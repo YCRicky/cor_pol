@@ -107,7 +107,6 @@ class LiveExecutionConfig:
     api_secret: str
     api_passphrase: str
     funder: str
-    derive_api_creds: bool = False
     signature_type: str = "POLY_1271"
     order_type: str = "FAK"
     slippage_ticks: int = 2
@@ -129,10 +128,12 @@ class LiveExecutionConfig:
             or ""
         )
         funder = os.getenv("DEPOSIT_WALLET_ADDRESS") or os.getenv("DEPOSIT_WALLET") or ""
-        has_clob_creds = bool(api_key and api_secret and api_passphrase)
         missing = [
             name for name, value in (
                 ("PRIVATE_KEY", private_key),
+                ("CLOB_API_KEY", api_key),
+                ("CLOB_SECRET", api_secret),
+                ("CLOB_PASS_PHRASE", api_passphrase),
                 ("DEPOSIT_WALLET_ADDRESS", funder),
             )
             if not value
@@ -147,7 +148,6 @@ class LiveExecutionConfig:
             api_secret=api_secret,
             api_passphrase=api_passphrase,
             funder=funder,
-            derive_api_creds=not has_clob_creds,
             signature_type=os.getenv("CLOB_SIGNATURE_TYPE", "POLY_1271").upper(),
             order_type=os.getenv("CORR_EXEC_ORDER_TYPE", "FAK").upper(),
             slippage_ticks=int(os.getenv("CORR_EXEC_SLIPPAGE_TICKS", "2")),
@@ -183,7 +183,7 @@ class PolymarketLiveExecutor:
         sig_type = getattr(SignatureTypeV2, config.signature_type, None)
         if sig_type is None:
             sig_type = int(config.signature_type)
-        creds = None if config.derive_api_creds else ApiCreds(
+        creds = ApiCreds(
             api_key=config.api_key,
             api_secret=config.api_secret,
             api_passphrase=config.api_passphrase,
@@ -196,8 +196,6 @@ class PolymarketLiveExecutor:
             signature_type=sig_type,
             funder=config.funder,
         )
-        if config.derive_api_creds:
-            self.client.set_api_creds(self.client.create_or_derive_api_key())
         self._asset_type = AssetType
         self._balance_params = BalanceAllowanceParams
         self._signature_type = sig_type
