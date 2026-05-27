@@ -12,10 +12,17 @@ It is based on the Polymarket docs reviewed on 2026-05-27:
 
 - Collateral is pUSD on Polygon. Do not assume old bridged-USDC wording in
   logs, config, or runbooks.
-- New API users should use a deposit wallet, `signature_type = POLY_1271`
-  (`3`), and pass the deposit wallet as the CLOB `funder`.
-- pUSD must sit in the deposit wallet, not just the owner EOA. After funding or
-  changing approvals, call balance/allowance sync with `signature_type = 3`.
+- The order signer and the order funder are separate concepts for proxy/deposit
+  wallet accounts. `PRIVATE_KEY` signs, while `CLOB_FUNDER_ADDRESS` is the
+  wallet that actually funds the order.
+- Wallet mode is controlled by `CLOB_SIGNATURE_TYPE`:
+  `EOA` (`0`) for direct EOA trading, `POLY_PROXY` (`1`) for legacy proxy
+  accounts, and `POLY_1271` (`3`) for deposit-wallet accounts.
+- pUSD must sit in the funding wallet selected by `CLOB_FUNDER_ADDRESS`, not
+  merely in the owner EOA. After funding or changing approvals, the bot calls
+  balance/allowance sync with the selected signature type.
+- Legacy builder users can set `POLY_BUILDER_CODE` to their bytes32 builder
+  code. The bot attaches it to every live order.
 - The CLOB order docs classify `FOK` and `FAK` as immediate execution order
   types. `FAK` fills whatever is available immediately and cancels the rest.
 - SDK market BUY orders take `amount` as dollars/pUSD, not shares. Because this
@@ -83,17 +90,27 @@ PRIVATE_KEY=...
 CLOB_API_KEY=...
 CLOB_SECRET=...
 CLOB_PASS_PHRASE=...
-DEPOSIT_WALLET_ADDRESS=...
-CLOB_SIGNATURE_TYPE=POLY_1271
+CLOB_SIGNATURE_TYPE=POLY_PROXY
+CLOB_FUNDER_ADDRESS=...
+POLY_BUILDER_CODE=...
 TG_BOT_TOKEN=...
 TG_CHAT_ID=...
 ```
 
+Wallet-mode mapping:
+
+| Account mode | `CLOB_SIGNATURE_TYPE` | `CLOB_FUNDER_ADDRESS` |
+|---|---|---|
+| Legacy Polymarket proxy | `POLY_PROXY` or `1` | Proxy wallet address |
+| EOA/direct wallet | `EOA` or `0` | EOA address matching `PRIVATE_KEY` |
+| Deposit wallet | `POLY_1271` or `3` | Deposit wallet address |
+
 Before switching to live:
 
-- Confirm the deposit wallet is deployed.
-- Confirm pUSD is in the deposit wallet.
-- Confirm collateral allowance is set from the deposit wallet, not the owner EOA.
+- Confirm the selected funding wallet is correct for the signature mode.
+- Confirm pUSD is in that funding wallet.
+- Confirm collateral allowance is set from that funding wallet, not a different
+  owner/signing address.
 - Start once in `DRY_RUN=true` on EC2 and check websocket, Gamma, and
   Telegram logs.
 - Switch to `DRY_RUN=false` only after balance/allowance sync succeeds at boot.

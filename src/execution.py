@@ -78,6 +78,18 @@ def _round_up_to_tick(price: float, tick_size: str) -> float:
     return round(min(max_price, max(tick, units * tick)), decimals)
 
 
+def _builder_code_from_env() -> str:
+    code = (os.getenv("POLY_BUILDER_CODE") or os.getenv("CLOB_BUILDER_CODE") or "").strip()
+    if not code:
+        return ""
+    if not code.startswith("0x"):
+        code = "0x" + code
+    if len(code) != 66:
+        raise RuntimeError("POLY_BUILDER_CODE must be a bytes32 hex value")
+    int(code[2:], 16)
+    return code
+
+
 def _merge_results(base: ExecutionLegResult, extra: ExecutionLegResult) -> ExecutionLegResult:
     filled = base.filled_qty + extra.filled_qty
     notional = base.notional + extra.notional
@@ -107,7 +119,8 @@ class LiveExecutionConfig:
     api_secret: str
     api_passphrase: str
     funder: str
-    signature_type: str = "POLY_1271"
+    signature_type: str = "POLY_PROXY"
+    builder_code: str = ""
     order_type: str = "FAK"
     slippage_ticks: int = 2
     chase_slippage_ticks: int = 4
@@ -127,14 +140,21 @@ class LiveExecutionConfig:
             or os.getenv("POLY_PASSPHRASE")
             or ""
         )
-        funder = os.getenv("DEPOSIT_WALLET_ADDRESS") or os.getenv("DEPOSIT_WALLET") or ""
+        funder = (
+            os.getenv("CLOB_FUNDER_ADDRESS")
+            or os.getenv("FUNDER_ADDRESS")
+            or os.getenv("PROXY_WALLET_ADDRESS")
+            or os.getenv("DEPOSIT_WALLET_ADDRESS")
+            or os.getenv("DEPOSIT_WALLET")
+            or ""
+        )
         missing = [
             name for name, value in (
                 ("PRIVATE_KEY", private_key),
                 ("CLOB_API_KEY", api_key),
                 ("CLOB_SECRET", api_secret),
                 ("CLOB_PASS_PHRASE", api_passphrase),
-                ("DEPOSIT_WALLET_ADDRESS", funder),
+                ("CLOB_FUNDER_ADDRESS", funder),
             )
             if not value
         ]
@@ -148,7 +168,8 @@ class LiveExecutionConfig:
             api_secret=api_secret,
             api_passphrase=api_passphrase,
             funder=funder,
-            signature_type=os.getenv("CLOB_SIGNATURE_TYPE", "POLY_1271").upper(),
+            signature_type=os.getenv("CLOB_SIGNATURE_TYPE", "POLY_PROXY").upper(),
+            builder_code=_builder_code_from_env(),
             order_type=os.getenv("CORR_EXEC_ORDER_TYPE", "FAK").upper(),
             slippage_ticks=int(os.getenv("CORR_EXEC_SLIPPAGE_TICKS", "2")),
             chase_slippage_ticks=int(os.getenv("CORR_EXEC_CHASE_SLIPPAGE_TICKS", "4")),
@@ -224,13 +245,16 @@ class PolymarketLiveExecutor:
         tick = float(tick_size or "0.01")
         limit_price = _round_up_to_tick(best_ask + max(slippage_ticks, 0) * tick, tick_size)
         try:
+            order_kwargs: dict[str, Any] = {
+                "token_id": token_id,
+                "price": limit_price,
+                "size": target_qty,
+                "side": self.Side.BUY,
+            }
+            if self.config.builder_code:
+                order_kwargs["builder_code"] = self.config.builder_code
             resp = self.client.create_and_post_order(
-                order_args=self.OrderArgs(
-                    token_id=token_id,
-                    price=limit_price,
-                    size=target_qty,
-                    side=self.Side.BUY,
-                ),
+                order_args=self.OrderArgs(**order_kwargs),
                 options=self.PartialCreateOrderOptions(tick_size=str(tick_size), neg_risk=bool(neg_risk)),
                 order_type=getattr(self.OrderType, self.config.order_type, self.OrderType.FAK),
             )

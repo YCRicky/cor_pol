@@ -1434,13 +1434,19 @@ async def main_async(rounds: int, start_mode: str, gates: GateConfig) -> None:
     notify = _make_notify(notifier)
     dry_run = os.getenv("DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
     live_executor: Optional[PolymarketLiveExecutor] = None
+    execution_note = "shadow"
     print(f"[BOOT] DRY_RUN={dry_run}  rounds={rounds}  start_mode={start_mode}")
     if not dry_run:
         cfg = LiveExecutionConfig.from_env()
         live_executor = PolymarketLiveExecutor(cfg)
         live_executor.sync_collateral()
+        execution_note = (
+            f"live sig={cfg.signature_type} funder={cfg.funder[:6]}... "
+            f"builder={'yes' if cfg.builder_code else 'no'}"
+        )
         print(f"[BOOT] LIVE CLOB enabled host={cfg.host} chain={cfg.chain_id} "
-              f"funder={cfg.funder[:6]}... order_type={cfg.order_type}")
+              f"sig={cfg.signature_type} funder={cfg.funder[:6]}... "
+              f"order_type={cfg.order_type} builder={'yes' if cfg.builder_code else 'no'}")
     if notifier is not None:
         try:
             notifier.send(f"cor_pol boot\nDRY_RUN={dry_run} rounds={rounds} mode={start_mode}\n"
@@ -1451,7 +1457,7 @@ async def main_async(rounds: int, start_mode: str, gates: GateConfig) -> None:
                           f"EV>={gates.min_model_edge:+.3f} bad<={gates.max_bad_quad_prob:.2f}\n"
                           f"Q4 asym dead={gates.q4_dead_loss_gap_mult:.1f}x gap "
                           f"fav_worse={gates.q4_fav_worsen_bp:.1f}bp\n"
-                          f"execution={'live' if live_executor else 'shadow'}")
+                          f"execution={execution_note}")
         except Exception as exc:
             print(f"[BOOT] tg boot ping failed: {exc}")
     if start_mode == "next" and rounds > 0:

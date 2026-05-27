@@ -17,7 +17,8 @@ outcome reported by the Gamma API.
 
 Default mode is `DRY_RUN=true`, which logs intent and computes simulated fills
 against the live book. `DRY_RUN=false` enables live CLOB execution through
-`py-clob-client-v2` using pUSD/deposit-wallet `POLY_1271` credentials.
+`py-clob-client-v2` using pUSD CLOB credentials. The funding wallet mode is
+configured by `CLOB_SIGNATURE_TYPE` and `CLOB_FUNDER_ADDRESS`.
 
 ## Strategy (four-quadrant PM kill + asym 0.60 + fav_bp >= -4.0)
 
