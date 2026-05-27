@@ -26,7 +26,7 @@ against the live book. `DRY_RUN=false` enables live CLOB execution through
 | Entry: asymmetric mid | `max(mid_a, mid_b) >= 0.60` AND `min(mid_a, mid_b) <= 0.40` | Skip coin-flip entries that historically blow up in Q4 |
 | Entry: min favorable bp | `min(fav_bp_a, fav_bp_b) >= -4.0 bp` | Skip entries where either leg is already underwater vs its strike |
 | Entry: quadrant EV | `fair_a + fair_b - cost >= 0.01`, `P(lose,lose) <= 0.22` | Gap alone only proves same-direction breakeven; the bad diagonal must be bounded |
-| Sizing: round cap | `max_combos_per_round = 3`, `max_cost_per_round_usd = 15` | The 95-round live dry-run showed combo #4/#5 had negative marginal PnL |
+| Sizing: round cap | `max_combos_per_round = 3`, `max_cost_per_round_usd = 15` | Entry-only cap. Defensive Q4/imbalance reverse buys bypass it so stops cannot be blocked |
 | Execution | aggressive limit `FAK`, 5 shares per leg, 1-share mismatch tolerance | Targets shares exactly and avoids infinite retries on tiny residual fills |
 | Defense: asymmetric Q4 kill | If one executable leg loss exceeds `2 * entry_gap`, the other leg is also below entry, and both legs' `fav_bp` worsened vs entry, buy both opposite asks | Cut the true `(lose, lose)` path while leaving `(win, win)`, `(win, lose)`, and `(lose, win)` alive |
 | PnL settlement | PM/UMA outcome via Gamma API | No Binance fallback -- avoids divergence rounds |
@@ -56,7 +56,6 @@ Per-round JSONL is written to `out/lab_corr_arb_round<N>_<ts>.jsonl`.
    - For live: `PRIVATE_KEY`, `DEPOSIT_WALLET_ADDRESS`.
    - Optional: `CLOB_API_KEY`, `CLOB_SECRET`, `CLOB_PASS_PHRASE`; if omitted,
      the bot derives CLOB credentials from `PRIVATE_KEY` at boot.
-   - For auto-redeem: `RELAYER_API_KEY`, `RELAYER_API_KEY_ADDRESS`.
    - Any `CORR_*` overrides you want (see `.env.example`).
 3. Deploy. The service runs `python main.py` indefinitely; round 1 starts on
    the next 5m boundary.
@@ -70,7 +69,6 @@ When `TG_BOT_TOKEN` and `TG_CHAT_ID` are set, the bot pings on:
 - **FLIP** -- every fourth-quadrant PM kill (reason, entry/flip prices).
 - **SETTLE** -- every round resolution after the PM/UMA outcome is read
   (combos, cost, gross, flip PnL, cumulative PnL, divergence flag).
-- **REDEEM** -- every auto-redeem relayer batch when `CORR_AUTO_REDEEM=true`.
 - **Run done** -- final summary when the rounds loop exits.
 
 ## Directory layout
@@ -83,7 +81,6 @@ railway.json + nixpacks.toml     # Railway build/start config
 src/
   common.py                      # Gamma API + 5m market discovery helpers
   execution.py                   # live CLOB execution wrapper and fill parsing
-  redeem.py                      # optional deposit-wallet auto-redeem relayer wrapper
   notifier.py                    # TelegramNotifier (HTTP)
   lab/
     correlation_arb_bot.py       # main bot: WS consumer, strategy loop, resolver

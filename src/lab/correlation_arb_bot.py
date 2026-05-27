@@ -33,7 +33,6 @@ from execution import (  # noqa: E402
     PolymarketLiveExecutor,
     merge_execution_results,
 )
-from redeem import AutoRedeemConfig, AutoRedeemer  # noqa: E402
 from lab.correlation_arb_core import (  # noqa: E402
     ArbSignal,
     GapHistogram,
@@ -784,6 +783,8 @@ async def strategy_loop(
 
         main_combos = [c for c in combos if not c.is_hedge]
         cooldown_ok = (now - last_fill_at) >= gates.combo_cooldown_s
+        # Entry-only risk budget. Defensive imbalance hedges and Q4 kills below
+        # must bypass this gate so stops cannot be blocked by sizing caps.
         capacity_ok = len(main_combos) < gates.max_combos_per_round and total_cost < gates.max_cost_per_round_usd
         if cooldown_ok and capacity_ok:
             sig, diag = try_entry(legs_by_asset, stats, gates, hist, tte)
@@ -1346,13 +1347,6 @@ def _format_event(kind: str, data: dict) -> str:
                 f"  combos={data['n_combos']}  cost=${data['cost']:.2f}  gross=${data['gross']:.2f}  flip=${data['flip_pnl']:+.2f}\n"
                 f"  pm_btc={data['pm_btc_up']}  pm_eth={data['pm_eth_up']}\n"
                 f"  run_pnl=${data.get('run_pnl', data['pnl']):+.2f} resolved={data.get('resolved_count', 1)}")
-    if kind == "redeem":
-        status = "OK" if data.get("ok") else "FAIL"
-        tx = data.get("transaction_hash") or data.get("transaction_id") or ""
-        return (f"REDEEM {status} R{data.get('round')} {data.get('asset')}\n"
-                f"  slug={data.get('slug')}\n"
-                f"  tx={tx}\n"
-                f"  err={data.get('error', '')}")
     return f"{kind}: {data}"
 
 
@@ -1405,49 +1399,11 @@ class RunLedger:
         }
 
 
-async def redeem_resolved_round(pending: dict, auto_redeemer: AutoRedeemer, notify=None) -> list[dict]:
-    if not pending.get("combos"):
-        return []
-    markets = [
-        ("BTC", pending.get("btc_slug"), pending.get("btc_condition_id"), bool(pending.get("btc_neg_risk", False))),
-        ("ETH", pending.get("eth_slug"), pending.get("eth_condition_id"), bool(pending.get("eth_neg_risk", False))),
-    ]
-    results: list[dict] = []
-    loop = asyncio.get_event_loop()
-    jsonl_path = Path(pending["jsonl"])
-    for asset, slug, condition_id, neg_risk in markets:
-        if not condition_id:
-            result = {
-                "asset": asset,
-                "slug": slug,
-                "condition_id": condition_id,
-                "neg_risk": neg_risk,
-                "ok": False,
-                "error": "missing_condition_id",
-            }
-        else:
-            redeem_result = await loop.run_in_executor(
-                None,
-                lambda slug=slug, condition_id=condition_id, neg_risk=neg_risk: auto_redeemer.redeem_condition(
-                    slug=str(slug),
-                    condition_id=str(condition_id),
-                    neg_risk=neg_risk,
-                ),
-            )
-            result = {"asset": asset, **redeem_result.__dict__}
-        results.append(result)
-        _log(jsonl_path, {"kind": "redeem_result", "round": pending.get("round"), **result})
-        if notify:
-            notify("redeem", {"round": pending.get("round"), **result})
-    return results
-
-
 async def resolve_and_record(
     pending: dict,
     gates: GateConfig,
     ledger: RunLedger,
     notify=None,
-    auto_redeemer: Optional[AutoRedeemer] = None,
 ) -> dict:
     summary = await resolve_round(pending, gates, notify=None)
     totals = ledger.record(summary)
@@ -1468,8 +1424,6 @@ async def resolve_and_record(
                 "divergence": summary["divergence"],
                 **totals,
             })
-        if auto_redeemer is not None:
-            summary["redeem"] = await redeem_resolved_round(pending, auto_redeemer, notify=notify)
     return summary
 
 
@@ -1480,7 +1434,6 @@ async def main_async(rounds: int, start_mode: str, gates: GateConfig) -> None:
     notify = _make_notify(notifier)
     dry_run = os.getenv("DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
     live_executor: Optional[PolymarketLiveExecutor] = None
-    auto_redeemer: Optional[AutoRedeemer] = None
     print(f"[BOOT] DRY_RUN={dry_run}  rounds={rounds}  start_mode={start_mode}")
     if not dry_run:
         cfg = LiveExecutionConfig.from_env()
@@ -1488,14 +1441,6 @@ async def main_async(rounds: int, start_mode: str, gates: GateConfig) -> None:
         live_executor.sync_collateral()
         print(f"[BOOT] LIVE CLOB enabled host={cfg.host} chain={cfg.chain_id} "
               f"funder={cfg.funder[:6]}... order_type={cfg.order_type}")
-    auto_redeem_requested = os.getenv("CORR_AUTO_REDEEM", "").strip().lower() in ("1", "true", "yes", "on")
-    if auto_redeem_requested and dry_run:
-        raise RuntimeError("CORR_AUTO_REDEEM=true requires DRY_RUN=false")
-    redeem_cfg = AutoRedeemConfig.from_env_if_enabled()
-    if redeem_cfg is not None:
-        auto_redeemer = AutoRedeemer(redeem_cfg)
-        print(f"[BOOT] auto redeem enabled relayer={redeem_cfg.relayer_url} "
-              f"wallet={redeem_cfg.deposit_wallet_address[:6]}... wait={redeem_cfg.wait}")
     if notifier is not None:
         try:
             notifier.send(f"cor_pol boot\nDRY_RUN={dry_run} rounds={rounds} mode={start_mode}\n"
@@ -1506,8 +1451,7 @@ async def main_async(rounds: int, start_mode: str, gates: GateConfig) -> None:
                           f"EV>={gates.min_model_edge:+.3f} bad<={gates.max_bad_quad_prob:.2f}\n"
                           f"Q4 asym dead={gates.q4_dead_loss_gap_mult:.1f}x gap "
                           f"fav_worse={gates.q4_fav_worsen_bp:.1f}bp\n"
-                          f"execution={'live' if live_executor else 'shadow'} "
-                          f"auto_redeem={auto_redeemer is not None}")
+                          f"execution={'live' if live_executor else 'shadow'}")
         except Exception as exc:
             print(f"[BOOT] tg boot ping failed: {exc}")
     if start_mode == "next" and rounds > 0:
@@ -1547,9 +1491,7 @@ async def main_async(rounds: int, start_mode: str, gates: GateConfig) -> None:
             if pending.get("status") == "SKIPPED":
                 print(f"[ROUND {i}] skipped: {pending.get('reason')}")
             else:
-                resolve_tasks.add(asyncio.create_task(resolve_and_record(
-                    pending, gates, ledger, notify=notify, auto_redeemer=auto_redeemer,
-                )))
+                resolve_tasks.add(asyncio.create_task(resolve_and_record(pending, gates, ledger, notify=notify)))
         except Exception as exc:
             print(f"[ROUND {i}] error: {exc}")
         await drain_resolved(done_only=True)

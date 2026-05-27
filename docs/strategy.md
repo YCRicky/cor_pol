@@ -44,7 +44,9 @@ and returns its `gap = 1.0 - (price_a + price_b)`. We enter when:
 - `P(lose, lose) <= max_bad_quad_prob (0.22)` and
   `P(lose, lose) / P(one-win-one-lose) <= 0.38` -- bounds the bad diagonal.
 - `max_combos_per_round = 3` and `max_cost_per_round_usd = 15` -- cap
-  repeated entries in the same 5-minute window. The 95-round live dry-run
+  repeated entries in the same 5-minute window only. Defensive reverse buys
+  for entry imbalance and Q4 stop-loss bypass these caps, so stops cannot be
+  blocked by entry sizing limits. The 95-round live dry-run
   showed combo #2/#3 carried the marginal alpha while combo #4/#5 were
   negative expectancy.
 

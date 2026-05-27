@@ -7,9 +7,6 @@ It is based on the Polymarket docs reviewed on 2026-05-27:
 - Deposit wallets: https://docs.polymarket.com/trading/deposit-wallets
 - CLOB create order: https://docs.polymarket.com/developers/CLOB/orders/create-order
 - CLOB Python client: https://docs.polymarket.com/developers/CLOB/clients/python-client
-- CTF redeem: https://docs.polymarket.com/trading/ctf/redeem
-- Relayer API keys: https://docs.polymarket.com/api-reference/relayer-api-keys/get-all-relayer-api-keys
-- Relayer submit: https://docs.polymarket.com/api-reference/relayer/submit-a-transaction
 
 ## Polymarket changes that matter
 
@@ -24,9 +21,9 @@ It is based on the Polymarket docs reviewed on 2026-05-27:
 - SDK market BUY orders take `amount` as dollars/pUSD, not shares. Because this
   strategy needs "send 5 shares", the bot uses marketable aggressive limit
   orders with `OrderArgs(size=5)` and `OrderType.FAK` instead of SDK market BUY.
-- Resolved CTF tokens redeem back into pUSD through the pUSD adapter flow. This
-  bot computes PnL from Gamma/UMA outcomes first, then can optionally submit
-  on-chain relayer redeem batches after settlement.
+- Resolved CTF tokens redeem back into pUSD through Polymarket settlement
+  tooling. This bot computes PnL from Gamma/UMA outcomes; redemption is handled
+  by the Polymarket UI auto-redeem setting, not by this process.
 
 ## Live execution contract
 
@@ -55,6 +52,8 @@ Entry execution:
 5. If the imbalance still remains after all chase attempts, buy the opposite
    side of the overfilled leg for `imbalance - tolerance`. That converts excess
    naked exposure back toward locked $1 payoff instead of leaving a one-leg bet.
+6. `CORR_MAX_COMBOS_PER_ROUND` and `CORR_MAX_COST_PER_ROUND_USD` apply only to
+   new entries. Entry-imbalance hedges and Q4 kill orders bypass those caps.
 
 Fourth-quadrant kill execution:
 
@@ -91,18 +90,6 @@ TG_CHAT_ID=...
 not set, the live executor derives CLOB credentials from `PRIVATE_KEY` during
 boot.
 
-Auto redeem:
-
-```text
-DRY_RUN=false
-CORR_AUTO_REDEEM=true
-RELAYER_URL=https://relayer-v2.polymarket.com/
-RELAYER_API_KEY=...
-RELAYER_API_KEY_ADDRESS=...
-CORR_REDEEM_WAIT=true
-CORR_REDEEM_DEADLINE_S=600
-```
-
 Before switching to live:
 
 - Confirm the deposit wallet is deployed.
@@ -120,7 +107,6 @@ Telegram sends:
 - every entry fill with leg quantities, imbalance, gap, rho, and execution mode,
 - every Q4 kill fill,
 - every PM/UMA settlement, including cumulative run PnL,
-- every auto-redeem relayer submission/result when enabled,
 - final summary for finite `--rounds` runs.
 
 PnL uses PM/UMA outcome from Gamma only. Binance prices are recorded only for
@@ -130,36 +116,9 @@ divergence diagnostics and never drive realized PnL.
 
 - The bot is taker-only. It is not designed to quote or manage resting GTC
   inventory.
-- Auto redeem is an on-chain relayer action from the deposit wallet. It runs
-  only after PM/UMA settlement and only when `CORR_AUTO_REDEEM=true`.
+- Redemption is not performed by this bot. Use Polymarket's own auto-redeem
+  setting or manual UI redemption.
 - Railway restarts can interrupt a round. Logs are append-only JSONL, but there
   is no persistent database reconciliation yet.
 - Polymarket API or SDK response fields can change. Live fills are logged raw so
   response parsing can be corrected without losing audit data.
-
-## Auto redeem details
-
-Deposit-wallet positions are held by the deposit wallet contract, so the owner
-EOA cannot redeem them by directly sending a transaction from the EOA. The bot
-signs a deposit-wallet `WALLET` batch and submits it through the current
-Polymarket Relayer API headers, making the deposit wallet call the pUSD CTF
-collateral adapter.
-`CORR_AUTO_REDEEM=true` is accepted only in live mode; it fails fast when
-`DRY_RUN=true` so a shadow run cannot redeem unrelated manual positions.
-Authentication uses the current Relayer API headers:
-`RELAYER_API_KEY` and `RELAYER_API_KEY_ADDRESS`.
-
-For each resolved round with at least one combo, the bot submits one redeem
-call for the BTC condition and one for the ETH condition:
-
-```text
-redeemPositions(pUSD, bytes32(0), conditionId, [1, 2])
-```
-
-The target adapter is:
-
-- `CTF_COLLATERAL_ADAPTER` for normal markets.
-- `NEG_RISK_CTF_COLLATERAL_ADAPTER` if Gamma marks the market `negRisk=true`.
-
-Redeem has no amount parameter. It burns the redeemable token balances for that
-condition and returns pUSD to the deposit wallet.
