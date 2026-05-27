@@ -18,6 +18,10 @@ It is based on the Polymarket docs reviewed on 2026-05-27:
 - Wallet mode is controlled by `CLOB_SIGNATURE_TYPE`:
   `EOA` (`0`) for direct EOA trading, `POLY_PROXY` (`1`) for legacy proxy
   accounts, and `POLY_1271` (`3`) for deposit-wallet accounts.
+- Existing env names from older Polymarket bots are accepted as aliases:
+  `POLYMARKET_API_KEY`, `POLYMARKET_API_SECRET`,
+  `POLYMARKET_PASSPHRASE`, `POLYMARKET_PRIVATE_KEY`,
+  `POLYMARKET_PROXY_ADDRESS`, `FUNDER_ADDRESS`, and `SIGNATURE_TYPE`.
 - pUSD must sit in the funding wallet selected by `CLOB_FUNDER_ADDRESS`, not
   merely in the owner EOA. After funding or changing approvals, the bot calls
   balance/allowance sync with the selected signature type.
@@ -102,6 +106,7 @@ Wallet-mode mapping:
 | Account mode | `CLOB_SIGNATURE_TYPE` | `CLOB_FUNDER_ADDRESS` |
 |---|---|---|
 | Legacy Polymarket proxy | `POLY_PROXY` or `1` | Proxy wallet address |
+| Existing Safe/Gnosis flow | `GNOSIS_SAFE` or `2` | Safe/proxy wallet address |
 | EOA/direct wallet | `EOA` or `0` | EOA address matching `PRIVATE_KEY` |
 | Deposit wallet | `POLY_1271` or `3` | Deposit wallet address |
 

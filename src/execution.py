@@ -78,8 +78,12 @@ def _round_up_to_tick(price: float, tick_size: str) -> float:
     return round(min(max_price, max(tick, units * tick)), decimals)
 
 
+def _clean_env(value: str | None) -> str:
+    return (value or "").strip().strip('"').strip("'")
+
+
 def _builder_code_from_env() -> str:
-    code = (os.getenv("POLY_BUILDER_CODE") or os.getenv("CLOB_BUILDER_CODE") or "").strip()
+    code = _clean_env(os.getenv("POLY_BUILDER_CODE") or os.getenv("CLOB_BUILDER_CODE"))
     if not code:
         return ""
     if not code.startswith("0x"):
@@ -129,25 +133,36 @@ class LiveExecutionConfig:
 
     @classmethod
     def from_env(cls) -> "LiveExecutionConfig":
-        private_key = os.getenv("PRIVATE_KEY") or os.getenv("POLYMARKET_PRIVATE_KEY") or ""
-        api_key = os.getenv("CLOB_API_KEY") or os.getenv("POLY_API_KEY") or ""
-        api_secret = os.getenv("CLOB_SECRET") or os.getenv("CLOB_API_SECRET") or os.getenv("POLY_SECRET") or ""
+        private_key = _clean_env(os.getenv("PRIVATE_KEY") or os.getenv("POLYMARKET_PRIVATE_KEY"))
+        api_key = _clean_env(os.getenv("CLOB_API_KEY") or os.getenv("POLYMARKET_API_KEY") or os.getenv("POLY_API_KEY"))
+        api_secret = _clean_env(
+            os.getenv("CLOB_SECRET")
+            or os.getenv("CLOB_API_SECRET")
+            or os.getenv("POLYMARKET_API_SECRET")
+            or os.getenv("POLY_SECRET")
+        )
         api_passphrase = (
             os.getenv("CLOB_PASS_PHRASE")
             or os.getenv("CLOB_API_PASS_PHRASE")
             or os.getenv("CLOB_API_PASSPHRASE")
             or os.getenv("CLOB_PASSPHRASE")
+            or os.getenv("POLYMARKET_PASSPHRASE")
+            or os.getenv("POLYMARKET_PASS_PHRASE")
             or os.getenv("POLY_PASSPHRASE")
             or ""
         )
+        api_passphrase = _clean_env(api_passphrase)
         funder = (
             os.getenv("CLOB_FUNDER_ADDRESS")
             or os.getenv("FUNDER_ADDRESS")
+            or os.getenv("POLYMARKET_PROXY_ADDRESS")
             or os.getenv("PROXY_WALLET_ADDRESS")
             or os.getenv("DEPOSIT_WALLET_ADDRESS")
             or os.getenv("DEPOSIT_WALLET")
             or ""
         )
+        funder = _clean_env(funder)
+        signature_type = _clean_env(os.getenv("CLOB_SIGNATURE_TYPE") or os.getenv("SIGNATURE_TYPE") or "POLY_PROXY").upper()
         missing = [
             name for name, value in (
                 ("PRIVATE_KEY", private_key),
@@ -168,7 +183,7 @@ class LiveExecutionConfig:
             api_secret=api_secret,
             api_passphrase=api_passphrase,
             funder=funder,
-            signature_type=os.getenv("CLOB_SIGNATURE_TYPE", "POLY_PROXY").upper(),
+            signature_type=signature_type,
             builder_code=_builder_code_from_env(),
             order_type=os.getenv("CORR_EXEC_ORDER_TYPE", "FAK").upper(),
             slippage_ticks=int(os.getenv("CORR_EXEC_SLIPPAGE_TICKS", "2")),

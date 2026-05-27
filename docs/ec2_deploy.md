@@ -55,6 +55,10 @@ For legacy API/proxy accounts, keep `CLOB_SIGNATURE_TYPE=POLY_PROXY` and set
 `CLOB_FUNDER_ADDRESS` to the proxy wallet address. If your account has a builder
 code, also set `POLY_BUILDER_CODE=<bytes32 builder code>`.
 
+If your previous working bot used `SIGNATURE_TYPE=2`, keep that mode by setting
+`CLOB_SIGNATURE_TYPE=GNOSIS_SAFE` or `CLOB_SIGNATURE_TYPE=2`; set
+`CLOB_FUNDER_ADDRESS` to the same address previously used as `FUNDER_ADDRESS`.
+
 For EOA mode use `CLOB_SIGNATURE_TYPE=EOA` and set `CLOB_FUNDER_ADDRESS` to the
 EOA address matching `PRIVATE_KEY`. For deposit-wallet mode use
 `CLOB_SIGNATURE_TYPE=POLY_1271` and set `CLOB_FUNDER_ADDRESS` to the deposit
