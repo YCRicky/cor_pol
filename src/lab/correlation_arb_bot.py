@@ -1308,8 +1308,7 @@ def _build_notifier():
     if not token or not chat:
         print("[BOOT] TG notifier disabled (TG_BOT_TOKEN / TG_CHAT_ID not set)")
         return None
-    thread = os.getenv("TG_THREAD_ID", "").strip() or None
-    notifier = TelegramNotifier(TelegramConfig(bot_token=token, chat_id=chat, thread_id=thread))
+    notifier = TelegramNotifier(TelegramConfig(bot_token=token, chat_id=chat))
     print(f"[BOOT] TG notifier enabled chat={chat[:4]}***")
     return notifier
 

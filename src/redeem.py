@@ -5,6 +5,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+import requests
+
 
 PUSD_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 CTF_COLLATERAL_ADAPTER = "0xAdA100Db00Ca00073811820692005400218FcE1f"
@@ -79,9 +81,8 @@ class AutoRedeemConfig:
     relayer_url: str
     chain_id: int
     private_key: str
-    builder_api_key: str
-    builder_secret: str
-    builder_passphrase: str
+    relayer_api_key: str
+    relayer_api_key_address: str
     deposit_wallet_address: str
     collateral_token: str = PUSD_ADDRESS
     ctf_adapter: str = CTF_COLLATERAL_ADAPTER
@@ -96,22 +97,14 @@ class AutoRedeemConfig:
         if not _env_bool("CORR_AUTO_REDEEM", False):
             return None
         private_key = os.getenv("PRIVATE_KEY") or os.getenv("POLYMARKET_PRIVATE_KEY") or ""
-        builder_api_key = os.getenv("BUILDER_API_KEY") or os.getenv("RELAYER_API_KEY") or ""
-        builder_secret = os.getenv("BUILDER_SECRET") or os.getenv("RELAYER_SECRET") or ""
-        builder_passphrase = (
-            os.getenv("BUILDER_PASS_PHRASE")
-            or os.getenv("BUILDER_PASSPHRASE")
-            or os.getenv("RELAYER_PASS_PHRASE")
-            or os.getenv("RELAYER_PASSPHRASE")
-            or ""
-        )
+        relayer_api_key = os.getenv("RELAYER_API_KEY") or ""
+        relayer_api_key_address = os.getenv("RELAYER_API_KEY_ADDRESS") or ""
         deposit_wallet = os.getenv("DEPOSIT_WALLET_ADDRESS") or os.getenv("DEPOSIT_WALLET") or ""
         missing = [
             name for name, value in (
                 ("PRIVATE_KEY", private_key),
-                ("BUILDER_API_KEY", builder_api_key),
-                ("BUILDER_SECRET", builder_secret),
-                ("BUILDER_PASS_PHRASE", builder_passphrase),
+                ("RELAYER_API_KEY", relayer_api_key),
+                ("RELAYER_API_KEY_ADDRESS", relayer_api_key_address),
                 ("DEPOSIT_WALLET_ADDRESS", deposit_wallet),
             )
             if not value
@@ -126,9 +119,8 @@ class AutoRedeemConfig:
             relayer_url=os.getenv("RELAYER_URL", "https://relayer-v2.polymarket.com/"),
             chain_id=int(os.getenv("CHAIN_ID", "137")),
             private_key=private_key,
-            builder_api_key=builder_api_key,
-            builder_secret=builder_secret,
-            builder_passphrase=builder_passphrase,
+            relayer_api_key=relayer_api_key,
+            relayer_api_key_address=relayer_api_key_address,
             deposit_wallet_address=deposit_wallet,
             collateral_token=os.getenv("PUSD_ADDRESS", PUSD_ADDRESS),
             ctf_adapter=os.getenv("CTF_COLLATERAL_ADAPTER", CTF_COLLATERAL_ADAPTER),
@@ -158,29 +150,83 @@ class AutoRedeemer:
     def __init__(self, config: AutoRedeemConfig):
         self.config = config
         try:
-            from py_builder_relayer_client.client import RelayClient  # type: ignore
-            from py_builder_relayer_client.models import DepositWalletCall, TransactionType  # type: ignore
-            from py_builder_signing_sdk.config import BuilderApiKeyCreds, BuilderConfig  # type: ignore
+            from py_builder_relayer_client.builder.deposit_wallet import build_deposit_wallet_batch_request  # type: ignore
+            from py_builder_relayer_client.config import get_contract_config  # type: ignore
+            from py_builder_relayer_client.models import (  # type: ignore
+                DepositWalletCall,
+                DepositWalletTransactionArgs,
+                RelayerTransactionState,
+                TransactionType,
+            )
+            from py_builder_relayer_client.signer import Signer  # type: ignore
         except Exception as exc:
             raise RuntimeError(
                 "py-builder-relayer-client is required for CORR_AUTO_REDEEM=true"
             ) from exc
 
+        self.build_deposit_wallet_batch_request = build_deposit_wallet_batch_request
+        self.DepositWalletTransactionArgs = DepositWalletTransactionArgs
         self.DepositWalletCall = DepositWalletCall
+        self.RelayerTransactionState = RelayerTransactionState
         self.TransactionType = TransactionType
-        builder_config = BuilderConfig(
-            local_builder_creds=BuilderApiKeyCreds(
-                key=config.builder_api_key,
-                secret=config.builder_secret,
-                passphrase=config.builder_passphrase,
-            )
+        self.signer = Signer(config.private_key, config.chain_id)
+        self.contract_config = get_contract_config(config.chain_id)
+        self.relayer_url = config.relayer_url.rstrip("/")
+
+    def _headers(self) -> dict[str, str]:
+        return {
+            "RELAYER_API_KEY": self.config.relayer_api_key,
+            "RELAYER_API_KEY_ADDRESS": self.config.relayer_api_key_address,
+            "Content-Type": "application/json",
+        }
+
+    def _get(self, path: str, params: Optional[dict[str, str]] = None) -> Any:
+        resp = requests.get(
+            f"{self.relayer_url}{path}",
+            headers=self._headers(),
+            params=params,
+            timeout=20,
         )
-        self.client = RelayClient(
-            config.relayer_url,
-            config.chain_id,
-            config.private_key,
-            builder_config,
+        if resp.status_code != 200:
+            raise RuntimeError(f"relayer GET {path} failed {resp.status_code}: {resp.text}")
+        return resp.json()
+
+    def _post(self, path: str, body: dict[str, Any]) -> Any:
+        resp = requests.post(
+            f"{self.relayer_url}{path}",
+            headers=self._headers(),
+            json=body,
+            timeout=20,
         )
+        if resp.status_code != 200:
+            raise RuntimeError(f"relayer POST {path} failed {resp.status_code}: {resp.text}")
+        return resp.json()
+
+    def _get_nonce(self) -> str:
+        payload = self._get("/nonce", {
+            "address": self.signer.address(),
+            "type": self.TransactionType.WALLET.value,
+        })
+        return str(payload["nonce"])
+
+    def _poll_confirmed(self, transaction_id: str) -> Optional[dict[str, Any]]:
+        target = {
+            self.RelayerTransactionState.STATE_MINED.value,
+            self.RelayerTransactionState.STATE_CONFIRMED.value,
+        }
+        fail = self.RelayerTransactionState.STATE_FAILED.value
+        for _ in range(30):
+            payload = self._get("/transaction", {"id": transaction_id})
+            rows = payload if isinstance(payload, list) else [payload]
+            if rows:
+                txn = rows[0]
+                state = txn.get("state") if isinstance(txn, dict) else None
+                if state in target:
+                    return txn
+                if state == fail:
+                    return None
+            time.sleep(2)
+        return None
 
     def redeem_condition(self, *, slug: str, condition_id: str, neg_risk: bool = False) -> RedeemResult:
         adapter = self.config.neg_risk_adapter if neg_risk else self.config.ctf_adapter
@@ -192,25 +238,32 @@ class AutoRedeemer:
                 condition_id=condition_id,
                 index_sets=self.config.index_sets,
             )
-            nonce_payload = self.client.get_nonce(
-                self.client.signer.address(),
-                self.TransactionType.WALLET.value,
-            )
-            nonce = str(nonce_payload["nonce"])
+            nonce = self._get_nonce()
             deadline = str(int(time.time()) + self.config.deadline_seconds)
             call = self.DepositWalletCall(target=adapter, value="0", data=data)
-            resp = self.client.execute_deposit_wallet_batch(
-                calls=[call],
+            args = self.DepositWalletTransactionArgs(
+                from_address=self.signer.address(),
+                chain_id=self.config.chain_id,
                 wallet_address=self.config.deposit_wallet_address,
                 nonce=nonce,
+                calls=[call],
                 deadline=deadline,
             )
-            raw = _obj_to_dict(resp)
+            body = self.build_deposit_wallet_batch_request(
+                signer=self.signer,
+                args=args,
+                config=self.contract_config,
+            ).to_dict()
+            resp = self._post("/submit", body)
+            raw = dict(resp) if isinstance(resp, dict) else {"response": resp}
             confirmed = None
             if self.config.wait:
-                confirmed = resp.wait()
+                transaction_id = str(raw.get("transactionID") or "")
+                confirmed = self._poll_confirmed(transaction_id) if transaction_id else None
                 raw["wait_result"] = _obj_to_dict(confirmed) or {"repr": repr(confirmed)}
-            ok = bool(resp.transaction_id or resp.transaction_hash)
+            transaction_id = str(raw.get("transactionID") or "")
+            transaction_hash = str(raw.get("transactionHash") or "")
+            ok = bool(transaction_id or transaction_hash)
             if self.config.wait:
                 ok = ok and confirmed is not None
             return RedeemResult(
@@ -219,8 +272,8 @@ class AutoRedeemer:
                 neg_risk=neg_risk,
                 adapter=adapter,
                 ok=ok,
-                transaction_id=str(resp.transaction_id or ""),
-                transaction_hash=str(resp.transaction_hash or ""),
+                transaction_id=transaction_id,
+                transaction_hash=transaction_hash,
                 confirmed=confirmed is not None if self.config.wait else False,
                 raw=raw,
             )

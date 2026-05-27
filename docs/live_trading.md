@@ -8,6 +8,8 @@ It is based on the Polymarket docs reviewed on 2026-05-27:
 - CLOB create order: https://docs.polymarket.com/developers/CLOB/orders/create-order
 - CLOB Python client: https://docs.polymarket.com/developers/CLOB/clients/python-client
 - CTF redeem: https://docs.polymarket.com/trading/ctf/redeem
+- Relayer API keys: https://docs.polymarket.com/api-reference/relayer-api-keys/get-all-relayer-api-keys
+- Relayer submit: https://docs.polymarket.com/api-reference/relayer/submit-a-transaction
 
 ## Polymarket changes that matter
 
@@ -79,14 +81,15 @@ DRY_RUN=false
 CLOB_API_URL=https://clob.polymarket.com
 CHAIN_ID=137
 PRIVATE_KEY=...
-CLOB_API_KEY=...
-CLOB_SECRET=...
-CLOB_PASS_PHRASE=...
 DEPOSIT_WALLET_ADDRESS=...
 CLOB_SIGNATURE_TYPE=POLY_1271
 TG_BOT_TOKEN=...
 TG_CHAT_ID=...
 ```
+
+`CLOB_API_KEY`, `CLOB_SECRET`, and `CLOB_PASS_PHRASE` are optional. If they are
+not set, the live executor derives CLOB credentials from `PRIVATE_KEY` during
+boot.
 
 Auto redeem:
 
@@ -94,9 +97,8 @@ Auto redeem:
 DRY_RUN=false
 CORR_AUTO_REDEEM=true
 RELAYER_URL=https://relayer-v2.polymarket.com/
-BUILDER_API_KEY=...
-BUILDER_SECRET=...
-BUILDER_PASS_PHRASE=...
+RELAYER_API_KEY=...
+RELAYER_API_KEY_ADDRESS=...
 CORR_REDEEM_WAIT=true
 CORR_REDEEM_DEADLINE_S=600
 ```
@@ -139,10 +141,13 @@ divergence diagnostics and never drive realized PnL.
 
 Deposit-wallet positions are held by the deposit wallet contract, so the owner
 EOA cannot redeem them by directly sending a transaction from the EOA. The bot
-uses the Polymarket builder relayer client to sign a deposit-wallet `WALLET`
-batch and make the deposit wallet call the pUSD CTF collateral adapter.
+signs a deposit-wallet `WALLET` batch and submits it through the current
+Polymarket Relayer API headers, making the deposit wallet call the pUSD CTF
+collateral adapter.
 `CORR_AUTO_REDEEM=true` is accepted only in live mode; it fails fast when
 `DRY_RUN=true` so a shadow run cannot redeem unrelated manual positions.
+Authentication uses the current Relayer API headers:
+`RELAYER_API_KEY` and `RELAYER_API_KEY_ADDRESS`.
 
 For each resolved round with at least one combo, the bot submits one redeem
 call for the BTC condition and one for the ETH condition:

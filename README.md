@@ -53,8 +53,10 @@ Per-round JSONL is written to `out/lab_corr_arb_round<N>_<ts>.jsonl`.
 2. In **Variables**, set at minimum:
    - `DRY_RUN=true` for shadow or `DRY_RUN=false` for live.
    - `TG_BOT_TOKEN`, `TG_CHAT_ID` (optional, recommended)
-   - For live: `PRIVATE_KEY`, `CLOB_API_KEY`, `CLOB_SECRET`,
-     `CLOB_PASS_PHRASE`, `DEPOSIT_WALLET_ADDRESS`.
+   - For live: `PRIVATE_KEY`, `DEPOSIT_WALLET_ADDRESS`.
+   - Optional: `CLOB_API_KEY`, `CLOB_SECRET`, `CLOB_PASS_PHRASE`; if omitted,
+     the bot derives CLOB credentials from `PRIVATE_KEY` at boot.
+   - For auto-redeem: `RELAYER_API_KEY`, `RELAYER_API_KEY_ADDRESS`.
    - Any `CORR_*` overrides you want (see `.env.example`).
 3. Deploy. The service runs `python main.py` indefinitely; round 1 starts on
    the next 5m boundary.
