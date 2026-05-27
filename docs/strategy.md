@@ -168,5 +168,5 @@ Caveats:
 - Rounds with PM/Binance divergence (the R53-type DIV cases) remain
   unhedged and cost ~$20 per occurrence when they hit.
 
-This Railway deployment is the long dry-run that will give us the real
+This EC2 deployment is the long dry-run that will give us the real
 per-day, per-week, per-month numbers.

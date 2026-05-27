@@ -46,18 +46,11 @@ python main.py
 The bot will wait for the next 5-minute boundary and start round 1.
 Per-round JSONL is written to `out/lab_corr_arb_round<N>_<ts>.jsonl`.
 
-## Deploy on Railway
+## Deploy on EC2
 
-1. Connect this repo as a Railway service. `nixpacks.toml` + `railway.json`
-   describe the build/start commands -- no manual config needed.
-2. In **Variables**, set at minimum:
-   - `DRY_RUN=true` for shadow or `DRY_RUN=false` for live.
-   - `TG_BOT_TOKEN`, `TG_CHAT_ID` (optional, recommended)
-   - For live: `PRIVATE_KEY`, `CLOB_API_KEY`, `CLOB_SECRET`,
-     `CLOB_PASS_PHRASE`, `DEPOSIT_WALLET_ADDRESS`.
-   - Any `CORR_*` overrides you want (see `.env.example`).
-3. Deploy. The service runs `python main.py` indefinitely; round 1 starts on
-   the next 5m boundary.
+Use systemd on an Ubuntu EC2 instance. The service reads `/etc/cor-pol.env`,
+runs from `/opt/cor_pol`, restarts on failure, and writes stdout/stderr to
+journald. See [docs/ec2_deploy.md](docs/ec2_deploy.md).
 
 ## Telegram notifications
 
@@ -75,7 +68,7 @@ When `TG_BOT_TOKEN` and `TG_CHAT_ID` are set, the bot pings on:
 ```
 main.py                          # entrypoint, adds src/ to sys.path and calls the bot
 requirements.txt                 # runtime deps, including py_clob_client_v2 for live CLOB
-railway.json + nixpacks.toml     # Railway build/start config
+deploy/                          # systemd and logrotate examples for EC2
 .env.example                     # all CORR_* / TG_* settings, documented
 src/
   common.py                      # Gamma API + 5m market discovery helpers

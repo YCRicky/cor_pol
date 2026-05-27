@@ -1,0 +1,8 @@
+/opt/cor_pol/out/*.jsonl /opt/cor_pol/out/*.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    copytruncate
+}

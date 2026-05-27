@@ -1,6 +1,6 @@
 # Live trading runbook
 
-This document locks the current live-trading design before Railway deployment.
+This document locks the current live-trading design before EC2 deployment.
 It is based on the Polymarket docs reviewed on 2026-05-27:
 
 - Polymarket USD: https://docs.polymarket.com/concepts/pusd
@@ -63,7 +63,7 @@ Fourth-quadrant kill execution:
 3. Partial kill fills are logged and included in PM-settled PnL; the bot does
    not pretend a kill completed if the CLOB fill response says otherwise.
 
-## Required Railway variables
+## Required environment variables
 
 Shadow mode:
 
@@ -94,7 +94,7 @@ Before switching to live:
 - Confirm the deposit wallet is deployed.
 - Confirm pUSD is in the deposit wallet.
 - Confirm collateral allowance is set from the deposit wallet, not the owner EOA.
-- Start once in `DRY_RUN=true` on Railway and check websocket, Gamma, and
+- Start once in `DRY_RUN=true` on EC2 and check websocket, Gamma, and
   Telegram logs.
 - Switch to `DRY_RUN=false` only after balance/allowance sync succeeds at boot.
 
@@ -117,7 +117,7 @@ divergence diagnostics and never drive realized PnL.
   inventory.
 - Redemption is not performed by this bot. Use Polymarket's own auto-redeem
   setting or manual UI redemption.
-- Railway restarts can interrupt a round. Logs are append-only JSONL, but there
+- EC2/systemd restarts can interrupt a round. Logs are append-only JSONL, but there
   is no persistent database reconciliation yet.
 - Polymarket API or SDK response fields can change. Live fills are logged raw so
   response parsing can be corrected without losing audit data.

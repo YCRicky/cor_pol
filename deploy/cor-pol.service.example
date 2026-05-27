@@ -1,0 +1,23 @@
+[Unit]
+Description=cor_pol BTC/ETH Polymarket 5m bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/cor_pol
+EnvironmentFile=/etc/cor-pol.env
+ExecStart=/opt/cor_pol/.venv/bin/python /opt/cor_pol/main.py
+Restart=always
+RestartSec=10
+KillSignal=SIGINT
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
