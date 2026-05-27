@@ -82,6 +82,23 @@ def _clean_env(value: str | None) -> str:
     return (value or "").strip().strip('"').strip("'")
 
 
+def _signature_type_from_env() -> str:
+    raw = _clean_env(os.getenv("CLOB_SIGNATURE_TYPE") or os.getenv("SIGNATURE_TYPE") or "POLY_PROXY").upper()
+    aliases = {
+        "EOA": "0",
+        "POLY_PROXY": "1",
+        "PROXY": "1",
+        "GNOSIS_SAFE": "2",
+        "POLY_GNOSIS_SAFE": "2",
+        "SAFE": "2",
+        "POLY_1271": "3",
+        "POLY1271": "3",
+        "DEPOSIT": "3",
+        "DEPOSIT_WALLET": "3",
+    }
+    return aliases.get(raw, raw)
+
+
 def _builder_code_from_env() -> str:
     code = _clean_env(os.getenv("POLY_BUILDER_CODE") or os.getenv("CLOB_BUILDER_CODE"))
     if not code:
@@ -162,7 +179,7 @@ class LiveExecutionConfig:
             or ""
         )
         funder = _clean_env(funder)
-        signature_type = _clean_env(os.getenv("CLOB_SIGNATURE_TYPE") or os.getenv("SIGNATURE_TYPE") or "POLY_PROXY").upper()
+        signature_type = _signature_type_from_env()
         missing = [
             name for name, value in (
                 ("PRIVATE_KEY", private_key),
