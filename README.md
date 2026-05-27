@@ -68,6 +68,7 @@ When `TG_BOT_TOKEN` and `TG_CHAT_ID` are set, the bot pings on:
 - **FLIP** -- every fourth-quadrant PM kill (reason, entry/flip prices).
 - **SETTLE** -- every round resolution after the PM/UMA outcome is read
   (combos, cost, gross, flip PnL, cumulative PnL, divergence flag).
+- **REDEEM** -- every auto-redeem relayer batch when `CORR_AUTO_REDEEM=true`.
 - **Run done** -- final summary when the rounds loop exits.
 
 ## Directory layout
@@ -80,6 +81,7 @@ railway.json + nixpacks.toml     # Railway build/start config
 src/
   common.py                      # Gamma API + 5m market discovery helpers
   execution.py                   # live CLOB execution wrapper and fill parsing
+  redeem.py                      # optional deposit-wallet auto-redeem relayer wrapper
   notifier.py                    # TelegramNotifier (HTTP)
   lab/
     correlation_arb_bot.py       # main bot: WS consumer, strategy loop, resolver
@@ -92,5 +94,4 @@ docs/
 
 - No maker quoting. Live mode uses taker-only aggressive FAK orders.
 - No tail-hedge, no Layer-4 spot kill -- fourth-quadrant control is handled by PM marks.
-- No automatic CTF redeem transaction yet. PnL is PM/UMA accounting truth.
 - No research scripts. Backtest tooling lives in the prior `taker_pol` repo.
