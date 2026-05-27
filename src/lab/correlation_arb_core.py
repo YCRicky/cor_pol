@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, Dict, Optional, Tuple
+from typing import Deque, Optional, Tuple
 
 
 def norm_cdf(z: float) -> float:
@@ -119,6 +119,55 @@ class ArbSignal:
     fair_diff: float
 
 
+@dataclass
+class QuadrantEstimate:
+    win_win: float
+    win_lose: float
+    lose_win: float
+    lose_lose: float
+    expected_gross: float
+    model_edge: float
+    event_corr: float
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def estimate_combo_quadrants(
+    fair_a: float,
+    fair_b: float,
+    cost: float,
+    rho: float,
+) -> QuadrantEstimate:
+    """Estimate the four post-entry quadrants for a two-leg combo.
+
+    The combo legs are opposite-direction BTC/ETH legs, so a positive BTC/ETH
+    return correlation maps to a negative event correlation between the two
+    selected legs. This is deliberately simple: it is a tail-risk diagnostic and
+    EV gate, not a pricing model.
+    """
+    pa = _clamp(fair_a, 0.001, 0.999)
+    pb = _clamp(fair_b, 0.001, 0.999)
+    event_corr = _clamp(-abs(rho), -0.95, 0.0)
+    denom = math.sqrt(pa * (1.0 - pa) * pb * (1.0 - pb))
+    p11 = pa * pb + event_corr * denom
+    p11 = _clamp(p11, max(0.0, pa + pb - 1.0), min(pa, pb))
+    p10 = pa - p11
+    p01 = pb - p11
+    p00 = 1.0 - pa - pb + p11
+    expected_gross = pa + pb
+    return QuadrantEstimate(
+        win_win=p11,
+        win_lose=p10,
+        lose_win=p01,
+        lose_lose=p00,
+        expected_gross=expected_gross,
+        model_edge=expected_gross - cost,
+        event_corr=event_corr,
+    )
+
+
 def evaluate_arb_box(
     btc_yes_ask: Optional[Tuple[float, float]],
     btc_no_ask: Optional[Tuple[float, float]],
@@ -147,118 +196,6 @@ def evaluate_arb_box(
         if best is None or gap > best.gap:
             best = ArbSignal(direction, la, lb, pa, pb, sa, sb, gap, rho, fdiff)
     return best
-
-
-def single_leg_flip_signal(
-    leg: str,
-    leg_position_side: str,
-    entry_price: float,
-    fair_up: float,
-    opp_ask: Optional[Tuple[float, float]],
-    kill_threshold: float = 0.30,
-) -> Optional[Tuple[float, float]]:
-    if opp_ask is None:
-        return None
-    opp_px, opp_sz = opp_ask
-    if opp_px <= 0 or opp_sz <= 0:
-        return None
-    fail_prob = (1.0 - fair_up) if leg_position_side == "YES" else fair_up
-    if fail_prob < kill_threshold:
-        return None
-    if entry_price + opp_px >= 1.0:
-        return None
-    return opp_px, opp_sz
-
-
-def leg_fail_prob(side: str, fair_up: float) -> float:
-    """Probability this leg fails at settlement, given the current spot-derived fair_up.
-
-    YES side fails when underlying ends below strike (fair_up small).
-    NO side fails when underlying ends above strike (fair_up large).
-    """
-    return (1.0 - fair_up) if side == "YES" else fair_up
-
-
-def policy_g_kill(
-    leg_a_side: str, fair_up_a: float, entry_a: float,
-    leg_b_side: str, fair_up_b: float, entry_b: float,
-    leg_a_opp_ask: Optional[Tuple[float, float]],
-    leg_b_opp_ask: Optional[Tuple[float, float]],
-    qty: float,
-    eps_loss: float = 0.05,
-    t_recov: float = 0.55,
-    t_lock: float = 0.80,
-) -> Optional[Dict[str, Tuple[float, float, str]]]:
-    """Policy G: dual-flip when both legs are in floating-loss AND the spot-derived
-    fair model says recovery is unlikely (fa,fb >= t_recov), OR when either leg has
-    crossed a hard "locked" threshold (max(fa,fb) >= t_lock).
-
-    Floating PnL per leg uses the opposite-side ask as a conservative mark:
-        mark_x = 1 - opp_x_ask    (i.e. what we could close the leg at right now)
-        fpnl_x = mark_x - entry_x
-
-    Returns the same shape as combo_kill_signal, or None if the policy does not fire
-    or there is no executable liquidity on both opposites.
-    """
-    if leg_a_opp_ask is None or leg_b_opp_ask is None:
-        return None
-    apx, asz = leg_a_opp_ask
-    bpx, bsz = leg_b_opp_ask
-    if apx <= 0 or bpx <= 0 or asz < qty or bsz < qty:
-        return None
-    mark_a = 1.0 - apx
-    mark_b = 1.0 - bpx
-    fpnl_a = mark_a - entry_a
-    fpnl_b = mark_b - entry_b
-    fa = leg_fail_prob(leg_a_side, fair_up_a)
-    fb = leg_fail_prob(leg_b_side, fair_up_b)
-    both_under = (fpnl_a < -eps_loss) and (fpnl_b < -eps_loss) and (fa >= t_recov) and (fb >= t_recov)
-    locked = max(fa, fb) >= t_lock
-    if not (both_under or locked):
-        return None
-    if both_under:
-        reason = f"G_both(fpnlA={fpnl_a:+.3f},fpnlB={fpnl_b:+.3f},fa={fa:.2f},fb={fb:.2f})"
-    else:
-        reason = f"G_lock(max_f={max(fa,fb):.2f})"
-    return {"leg_a": (apx, asz, reason), "leg_b": (bpx, bsz, reason)}
-
-
-def combo_kill_signal(
-    leg_a_side: str, fair_up_a: float,
-    leg_b_side: str, fair_up_b: float,
-    leg_a_opp_ask: Optional[Tuple[float, float]],
-    leg_b_opp_ask: Optional[Tuple[float, float]],
-    qty: float,
-    kill_threshold: float = 0.60,
-) -> Optional[Dict[str, Tuple[float, float, str]]]:
-    """4th-quadrant pre-emptive hedge: flip BOTH legs when EITHER leg's spot-derived
-    fail prob has crossed kill_threshold. Caller must additionally gate this on a small
-    tte window (e.g. tte <= 30s) so we only insure against last-second PM oracle
-    manipulation, not against early-round mean-reverting drift.
-
-    Rationale: empirically (Run #2 replay), Q4 catastrophes are characterized by one
-    leg already losing badly while the other leg is a "weak winner" near strike. The
-    weak winner gets flipped by sub-noise PM oracle moves in the final seconds. Waiting
-    for BOTH legs to be adverse simultaneously is too late. Triggering when EITHER leg
-    crosses the threshold inside the tte gate locks in $2 gross on both legs, accepting
-    the flip cost as tail-risk insurance against the (lose, lose) Q4 outcome.
-
-    PM order book is used ONLY to confirm executable liquidity on the opposite side.
-
-    Returns {"leg_a": (opp_px, opp_sz, reason), "leg_b": (...)} or None.
-    """
-    fail_a = leg_fail_prob(leg_a_side, fair_up_a)
-    fail_b = leg_fail_prob(leg_b_side, fair_up_b)
-    if max(fail_a, fail_b) < kill_threshold:
-        return None
-    if leg_a_opp_ask is None or leg_b_opp_ask is None:
-        return None
-    apx, asz = leg_a_opp_ask
-    bpx, bsz = leg_b_opp_ask
-    if apx <= 0 or bpx <= 0 or asz < qty or bsz < qty:
-        return None
-    reason = f"spot_kill(fa={fail_a:.2f},fb={fail_b:.2f})"
-    return {"leg_a": (apx, asz, reason), "leg_b": (bpx, bsz, reason)}
 
 
 def evaluate_reverse_box(

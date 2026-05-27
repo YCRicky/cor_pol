@@ -27,15 +27,20 @@ from common import (  # noqa: E402
     parse_clob_token_ids,
     parse_outcomes,
 )
+from execution import (  # noqa: E402
+    ExecutionLegResult,
+    LiveExecutionConfig,
+    PolymarketLiveExecutor,
+    merge_execution_results,
+)
 from lab.correlation_arb_core import (  # noqa: E402
     ArbSignal,
     GapHistogram,
     RollingStats,
     evaluate_arb_box,
     evaluate_reverse_box,
+    estimate_combo_quadrants,
     fair_up_from_spot,
-    leg_fail_prob,
-    policy_g_kill,
 )
 from notifier import TelegramConfig, TelegramNotifier  # noqa: E402
 
@@ -87,6 +92,9 @@ class MarketLeg:
     yes_token: str
     no_token: str
     symbol: str
+    condition_id: str = ""
+    tick_size: str = "0.01"
+    neg_risk: bool = False
     yes_book: SimpleBook = field(default_factory=SimpleBook)
     no_book: SimpleBook = field(default_factory=SimpleBook)
     spot_history: Deque[Tuple[float, float]] = field(default_factory=lambda: deque(maxlen=900))
@@ -120,6 +128,9 @@ def discover_leg(asset: str, symbol: str) -> MarketLeg:
         yes_token=str(yes_tok),
         no_token=str(no_tok),
         symbol=symbol,
+        condition_id=str(market.get("conditionId") or market.get("condition_id") or market.get("conditionID") or ""),
+        tick_size=str(market.get("minimum_tick_size") or market.get("minimumTickSize") or market.get("tick_size") or "0.01"),
+        neg_risk=bool(market.get("neg_risk") or market.get("negRisk") or False),
     )
 
 
@@ -270,15 +281,22 @@ class LabCombo:
     price_b: float
     qty: float
     entered_at: float
+    qty_a: float = 0.0
+    qty_b: float = 0.0
+    entry_gap: float = 0.0
+    entry_fav_bp_a: float = 0.0
+    entry_fav_bp_b: float = 0.0
     flipped_a: bool = False
     flipped_b: bool = False
     flip_price_a: float = 0.0
     flip_price_b: float = 0.0
+    flip_qty_a: float = 0.0
+    flip_qty_b: float = 0.0
     flip_reason_a: str = ""
     flip_reason_b: str = ""
     is_hedge: bool = False
     parent_combo_id: int = 0
-    adverse_since_ts: Optional[float] = None  # reserved; Policy G fires immediately
+    q4_watch_last_log: float = 0.0
 
 
 def best_ask_tuple(book: SimpleBook) -> Optional[Tuple[float, float]]:
@@ -304,6 +322,16 @@ def get_book_for_label(legs_by_asset: dict[str, MarketLeg], label: str) -> Simpl
     return leg.yes_book if side == "YES" else leg.no_book
 
 
+def get_leg_for_label(legs_by_asset: dict[str, MarketLeg], label: str) -> MarketLeg:
+    asset, _side = asset_side_of(label)
+    return legs_by_asset[asset]
+
+
+def token_id_for_label(legs_by_asset: dict[str, MarketLeg], label: str) -> str:
+    asset, side = asset_side_of(label)
+    return leg_token(legs_by_asset[asset], side)
+
+
 def opposite_label(label: str) -> str:
     asset, side = asset_side_of(label)
     return f"{asset}_{'NO' if side == 'YES' else 'YES'}"
@@ -313,20 +341,25 @@ def opposite_label(label: str) -> str:
 @dataclass
 class GateConfig:
     min_correlation: float = 0.65
-    min_gap: float = 0.06
-    max_gap: float = 0.18
+    min_gap: float = 0.04
+    max_gap: float = 0.22
     min_book_size: float = 5.0
     tte_min_s: int = 60
     tte_max_s: int = 270
     combo_qty: float = 5.0
-    max_combos_per_round: int = 5
-    max_cost_per_round_usd: float = 50.0
+    max_combos_per_round: int = 3
+    max_cost_per_round_usd: float = 15.0
     combo_cooldown_s: float = 15.0
     taker_fee: float = 0.0
     fair_block_margin: float = 0.05
     pm_resolution_wait_s: float = 1200.0
     pm_resolution_poll_s: float = 15.0
-    min_vol_bp_60s: float = 10.0
+    min_vol_bp_60s: float = 0.0
+    # Four-quadrant EV/tail diagnostic. The entry is still a cheap diagonal, but
+    # it must also have model edge and a bounded lose/lose quadrant.
+    min_model_edge: float = 0.01
+    max_bad_quad_prob: float = 0.22
+    max_bad_to_normal_ratio: float = 0.38
     # --- Finalized entry filter (OOS-validated on Run #2 -> Run #84) ---
     # Asymmetric mid: at entry, both PM legs must lean -- one >= asym_mid_hi, the
     # other <= asym_mid_lo. Both legs near 0.50 = coin-flip = Q4-prone, skip.
@@ -335,12 +368,13 @@ class GateConfig:
     # Minimum favorable bp: at entry, neither leg may already be deeper than
     # min_fav_bp adverse (negative = adverse). Default -4.0 bp.
     entry_min_fav_bp: float = -4.0
-    # --- Policy G defensive flip ---
-    # Trigger dual-flip when both legs have floating loss > eps_loss AND both have
-    # fair-model fail_prob >= t_recov, OR when either leg's fail_prob >= t_lock.
-    policy_g_eps_loss: float = 0.05
-    policy_g_t_recov: float = 0.55
-    policy_g_t_lock: float = 0.80
+    # Final fourth-quadrant kill:
+    # one executable leg loss has broken the entry edge by q4_dead_loss_gap_mult,
+    # the other leg is also below entry, and both legs are more spot-adverse than
+    # they were at entry.
+    q4_dead_loss_gap_mult: float = 2.0
+    q4_confirm_loss: float = 0.0
+    q4_fav_worsen_bp: float = 1.0
     # Tail hedge: not part of the finalized strategy, disabled by default.
     enable_tail_hedge: bool = False
     tail_hedge_qty_ratio: float = 0.30
@@ -350,6 +384,10 @@ class GateConfig:
     fast_poll_tte_s: int = 30
     poll_normal_s: float = 0.5
     poll_fast_s: float = 0.1
+    leg_mismatch_tolerance_shares: float = 1.0
+    exec_slippage_ticks: int = 2
+    exec_chase_slippage_ticks: int = 4
+    exec_max_chase_attempts: int = 2
 
 
 def shadow_fill(book: SimpleBook, side: str, target_qty: float) -> Tuple[float, float]:
@@ -372,6 +410,176 @@ def shadow_fill(book: SimpleBook, side: str, target_qty: float) -> Tuple[float, 
     if filled <= 0:
         return 0.0, 0.0
     return filled, notional / filled
+
+
+def make_shadow_result(label: str, token_id: str, target_qty: float, filled: float, avg_price: float) -> ExecutionLegResult:
+    return ExecutionLegResult(
+        label=label,
+        token_id=token_id,
+        requested_qty=target_qty,
+        filled_qty=filled,
+        avg_price=avg_price,
+        notional=filled * avg_price,
+        order_id="shadow",
+        status="shadow_fill" if filled > 0 else "shadow_no_fill",
+        ok=filled > 0,
+    )
+
+
+async def execute_buy_leg(
+    *,
+    legs_by_asset: dict[str, MarketLeg],
+    label: str,
+    qty: float,
+    live_executor: Optional[PolymarketLiveExecutor],
+    slippage_ticks: int,
+) -> ExecutionLegResult:
+    token_id = token_id_for_label(legs_by_asset, label)
+    book = get_book_for_label(legs_by_asset, label)
+    if live_executor is None:
+        filled, avg = shadow_fill(book, "BUY", qty)
+        return make_shadow_result(label, token_id, qty, filled, avg)
+    ask = best_ask_tuple(book)
+    if ask is None:
+        return ExecutionLegResult(label, token_id, qty, 0.0, 0.0, 0.0, ok=False, error="no_best_ask")
+    leg = get_leg_for_label(legs_by_asset, label)
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: live_executor.buy_limit_fak(
+            label=label,
+            token_id=token_id,
+            target_qty=qty,
+            best_ask=ask[0],
+            tick_size=leg.tick_size,
+            neg_risk=leg.neg_risk,
+            slippage_ticks=slippage_ticks,
+        ),
+    )
+
+
+async def execute_buy_pair(
+    *,
+    legs_by_asset: dict[str, MarketLeg],
+    leg_a: str,
+    leg_b: str,
+    qty: float,
+    gates: GateConfig,
+    live_executor: Optional[PolymarketLiveExecutor],
+) -> tuple[ExecutionLegResult, ExecutionLegResult, list[dict]]:
+    events: list[dict] = []
+    res_a = await execute_buy_leg(
+        legs_by_asset=legs_by_asset,
+        label=leg_a,
+        qty=qty,
+        live_executor=live_executor,
+        slippage_ticks=gates.exec_slippage_ticks,
+    )
+    res_b = await execute_buy_leg(
+        legs_by_asset=legs_by_asset,
+        label=leg_b,
+        qty=qty,
+        live_executor=live_executor,
+        slippage_ticks=gates.exec_slippage_ticks,
+    )
+    events.append({"phase": "initial", "leg": leg_a, **res_a.__dict__})
+    events.append({"phase": "initial", "leg": leg_b, **res_b.__dict__})
+
+    for attempt in range(1, gates.exec_max_chase_attempts + 1):
+        diff = res_a.filled_qty - res_b.filled_qty
+        if abs(diff) <= gates.leg_mismatch_tolerance_shares:
+            break
+        if diff > 0:
+            chase_label = leg_b
+            chase_qty = diff
+            extra = await execute_buy_leg(
+                legs_by_asset=legs_by_asset,
+                label=chase_label,
+                qty=chase_qty,
+                live_executor=live_executor,
+                slippage_ticks=gates.exec_chase_slippage_ticks,
+            )
+            res_b = merge_execution_results(res_b, extra)
+        else:
+            chase_label = leg_a
+            chase_qty = -diff
+            extra = await execute_buy_leg(
+                legs_by_asset=legs_by_asset,
+                label=chase_label,
+                qty=chase_qty,
+                live_executor=live_executor,
+                slippage_ticks=gates.exec_chase_slippage_ticks,
+            )
+            res_a = merge_execution_results(res_a, extra)
+        events.append({"phase": f"chase_{attempt}", "leg": chase_label, **extra.__dict__})
+        if extra.filled_qty <= 0:
+            break
+    return res_a, res_b, events
+
+
+def pm_long_mark_from_opposite(
+    legs_by_asset: dict[str, MarketLeg],
+    label: str,
+) -> Optional[Tuple[str, SimpleBook, float, float, float]]:
+    """Conservative PM mark for a long binary leg.
+
+    If we hold YES, buying NO at the current ask locks $1 at resolution, so the
+    executable mark for the YES leg is `1 - NO_ask`. This is also the action the
+    kill path uses to stop fourth-quadrant downside.
+    """
+    opp_label = opposite_label(label)
+    opp_book = get_book_for_label(legs_by_asset, opp_label)
+    opp = best_ask_tuple(opp_book)
+    if opp is None:
+        return None
+    opp_px, opp_sz = opp
+    if opp_px <= 0 or opp_sz <= 0:
+        return None
+    return opp_label, opp_book, opp_px, opp_sz, 1.0 - opp_px
+
+
+def leg_fav_bp(legs_by_asset: dict[str, MarketLeg], label: str) -> Optional[float]:
+    asset, side = asset_side_of(label)
+    leg = legs_by_asset[asset]
+    last = leg.last_spot()
+    if last is None or leg.open_px is None or leg.open_px <= 0:
+        return None
+    bp = (last / leg.open_px - 1.0) * 1e4
+    return bp if side == "YES" else -bp
+
+
+def fourth_quadrant_kill_reason(
+    combo: LabCombo,
+    loss_a: float,
+    loss_b: float,
+    fav_bp_a: float,
+    fav_bp_b: float,
+    gates: GateConfig,
+) -> Optional[str]:
+    """Final asymmetric Q4 kill.
+
+    A combo should be cut when one leg's executable loss has overwhelmed the
+    original entry edge and the other leg has crossed below entry too. Requiring
+    both legs to be worse than their entry fav_bp avoids killing a normal
+    one-win-one-lose path just because the PM book widens briefly.
+    """
+    entry_gap = max(combo.entry_gap, 1e-6)
+    max_loss = max(loss_a, loss_b)
+    min_loss = min(loss_a, loss_b)
+    dead_leg = max_loss >= gates.q4_dead_loss_gap_mult * entry_gap
+    other_leg_confirmed = min_loss > gates.q4_confirm_loss
+    both_current_adverse = fav_bp_a < 0.0 and fav_bp_b < 0.0
+    both_worse_than_entry = (
+        fav_bp_a <= combo.entry_fav_bp_a - gates.q4_fav_worsen_bp
+        and fav_bp_b <= combo.entry_fav_bp_b - gates.q4_fav_worsen_bp
+    )
+    if not (dead_leg and other_leg_confirmed and both_current_adverse and both_worse_than_entry):
+        return None
+    return (
+        f"Q4_asym(lossA={loss_a:.3f},lossB={loss_b:.3f},"
+        f"gap={entry_gap:.3f},favA={combo.entry_fav_bp_a:+.1f}->{fav_bp_a:+.1f},"
+        f"favB={combo.entry_fav_bp_b:+.1f}->{fav_bp_b:+.1f})"
+    )
 
 
 def try_entry(
@@ -445,8 +653,29 @@ def try_entry(
         return None, diag
     fair_a = fair_up_btc if sig.leg_a == "BTC_YES" else (1.0 - fair_up_btc) if sig.leg_a == "BTC_NO" else fair_up_eth if sig.leg_a == "ETH_YES" else (1.0 - fair_up_eth)
     fair_b = fair_up_btc if sig.leg_b == "BTC_YES" else (1.0 - fair_up_btc) if sig.leg_b == "BTC_NO" else fair_up_eth if sig.leg_b == "ETH_YES" else (1.0 - fair_up_eth)
-    if fair_a + fair_b < (sig.price_a + sig.price_b) - gates.fair_block_margin:
-        diag["reason"] = f"fair_blocks:{fair_a + fair_b:.3f}<{sig.price_a + sig.price_b:.3f}"
+    cost = sig.price_a + sig.price_b
+    quad = estimate_combo_quadrants(fair_a, fair_b, cost, rho)
+    normal_prob = quad.win_lose + quad.lose_win
+    bad_to_normal = quad.lose_lose / max(normal_prob, 1e-9)
+    diag.update({
+        "fair_a": fair_a,
+        "fair_b": fair_b,
+        "quad_win_win": quad.win_win,
+        "quad_win_lose": quad.win_lose,
+        "quad_lose_win": quad.lose_win,
+        "quad_lose_lose": quad.lose_lose,
+        "quad_model_edge": quad.model_edge,
+        "quad_event_corr": quad.event_corr,
+        "bad_to_normal": bad_to_normal,
+    })
+    if quad.model_edge < gates.min_model_edge:
+        diag["reason"] = f"model_edge_low:{quad.model_edge:+.4f}<{gates.min_model_edge:+.4f}"
+        return None, diag
+    if quad.lose_lose > gates.max_bad_quad_prob:
+        diag["reason"] = f"bad_quad_high:{quad.lose_lose:.3f}>{gates.max_bad_quad_prob:.3f}"
+        return None, diag
+    if bad_to_normal > gates.max_bad_to_normal_ratio:
+        diag["reason"] = f"bad_quad_ratio:{bad_to_normal:.3f}>{gates.max_bad_to_normal_ratio:.3f}"
         return None, diag
     q = hist.quantile(0.95)
     if q is not None and sig.gap > q * 1.5 and len(hist.samples) > 100:
@@ -484,8 +713,6 @@ def try_entry(
                           f"need>={gates.entry_min_fav_bp:+.1f}")
         return None, diag
 
-    diag["fair_a"] = fair_a
-    diag["fair_b"] = fair_b
     return sig, diag
 
 
@@ -507,6 +734,7 @@ async def strategy_loop(
     jsonl: Path,
     round_idx: int,
     notify=None,
+    live_executor: Optional[PolymarketLiveExecutor] = None,
 ) -> dict:
     combos: list[LabCombo] = []
     last_log = 0.0
@@ -516,7 +744,7 @@ async def strategy_loop(
     total_cost = 0.0
 
     def aggregate_cost() -> float:
-        return sum((c.price_a + c.price_b) * c.qty for c in combos)
+        return sum(c.price_a * max(c.qty_a, c.qty) + c.price_b * max(c.qty_b, c.qty) for c in combos)
 
     while time.time() < stop_at:
         now = time.time()
@@ -566,25 +794,83 @@ async def strategy_loop(
                 book_a = get_book_for_label(legs_by_asset, sig.leg_a)
                 book_b = get_book_for_label(legs_by_asset, sig.leg_b)
                 budget_left = gates.max_cost_per_round_usd - total_cost
-                max_qty_by_budget = budget_left / max(sig.price_a + sig.price_b, 1e-6)
-                qty_target = min(gates.combo_qty, sig.size_a, sig.size_b, max_qty_by_budget)
-                if qty_target <= 0:
+                estimated_combo_cost = (sig.price_a + sig.price_b) * gates.combo_qty
+                qty_target = gates.combo_qty
+                if estimated_combo_cost > budget_left or sig.size_a < qty_target or sig.size_b < qty_target:
                     _log(jsonl, {"kind": "entry_reject", "ts": now, "tte": tte,
-                                 "reason": "no_budget_or_size", "budget_left": budget_left})
+                                 "reason": "no_budget_or_size", "budget_left": budget_left,
+                                 "estimated_combo_cost": estimated_combo_cost,
+                                 "size_a": sig.size_a, "size_b": sig.size_b,
+                                 "qty_target": qty_target})
                 else:
-                    fa, pa = shadow_fill(book_a, "BUY", qty_target)
-                    fb, pb = shadow_fill(book_b, "BUY", qty_target)
+                    res_a, res_b, exec_events = await execute_buy_pair(
+                        legs_by_asset=legs_by_asset,
+                        leg_a=sig.leg_a,
+                        leg_b=sig.leg_b,
+                        qty=qty_target,
+                        gates=gates,
+                        live_executor=live_executor,
+                    )
+                    for ev in exec_events:
+                        _log(jsonl, {"kind": "order_fill", "ts": now, "tte": tte, "combo_id": next_combo_id, **ev})
+                    fa, pa = res_a.filled_qty, res_a.avg_price
+                    fb, pb = res_b.filled_qty, res_b.avg_price
                     qty = min(fa, fb)
-                    if qty > 0:
+                    imbalance = abs(fa - fb)
+                    if max(fa, fb) > 0:
                         combo = LabCombo(
                             combo_id=next_combo_id,
                             direction=sig.direction,
                             leg_a=sig.leg_a, leg_b=sig.leg_b,
                             price_a=pa, price_b=pb, qty=qty,
                             entered_at=now,
+                            qty_a=fa,
+                            qty_b=fb,
+                            entry_gap=sig.gap,
+                            entry_fav_bp_a=float(diag.get("fav_bp_a", 0.0)),
+                            entry_fav_bp_b=float(diag.get("fav_bp_b", 0.0)),
                         )
                         combos.append(combo)
                         last_fill_at = now
+                        hedge_result = None
+                        if imbalance > gates.leg_mismatch_tolerance_shares:
+                            excess_qty = imbalance - gates.leg_mismatch_tolerance_shares
+                            if fa > fb:
+                                hedge_label = opposite_label(sig.leg_a)
+                                hedge_result = await execute_buy_leg(
+                                    legs_by_asset=legs_by_asset,
+                                    label=hedge_label,
+                                    qty=excess_qty,
+                                    live_executor=live_executor,
+                                    slippage_ticks=gates.exec_chase_slippage_ticks,
+                                )
+                                if hedge_result.filled_qty > 0:
+                                    combo.flip_qty_a += hedge_result.filled_qty
+                                    combo.flip_price_a = hedge_result.avg_price
+                                    combo.flip_reason_a = "entry_imbalance_hedge"
+                            else:
+                                hedge_label = opposite_label(sig.leg_b)
+                                hedge_result = await execute_buy_leg(
+                                    legs_by_asset=legs_by_asset,
+                                    label=hedge_label,
+                                    qty=excess_qty,
+                                    live_executor=live_executor,
+                                    slippage_ticks=gates.exec_chase_slippage_ticks,
+                                )
+                                if hedge_result.filled_qty > 0:
+                                    combo.flip_qty_b += hedge_result.filled_qty
+                                    combo.flip_price_b = hedge_result.avg_price
+                                    combo.flip_reason_b = "entry_imbalance_hedge"
+                            _log(jsonl, {
+                                "kind": "entry_imbalance_hedge",
+                                "ts": now,
+                                "tte": tte,
+                                "combo_id": combo.combo_id,
+                                "imbalance": imbalance,
+                                "tolerance": gates.leg_mismatch_tolerance_shares,
+                                "hedge_label": hedge_label,
+                                **(hedge_result.__dict__ if hedge_result else {}),
+                            })
                         total_cost = aggregate_cost()
                         next_combo_id += 1
                         _log(jsonl, {
@@ -594,7 +880,22 @@ async def strategy_loop(
                             "leg_a": sig.leg_a, "price_a": pa, "qty_a": fa,
                             "leg_b": sig.leg_b, "price_b": pb, "qty_b": fb,
                             "qty": qty, "gap": sig.gap, "rho": sig.correlation,
+                            "leg_imbalance": imbalance,
+                            "balanced": imbalance <= gates.leg_mismatch_tolerance_shares,
+                            "execution": "live" if live_executor else "shadow",
+                            "order_id_a": res_a.order_id,
+                            "order_id_b": res_b.order_id,
+                            "status_a": res_a.status,
+                            "status_b": res_b.status,
+                            "error_a": res_a.error,
+                            "error_b": res_b.error,
                             "fair_diff": sig.fair_diff,
+                            "quad_win_win": diag.get("quad_win_win"),
+                            "quad_win_lose": diag.get("quad_win_lose"),
+                            "quad_lose_win": diag.get("quad_lose_win"),
+                            "quad_lose_lose": diag.get("quad_lose_lose"),
+                            "quad_model_edge": diag.get("quad_model_edge"),
+                            "bad_to_normal": diag.get("bad_to_normal"),
                             "is_hedge": False,
                             "combos_open": len(combos), "total_cost": round(total_cost, 4),
                         })
@@ -604,7 +905,10 @@ async def strategy_loop(
                                 "tte": tte, "direction": sig.direction,
                                 "leg_a": sig.leg_a, "price_a": pa,
                                 "leg_b": sig.leg_b, "price_b": pb,
-                                "qty": qty, "gap": sig.gap, "rho": sig.correlation,
+                                "qty": qty, "qty_a": fa, "qty_b": fb,
+                                "imbalance": imbalance,
+                                "execution": "live" if live_executor else "shadow",
+                                "gap": sig.gap, "rho": sig.correlation,
                             })
                         if gates.enable_tail_hedge:
                             rev = evaluate_reverse_box(ba, na, eya, ena, sig.direction)
@@ -654,73 +958,162 @@ async def strategy_loop(
                                     })
 
         if combos:
-            btc_spot = btc.last_spot()
-            eth_spot = eth.last_spot()
-            sigma_b = stats.realized_sigma_per_sec("btc") or 3.5e-4
-            sigma_e = stats.realized_sigma_per_sec("eth") or 4.0e-4
-            fub = fair_up_from_spot(btc.open_px or btc_spot or 1.0, btc_spot or 1.0, sigma_b, tte) if btc_spot else 0.5
-            fue = fair_up_from_spot(eth.open_px or eth_spot or 1.0, eth_spot or 1.0, sigma_e, tte) if eth_spot else 0.5
             for combo in combos:
                 if combo.flipped_a and combo.flipped_b:
                     continue
-                asset_a = label_to_asset(combo.leg_a)
-                asset_b = label_to_asset(combo.leg_b)
-                side_a = label_to_side(combo.leg_a)
-                side_b = label_to_side(combo.leg_b)
-                fair_a = fub if asset_a == "BTC" else fue
-                fair_b = fub if asset_b == "BTC" else fue
-                opp_a_label = opposite_label(combo.leg_a)
-                opp_b_label = opposite_label(combo.leg_b)
-                opp_a_book = get_book_for_label(legs_by_asset, opp_a_label)
-                opp_b_book = get_book_for_label(legs_by_asset, opp_b_label)
-                opp_a = best_ask_tuple(opp_a_book)
-                opp_b = best_ask_tuple(opp_b_book)
-                plan = policy_g_kill(
-                    leg_a_side=side_a, fair_up_a=fair_a, entry_a=combo.price_a,
-                    leg_b_side=side_b, fair_up_b=fair_b, entry_b=combo.price_b,
-                    leg_a_opp_ask=opp_a, leg_b_opp_ask=opp_b,
-                    qty=combo.qty,
-                    eps_loss=gates.policy_g_eps_loss,
-                    t_recov=gates.policy_g_t_recov,
-                    t_lock=gates.policy_g_t_lock,
-                )
-                if plan is None:
+                combo_qty_a = max(combo.qty_a, combo.qty)
+                combo_qty_b = max(combo.qty_b, combo.qty)
+                remaining_flip_a = max(0.0, combo_qty_a - combo.flip_qty_a)
+                remaining_flip_b = max(0.0, combo_qty_b - combo.flip_qty_b)
+                exec_a = pm_long_mark_from_opposite(legs_by_asset, combo.leg_a)
+                exec_b = pm_long_mark_from_opposite(legs_by_asset, combo.leg_b)
+                fav_bp_a = leg_fav_bp(legs_by_asset, combo.leg_a)
+                fav_bp_b = leg_fav_bp(legs_by_asset, combo.leg_b)
+                if exec_a is None or exec_b is None:
                     continue
-                _apx, asz, areason = plan["leg_a"]
-                _bpx, bsz, breason = plan["leg_b"]
-                ffa, fpa = shadow_fill(opp_a_book, "BUY", combo.qty)
-                ffb, fpb = shadow_fill(opp_b_book, "BUY", combo.qty)
-                if ffa >= combo.qty and ffb >= combo.qty:
+                if fav_bp_a is None or fav_bp_b is None:
+                    continue
+                opp_a_label, opp_a_book, opp_a_px, opp_a_sz, exec_mark_a = exec_a
+                opp_b_label, opp_b_book, opp_b_px, opp_b_sz, exec_mark_b = exec_b
+                exec_fpnl_a = exec_mark_a - combo.price_a
+                exec_fpnl_b = exec_mark_b - combo.price_b
+                loss_a = -exec_fpnl_a
+                loss_b = -exec_fpnl_b
+                reason = fourth_quadrant_kill_reason(
+                    combo, loss_a, loss_b, fav_bp_a, fav_bp_b, gates,
+                )
+                if reason is None:
+                    partial_q4 = (
+                        fav_bp_a < 0.0 and fav_bp_b < 0.0
+                        and max(loss_a, loss_b) >= combo.entry_gap
+                        and min(loss_a, loss_b) > 0.0
+                    )
+                    if partial_q4 and now - combo.q4_watch_last_log >= 5.0:
+                        combo.q4_watch_last_log = now
+                        _log(jsonl, {
+                            "kind": "q4_watch", "ts": now, "tte": tte,
+                            "combo_id": combo.combo_id,
+                            "leg_a": combo.leg_a, "leg_b": combo.leg_b,
+                            "exec_mark_a": exec_mark_a, "exec_mark_b": exec_mark_b,
+                            "exec_fpnl_a": exec_fpnl_a, "exec_fpnl_b": exec_fpnl_b,
+                            "loss_a": loss_a, "loss_b": loss_b,
+                            "fav_bp_a": fav_bp_a, "fav_bp_b": fav_bp_b,
+                            "entry_fav_bp_a": combo.entry_fav_bp_a,
+                            "entry_fav_bp_b": combo.entry_fav_bp_b,
+                            "entry_gap": combo.entry_gap,
+                            "dead_threshold": gates.q4_dead_loss_gap_mult * max(combo.entry_gap, 1e-6),
+                            "fav_worse_a": fav_bp_a <= combo.entry_fav_bp_a - gates.q4_fav_worsen_bp,
+                            "fav_worse_b": fav_bp_b <= combo.entry_fav_bp_b - gates.q4_fav_worsen_bp,
+                        })
+                    continue
+                if live_executor is None and (opp_a_sz < remaining_flip_a or opp_b_sz < remaining_flip_b):
+                    _log(jsonl, {
+                        "kind": "combo_kill_no_liquidity", "ts": now, "tte": tte,
+                        "combo_id": combo.combo_id,
+                        "leg_a": combo.leg_a, "opp_a": opp_a_label,
+                        "opp_a_px": opp_a_px, "opp_a_size": opp_a_sz,
+                        "leg_b": combo.leg_b, "opp_b": opp_b_label,
+                        "opp_b_px": opp_b_px, "opp_b_size": opp_b_sz,
+                        "qty_target_a": remaining_flip_a,
+                        "qty_target_b": remaining_flip_b,
+                        "exec_fpnl_a": exec_fpnl_a, "exec_fpnl_b": exec_fpnl_b,
+                        "loss_a": loss_a, "loss_b": loss_b,
+                        "fav_bp_a": fav_bp_a, "fav_bp_b": fav_bp_b,
+                        "entry_fav_bp_a": combo.entry_fav_bp_a,
+                        "entry_fav_bp_b": combo.entry_fav_bp_b,
+                        "entry_gap": combo.entry_gap,
+                        "reason": reason,
+                    })
+                    continue
+                if remaining_flip_a <= 0 and remaining_flip_b <= 0:
                     combo.flipped_a = True
-                    combo.flip_price_a = fpa
-                    combo.flip_reason_a = areason
                     combo.flipped_b = True
-                    combo.flip_price_b = fpb
-                    combo.flip_reason_b = breason
+                    continue
+                if live_executor is None:
+                    ffa, fpa = shadow_fill(opp_a_book, "BUY", remaining_flip_a)
+                    ffb, fpb = shadow_fill(opp_b_book, "BUY", remaining_flip_b)
+                    res_flip_a = make_shadow_result(opp_a_label, token_id_for_label(legs_by_asset, opp_a_label), remaining_flip_a, ffa, fpa)
+                    res_flip_b = make_shadow_result(opp_b_label, token_id_for_label(legs_by_asset, opp_b_label), remaining_flip_b, ffb, fpb)
+                else:
+                    res_flip_a = await execute_buy_leg(
+                        legs_by_asset=legs_by_asset,
+                        label=opp_a_label,
+                        qty=remaining_flip_a,
+                        live_executor=live_executor,
+                        slippage_ticks=gates.exec_chase_slippage_ticks,
+                    )
+                    res_flip_b = await execute_buy_leg(
+                        legs_by_asset=legs_by_asset,
+                        label=opp_b_label,
+                        qty=remaining_flip_b,
+                        live_executor=live_executor,
+                        slippage_ticks=gates.exec_chase_slippage_ticks,
+                    )
+                    _log(jsonl, {"kind": "kill_order_fill", "ts": now, "tte": tte, "combo_id": combo.combo_id,
+                                 "phase": "kill", "leg": opp_a_label, **res_flip_a.__dict__})
+                    _log(jsonl, {"kind": "kill_order_fill", "ts": now, "tte": tte, "combo_id": combo.combo_id,
+                                 "phase": "kill", "leg": opp_b_label, **res_flip_b.__dict__})
+                ffa, fpa = res_flip_a.filled_qty, res_flip_a.avg_price
+                ffb, fpb = res_flip_b.filled_qty, res_flip_b.avg_price
+                if ffa > 0:
+                    old_qty = combo.flip_qty_a
+                    combo.flip_qty_a += ffa
+                    combo.flip_price_a = ((combo.flip_price_a * old_qty) + (fpa * ffa)) / combo.flip_qty_a
+                    combo.flip_reason_a = reason
+                    combo.flipped_a = combo.flip_qty_a >= max(0.0, combo_qty_a - gates.leg_mismatch_tolerance_shares)
+                if ffb > 0:
+                    old_qty = combo.flip_qty_b
+                    combo.flip_qty_b += ffb
+                    combo.flip_price_b = ((combo.flip_price_b * old_qty) + (fpb * ffb)) / combo.flip_qty_b
+                    combo.flip_reason_b = reason
+                    combo.flipped_b = combo.flip_qty_b >= max(0.0, combo_qty_b - gates.leg_mismatch_tolerance_shares)
+                if ffa > 0 or ffb > 0:
                     _log(jsonl, {
                         "kind": "combo_kill", "ts": now, "tte": tte,
                         "combo_id": combo.combo_id, "is_hedge": combo.is_hedge,
                         "leg_a": combo.leg_a, "opp_a": opp_a_label,
-                        "reason_a": areason, "entry_a": combo.price_a,
+                        "reason_a": reason, "entry_a": combo.price_a,
+                        "exec_mark_a": exec_mark_a, "exec_fpnl_a": exec_fpnl_a,
+                        "loss_a": loss_a,
+                        "fav_bp_a": fav_bp_a,
+                        "entry_fav_bp_a": combo.entry_fav_bp_a,
                         "flip_price_a": fpa, "qty_a": ffa,
+                        "flip_total_qty_a": combo.flip_qty_a,
+                        "order_id_a": res_flip_a.order_id,
+                        "status_a": res_flip_a.status,
+                        "error_a": res_flip_a.error,
                         "leg_b": combo.leg_b, "opp_b": opp_b_label,
-                        "reason_b": breason, "entry_b": combo.price_b,
+                        "reason_b": reason, "entry_b": combo.price_b,
+                        "exec_mark_b": exec_mark_b, "exec_fpnl_b": exec_fpnl_b,
+                        "loss_b": loss_b,
+                        "fav_bp_b": fav_bp_b,
+                        "entry_fav_bp_b": combo.entry_fav_bp_b,
+                        "entry_gap": combo.entry_gap,
                         "flip_price_b": fpb, "qty_b": ffb,
-                        "fair_up_btc": fub, "fair_up_eth": fue,
+                        "flip_total_qty_b": combo.flip_qty_b,
+                        "order_id_b": res_flip_b.order_id,
+                        "status_b": res_flip_b.status,
+                        "error_b": res_flip_b.error,
                     })
                     if notify:
                         notify("flip", {
                             "round": round_idx, "combo_id": combo.combo_id,
-                            "tte": tte, "reason": areason,
+                            "tte": tte, "reason": reason,
                             "leg_a": combo.leg_a, "entry_a": combo.price_a, "flip_a": fpa,
                             "leg_b": combo.leg_b, "entry_b": combo.price_b, "flip_b": fpb,
-                            "qty": combo.qty,
+                            "qty": min(ffa, ffb),
+                            "qty_a": ffa,
+                            "qty_b": ffb,
+                            "execution": "live" if live_executor else "shadow",
                         })
                 else:
                     _log(jsonl, {
                         "kind": "combo_kill_partial", "ts": now, "tte": tte,
                         "combo_id": combo.combo_id, "ffa": ffa, "ffb": ffb,
-                        "qty_target": combo.qty,
+                        "qty_target_a": remaining_flip_a,
+                        "qty_target_b": remaining_flip_b,
+                        "error_a": res_flip_a.error,
+                        "error_b": res_flip_b.error,
                     })
 
         poll_dt = gates.poll_fast_s if tte <= gates.fast_poll_tte_s else gates.poll_normal_s
@@ -744,7 +1137,7 @@ async def strategy_loop(
     }
     _log(jsonl, {**pending, "combos": [c.__dict__ for c in combos]})
     print(f"[ROUND {round_idx}] window ended; trading phase done with {len(combos)} combos "
-          f"(cost ${sum((c.price_a + c.price_b) * c.qty for c in combos):.2f}). "
+          f"(cost ${sum(c.price_a * max(c.qty_a, c.qty) + c.price_b * max(c.qty_b, c.qty) for c in combos):.2f}). "
           f"PM resolution deferred to post-run.")
     return pending
 
@@ -791,8 +1184,11 @@ async def resolve_round(pending: dict, gates: GateConfig, notify=None) -> dict:
             "combo_id": c.combo_id, "direction": c.direction,
             "leg_a": c.leg_a, "price_a": c.price_a,
             "leg_b": c.leg_b, "price_b": c.price_b, "qty": c.qty,
+            "qty_a": max(c.qty_a, c.qty), "qty_b": max(c.qty_b, c.qty),
             "flipped_a": c.flipped_a, "flip_price_a": c.flip_price_a,
+            "flip_qty_a": c.flip_qty_a,
             "flipped_b": c.flipped_b, "flip_price_b": c.flip_price_b,
+            "flip_qty_b": c.flip_qty_b,
         } for c in combos]
         _log(jsonl_path, summary)
         return summary
@@ -804,11 +1200,13 @@ async def resolve_round(pending: dict, gates: GateConfig, notify=None) -> dict:
     total_flip = 0.0
     combo_rows = []
     for c in combos:
-        leg_a_pay = payoffs[c.leg_a] * c.qty
-        leg_b_pay = payoffs[c.leg_b] * c.qty
-        cost = (c.price_a + c.price_b) * c.qty
-        flip_pnl_a = (payoffs[opposite_label(c.leg_a)] - c.flip_price_a) * c.qty if c.flipped_a else 0.0
-        flip_pnl_b = (payoffs[opposite_label(c.leg_b)] - c.flip_price_b) * c.qty if c.flipped_b else 0.0
+        qty_a = max(c.qty_a, c.qty)
+        qty_b = max(c.qty_b, c.qty)
+        leg_a_pay = payoffs[c.leg_a] * qty_a
+        leg_b_pay = payoffs[c.leg_b] * qty_b
+        cost = c.price_a * qty_a + c.price_b * qty_b
+        flip_pnl_a = (payoffs[opposite_label(c.leg_a)] - c.flip_price_a) * c.flip_qty_a if c.flip_qty_a > 0 else 0.0
+        flip_pnl_b = (payoffs[opposite_label(c.leg_b)] - c.flip_price_b) * c.flip_qty_b if c.flip_qty_b > 0 else 0.0
         pnl_c = leg_a_pay + leg_b_pay - cost + flip_pnl_a + flip_pnl_b
         total_cost += cost
         total_gross += leg_a_pay + leg_b_pay
@@ -817,9 +1215,11 @@ async def resolve_round(pending: dict, gates: GateConfig, notify=None) -> dict:
             "combo_id": c.combo_id, "direction": c.direction,
             "leg_a": c.leg_a, "price_a": c.price_a, "payoff_a": payoffs[c.leg_a],
             "leg_b": c.leg_b, "price_b": c.price_b, "payoff_b": payoffs[c.leg_b],
-            "qty": c.qty,
-            "flipped_a": c.flipped_a, "flip_price_a": c.flip_price_a, "flip_pnl_a": flip_pnl_a,
-            "flipped_b": c.flipped_b, "flip_price_b": c.flip_price_b, "flip_pnl_b": flip_pnl_b,
+            "qty": c.qty, "qty_a": qty_a, "qty_b": qty_b,
+            "flipped_a": c.flipped_a, "flip_price_a": c.flip_price_a,
+            "flip_qty_a": c.flip_qty_a, "flip_pnl_a": flip_pnl_a,
+            "flipped_b": c.flipped_b, "flip_price_b": c.flip_price_b,
+            "flip_qty_b": c.flip_qty_b, "flip_pnl_b": flip_pnl_b,
             "cost": cost, "gross": leg_a_pay + leg_b_pay, "pnl": pnl_c,
         })
     pnl = total_gross - total_cost + total_flip
@@ -844,12 +1244,25 @@ async def resolve_round(pending: dict, gates: GateConfig, notify=None) -> dict:
 
 
 async def run_round(round_idx: int, gates: GateConfig, stats: RollingStats,
-                    hist: GapHistogram, notify=None) -> dict:
+                    hist: GapHistogram, notify=None,
+                    live_executor: Optional[PolymarketLiveExecutor] = None) -> dict:
     btc_leg = discover_leg("BTC", "BTCUSDT")
     eth_leg = discover_leg("ETH", "ETHUSDT")
     if btc_leg.start_ts != eth_leg.start_ts or btc_leg.end_ts != eth_leg.end_ts:
-        print(f"[ROUND {round_idx}] WARNING: BTC/ETH market windows misaligned "
+        print(f"[ROUND {round_idx}] SKIP: BTC/ETH market windows misaligned "
               f"btc={btc_leg.start_ts}-{btc_leg.end_ts} eth={eth_leg.start_ts}-{eth_leg.end_ts}")
+        return {
+            "round": round_idx,
+            "kind": "round_skip",
+            "status": "SKIPPED",
+            "reason": "window_mismatch",
+            "btc_slug": btc_leg.slug,
+            "eth_slug": eth_leg.slug,
+            "btc_start_ts": btc_leg.start_ts,
+            "btc_end_ts": btc_leg.end_ts,
+            "eth_start_ts": eth_leg.start_ts,
+            "eth_end_ts": eth_leg.end_ts,
+        }
     legs = [btc_leg, eth_leg]
     legs_by_asset = {"BTC": btc_leg, "ETH": eth_leg}
     end_ts = min(btc_leg.end_ts, eth_leg.end_ts)
@@ -863,12 +1276,20 @@ async def run_round(round_idx: int, gates: GateConfig, stats: RollingStats,
         "btc_slug": btc_leg.slug, "eth_slug": eth_leg.slug,
         "btc_start_ts": btc_leg.start_ts, "btc_end_ts": btc_leg.end_ts,
         "eth_start_ts": eth_leg.start_ts, "eth_end_ts": eth_leg.end_ts,
+        "btc_condition_id": btc_leg.condition_id,
+        "eth_condition_id": eth_leg.condition_id,
+        "btc_tick_size": btc_leg.tick_size,
+        "eth_tick_size": eth_leg.tick_size,
+        "btc_neg_risk": btc_leg.neg_risk,
+        "eth_neg_risk": eth_leg.neg_risk,
         "gates": gates.__dict__,
+        "execution": "live" if live_executor else "shadow",
     })
     results = await asyncio.gather(
         ws_consumer(legs, stop_at),
         spot_pump(legs, stop_at, stats),
-        strategy_loop(legs_by_asset, stats, gates, hist, stop_at, end_ts, jsonl, round_idx, notify=notify),
+        strategy_loop(legs_by_asset, stats, gates, hist, stop_at, end_ts, jsonl, round_idx,
+                      notify=notify, live_executor=live_executor),
     )
     pending = results[2]
     return pending
@@ -888,26 +1309,37 @@ def _build_notifier():
 
 def _format_event(kind: str, data: dict) -> str:
     if kind == "entry":
-        return (f"\U0001f7e2 ENTRY R{data['round']} c{data['combo_id']} tte={data['tte']}s\n"
+        qty_line = f"  qty={data.get('qty', 0.0):.2f}"
+        if "qty_a" in data or "qty_b" in data:
+            qty_line = (
+                f"  qtyA={data.get('qty_a', 0.0):.2f} qtyB={data.get('qty_b', 0.0):.2f} "
+                f"imb={data.get('imbalance', 0.0):.2f}"
+            )
+        exec_line = f"  exec={data.get('execution', 'shadow')}"
+        return (f"ENTRY R{data['round']} c{data['combo_id']} tte={data['tte']}s\n"
                 f"  {data['leg_a']} @ {data['price_a']:.3f}\n"
                 f"  {data['leg_b']} @ {data['price_b']:.3f}\n"
-                f"  qty={data['qty']:.2f}  gap={data['gap']:+.4f}  rho={data['correlation']:.2f}"
+                f"{qty_line}  gap={data['gap']:+.4f}  rho={data['correlation']:.2f}\n"
+                f"{exec_line}"
                 if 'correlation' in data else
-                f"\U0001f7e2 ENTRY R{data['round']} c{data['combo_id']} tte={data['tte']}s\n"
+                f"ENTRY R{data['round']} c{data['combo_id']} tte={data['tte']}s\n"
                 f"  {data['leg_a']} @ {data['price_a']:.3f}\n"
                 f"  {data['leg_b']} @ {data['price_b']:.3f}\n"
-                f"  qty={data['qty']:.2f}  gap={data['gap']:+.4f}  rho={data['rho']:.2f}")
+                f"{qty_line}  gap={data['gap']:+.4f}  rho={data['rho']:.2f}\n"
+                f"{exec_line}")
     if kind == "flip":
-        return (f"\U0001f534 FLIP R{data['round']} c{data['combo_id']} tte={data['tte']}s\n"
+        return (f"FLIP R{data['round']} c{data['combo_id']} tte={data['tte']}s\n"
                 f"  reason: {data['reason']}\n"
                 f"  {data['leg_a']} entry={data['entry_a']:.3f} -> flip={data['flip_a']:.3f}\n"
                 f"  {data['leg_b']} entry={data['entry_b']:.3f} -> flip={data['flip_b']:.3f}\n"
-                f"  qty={data['qty']:.2f}")
+                f"  qtyA={data.get('qty_a', data.get('qty', 0.0)):.2f} qtyB={data.get('qty_b', data.get('qty', 0.0)):.2f} "
+                f"exec={data.get('execution', 'shadow')}")
     if kind == "settle":
         div = " (DIV)" if data.get("divergence") else ""
-        return (f"\U0001f3c1 SETTLE R{data['round']}{div} pnl=${data['pnl']:+.2f}\n"
+        return (f"SETTLE R{data['round']}{div} pnl=${data['pnl']:+.2f}\n"
                 f"  combos={data['n_combos']}  cost=${data['cost']:.2f}  gross=${data['gross']:.2f}  flip=${data['flip_pnl']:+.2f}\n"
-                f"  pm_btc={data['pm_btc_up']}  pm_eth={data['pm_eth_up']}")
+                f"  pm_btc={data['pm_btc_up']}  pm_eth={data['pm_eth_up']}\n"
+                f"  run_pnl=${data.get('run_pnl', data['pnl']):+.2f} resolved={data.get('resolved_count', 1)}")
     return f"{kind}: {data}"
 
 
@@ -927,35 +1359,130 @@ def _make_notify(notifier):
     return _notify
 
 
+@dataclass
+class RunLedger:
+    resolved_count: int = 0
+    divergence_count: int = 0
+    total_pnl: float = 0.0
+    total_cost: float = 0.0
+    total_gross: float = 0.0
+    total_flip: float = 0.0
+
+    def record(self, summary: dict) -> dict:
+        if summary.get("status") != "OK":
+            return {
+                "resolved_count": self.resolved_count,
+                "divergence_count": self.divergence_count,
+                "run_pnl": self.total_pnl,
+            }
+        self.resolved_count += 1
+        if summary.get("divergence"):
+            self.divergence_count += 1
+        self.total_pnl += float(summary.get("pnl", 0.0) or 0.0)
+        self.total_cost += float(summary.get("cost", 0.0) or 0.0)
+        self.total_gross += float(summary.get("gross", 0.0) or 0.0)
+        self.total_flip += float(summary.get("flip_pnl", 0.0) or 0.0)
+        return {
+            "resolved_count": self.resolved_count,
+            "divergence_count": self.divergence_count,
+            "run_pnl": self.total_pnl,
+            "run_cost": self.total_cost,
+            "run_gross": self.total_gross,
+            "run_flip": self.total_flip,
+        }
+
+
+async def resolve_and_record(pending: dict, gates: GateConfig, ledger: RunLedger, notify=None) -> dict:
+    summary = await resolve_round(pending, gates, notify=None)
+    totals = ledger.record(summary)
+    summary.update(totals)
+    if summary.get("status") == "OK":
+        jsonl_path = Path(pending["jsonl"])
+        _log(jsonl_path, {
+            "kind": "run_ledger",
+            "round": pending.get("round"),
+            **totals,
+        })
+        if notify:
+            notify("settle", {
+                "round": summary["round"], "pnl": summary["pnl"],
+                "cost": summary["cost"], "gross": summary["gross"], "flip_pnl": summary["flip_pnl"],
+                "n_combos": summary["combos_count"],
+                "pm_btc_up": summary["pm_btc_up"], "pm_eth_up": summary["pm_eth_up"],
+                "divergence": summary["divergence"],
+                **totals,
+            })
+    return summary
+
+
 async def main_async(rounds: int, start_mode: str, gates: GateConfig) -> None:
     stats = RollingStats(window=120)
     hist = GapHistogram(window=600)
     notifier = _build_notifier()
     notify = _make_notify(notifier)
     dry_run = os.getenv("DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
+    live_executor: Optional[PolymarketLiveExecutor] = None
     print(f"[BOOT] DRY_RUN={dry_run}  rounds={rounds}  start_mode={start_mode}")
     if not dry_run:
-        print("[BOOT] WARNING: DRY_RUN=false -- live execution is NOT YET WIRED; staying shadow-only")
+        cfg = LiveExecutionConfig.from_env()
+        live_executor = PolymarketLiveExecutor(cfg)
+        live_executor.sync_collateral()
+        print(f"[BOOT] LIVE CLOB enabled host={cfg.host} chain={cfg.chain_id} "
+              f"funder={cfg.funder[:6]}... order_type={cfg.order_type}")
     if notifier is not None:
         try:
-            notifier.send(f"\U0001f680 cor_pol boot\nDRY_RUN={dry_run} rounds={rounds} mode={start_mode}\n"
+            notifier.send(f"cor_pol boot\nDRY_RUN={dry_run} rounds={rounds} mode={start_mode}\n"
                           f"asym=[{gates.entry_asym_mid_lo:.2f},{gates.entry_asym_mid_hi:.2f}] "
                           f"min_fav_bp={gates.entry_min_fav_bp:+.1f}\n"
-                          f"G eps={gates.policy_g_eps_loss:.2f} t_recov={gates.policy_g_t_recov:.2f} "
-                          f"t_lock={gates.policy_g_t_lock:.2f}")
+                          f"combo_cap={gates.max_combos_per_round} qty={gates.combo_qty:.2f} "
+                          f"tol={gates.leg_mismatch_tolerance_shares:.2f}\n"
+                          f"EV>={gates.min_model_edge:+.3f} bad<={gates.max_bad_quad_prob:.2f}\n"
+                          f"Q4 asym dead={gates.q4_dead_loss_gap_mult:.1f}x gap "
+                          f"fav_worse={gates.q4_fav_worsen_bp:.1f}bp\n"
+                          f"execution={'live' if live_executor else 'shadow'}")
         except Exception as exc:
             print(f"[BOOT] tg boot ping failed: {exc}")
-    if start_mode == "next":
+    if start_mode == "next" and rounds > 0:
         wait = 300 - (int(time.time()) % 300)
         print(f"[LAB] waiting {wait + 1}s for next 5m boundary")
         await asyncio.sleep(wait + 1)
-    pendings: list[dict] = []
+    ledger = RunLedger()
+    resolve_tasks: set[asyncio.Task] = set()
+    summaries: list[dict] = []
+
+    async def drain_resolved(done_only: bool = True) -> None:
+        nonlocal resolve_tasks, summaries
+        if not resolve_tasks:
+            return
+        done = {t for t in resolve_tasks if t.done()} if done_only else set(resolve_tasks)
+        if not done:
+            return
+        if done_only:
+            resolve_tasks -= done
+            for task in done:
+                try:
+                    summaries.append(task.result())
+                except Exception as exc:
+                    print(f"[RESOLVE] task error: {exc}")
+        else:
+            results = await asyncio.gather(*done, return_exceptions=True)
+            for item in results:
+                if isinstance(item, Exception):
+                    print(f"[RESOLVE] task error: {item}")
+                else:
+                    summaries.append(item)
+            resolve_tasks -= done
+
     for i in range(1, rounds + 1):
         try:
-            pending = await run_round(i, gates, stats, hist, notify=notify)
-            pendings.append(pending)
+            pending = await run_round(i, gates, stats, hist, notify=notify, live_executor=live_executor)
+            if pending.get("status") == "SKIPPED":
+                print(f"[ROUND {i}] skipped: {pending.get('reason')}")
+            else:
+                resolve_tasks.add(asyncio.create_task(resolve_and_record(pending, gates, ledger, notify=notify)))
         except Exception as exc:
             print(f"[ROUND {i}] error: {exc}")
+        await drain_resolved(done_only=True)
         if i < rounds:
             now = int(time.time())
             mod = now % 300
@@ -967,15 +1494,15 @@ async def main_async(rounds: int, start_mode: str, gates: GateConfig) -> None:
                 print(f"[LAB] round {i} done; waiting {wait + 1}s for next 5m boundary")
                 wait = wait + 1
             await asyncio.sleep(wait)
-    print(f"[LAB] all {rounds} trading phases done; resolving {len(pendings)} rounds via PM/UMA now...")
-    summaries = await asyncio.gather(*(resolve_round(p, gates, notify=notify) for p in pendings))
+    print(f"[LAB] all {rounds} trading phases done; waiting for {len(resolve_tasks)} PM/UMA resolution tasks...")
+    await drain_resolved(done_only=False)
     n_ok = sum(1 for s in summaries if s.get("status") == "OK")
     n_div = sum(1 for s in summaries if s.get("divergence"))
     total_pnl = sum(s.get("pnl", 0.0) for s in summaries if s.get("status") == "OK")
     print(f"[LAB] resolution complete: {n_ok}/{len(summaries)} resolved, {n_div} divergences, total_pnl=${total_pnl:+.2f}")
     if notifier is not None:
         try:
-            notifier.send(f"\U0001f4ca cor_pol run done\nresolved={n_ok}/{len(summaries)} div={n_div} total_pnl=${total_pnl:+.2f}")
+            notifier.send(f"cor_pol run done\nresolved={n_ok}/{len(summaries)} div={n_div} total_pnl=${total_pnl:+.2f}")
         except Exception:
             pass
 
@@ -1002,24 +1529,31 @@ def main() -> None:
     args = parser.parse_args()
     gates = GateConfig(
         min_correlation=_envf("CORR_MIN_CORRELATION", 0.65),
-        min_gap=_envf("CORR_MIN_GAP", 0.06),
-        max_gap=_envf("CORR_MAX_GAP", 0.18),
+        min_gap=_envf("CORR_MIN_GAP", 0.04),
+        max_gap=_envf("CORR_MAX_GAP", 0.22),
         min_book_size=_envf("CORR_MIN_BOOK_SIZE", 5.0),
         tte_min_s=_envi("CORR_TTE_MIN_S", 60),
         tte_max_s=_envi("CORR_TTE_MAX_S", 270),
         combo_qty=_envf("CORR_COMBO_QTY", 5.0),
-        max_combos_per_round=_envi("CORR_MAX_COMBOS_PER_ROUND", 5),
-        max_cost_per_round_usd=_envf("CORR_MAX_COST_PER_ROUND_USD", 50.0),
+        max_combos_per_round=_envi("CORR_MAX_COMBOS_PER_ROUND", 3),
+        max_cost_per_round_usd=_envf("CORR_MAX_COST_PER_ROUND_USD", 15.0),
         combo_cooldown_s=_envf("CORR_COMBO_COOLDOWN_S", 15.0),
         pm_resolution_wait_s=_envf("CORR_PM_RESOLUTION_WAIT_S", 1200.0),
         pm_resolution_poll_s=_envf("CORR_PM_RESOLUTION_POLL_S", 15.0),
-        min_vol_bp_60s=_envf("CORR_MIN_VOL_BP_60S", 10.0),
+        min_vol_bp_60s=_envf("CORR_MIN_VOL_BP_60S", 0.0),
+        min_model_edge=_envf("CORR_MIN_MODEL_EDGE", 0.01),
+        max_bad_quad_prob=_envf("CORR_MAX_BAD_QUAD_PROB", 0.22),
+        max_bad_to_normal_ratio=_envf("CORR_MAX_BAD_TO_NORMAL_RATIO", 0.38),
         entry_asym_mid_hi=_envf("CORR_ENTRY_ASYM_MID_HI", 0.60),
         entry_asym_mid_lo=_envf("CORR_ENTRY_ASYM_MID_LO", 0.40),
         entry_min_fav_bp=_envf("CORR_ENTRY_MIN_FAV_BP", -4.0),
-        policy_g_eps_loss=_envf("CORR_POLICY_G_EPS_LOSS", 0.05),
-        policy_g_t_recov=_envf("CORR_POLICY_G_T_RECOV", 0.55),
-        policy_g_t_lock=_envf("CORR_POLICY_G_T_LOCK", 0.80),
+        q4_dead_loss_gap_mult=_envf("CORR_Q4_DEAD_LOSS_GAP_MULT", 2.0),
+        q4_confirm_loss=_envf("CORR_Q4_CONFIRM_LOSS", 0.0),
+        q4_fav_worsen_bp=_envf("CORR_Q4_FAV_WORSEN_BP", 1.0),
+        leg_mismatch_tolerance_shares=_envf("CORR_LEG_MISMATCH_TOLERANCE_SHARES", 1.0),
+        exec_slippage_ticks=_envi("CORR_EXEC_SLIPPAGE_TICKS", 2),
+        exec_chase_slippage_ticks=_envi("CORR_EXEC_CHASE_SLIPPAGE_TICKS", 4),
+        exec_max_chase_attempts=_envi("CORR_EXEC_MAX_CHASE_ATTEMPTS", 2),
     )
     asyncio.run(main_async(args.rounds, args.start_mode, gates))
 
