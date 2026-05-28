@@ -651,7 +651,7 @@ class GateConfig:
     exec_flatten_slippage_ticks: int = 8
     exec_flatten_max_attempts: int = 3
     exec_kill_retry_cooldown_s: float = 1.0
-    exec_user_ws_enabled: bool = True
+    exec_user_ws_enabled: bool = False
     exec_user_ws_confirm_timeout_s: float = 8.0
 
 
@@ -726,14 +726,9 @@ def live_order_block_reason(
     gates: GateConfig,
     order_feed: Optional[UserOrderFeed],
 ) -> Optional[str]:
-    if live_executor is None or not gates.exec_user_ws_enabled:
-        return None
-    if order_feed is None:
-        return "user_ws_not_configured"
-    if not order_feed.ready:
-        return "user_ws_not_ready"
-    if not order_feed.connected:
-        return "user_ws_not_connected"
+    # CLOB submit/cancel/get_order is the execution source of truth. User WS is
+    # only a telemetry/fast-confirm channel, so it must not block entry, chase,
+    # flatten, or Q4 kill orders.
     return None
 
 
@@ -742,7 +737,9 @@ def live_ordering_ready(
     gates: GateConfig,
     order_feed: Optional[UserOrderFeed],
 ) -> bool:
-    return live_order_block_reason(live_executor, gates, order_feed) is None
+    if live_executor is None or not gates.exec_user_ws_enabled:
+        return True
+    return bool(order_feed is not None and order_feed.ready and order_feed.connected)
 
 
 def _blocked_live_result(
@@ -777,7 +774,13 @@ async def confirm_live_result(
     if live_executor is None or not result.order_id:
         return result
     out = result
-    if order_feed is not None and order_feed.ready and gates.exec_user_ws_confirm_timeout_s > 0:
+    if (
+        gates.exec_user_ws_enabled
+        and order_feed is not None
+        and order_feed.ready
+        and order_feed.connected
+        and gates.exec_user_ws_confirm_timeout_s > 0
+    ):
         min_ws_qty = (
             result.requested_qty
             if result.requested_qty <= gates.leg_mismatch_tolerance_shares
@@ -789,9 +792,24 @@ async def confirm_live_result(
             min_qty=max(0.0, min_ws_qty),
             target_qty=max(0.0, result.requested_qty),
         )
-        out = _replace_exec_fill(out, filled_qty=qty, price=px, source="user_ws", force=True)
+        out = _replace_exec_fill(out, filled_qty=qty, price=px, source="user_ws", force=False)
         if confirmed:
             if qty <= 0:
+                if result.filled_qty > 0 or result.ok:
+                    return ExecutionLegResult(
+                        label=result.label,
+                        token_id=result.token_id,
+                        requested_qty=result.requested_qty,
+                        filled_qty=result.filled_qty,
+                        avg_price=result.avg_price,
+                        notional=result.notional,
+                        order_id=result.order_id,
+                        status=result.status,
+                        ok=result.ok,
+                        estimated=result.estimated,
+                        error=result.error,
+                        raw={**result.raw, "confirm_source": "clob_after_user_ws_empty"},
+                    )
                 return ExecutionLegResult(
                     label=result.label,
                     token_id=result.token_id,
@@ -807,41 +825,55 @@ async def confirm_live_result(
                     raw={**result.raw, "confirm_source": "user_ws"},
                 )
             return out
+    if post_ack_immediate_no_fill(result):
+        return ExecutionLegResult(
+            label=result.label,
+            token_id=result.token_id,
+            requested_qty=result.requested_qty,
+            filled_qty=0.0,
+            avg_price=0.0,
+            notional=0.0,
+            order_id=result.order_id,
+            status=result.status or "post_ack_no_fill",
+            ok=False,
+            estimated=False,
+            error="no_fill",
+            raw={**result.raw, "confirm_source": "post_ack_no_fill"},
+        )
+    if result.ok and result.filled_qty > 0 and result.avg_price > 0:
+        return ExecutionLegResult(
+            label=result.label,
+            token_id=result.token_id,
+            requested_qty=result.requested_qty,
+            filled_qty=result.filled_qty,
+            avg_price=result.avg_price,
+            notional=result.notional,
+            order_id=result.order_id,
+            status=result.status,
+            ok=True,
+            estimated=True,
+            error="",
+            raw={
+                **result.raw,
+                "confirm_source": "clob_post_ack",
+            },
+        )
+    if result.filled_qty > 0 or (result.error and not result.error.startswith("user_ws_")):
+        return ExecutionLegResult(
+            label=result.label,
+            token_id=result.token_id,
+            requested_qty=result.requested_qty,
+            filled_qty=result.filled_qty,
+            avg_price=result.avg_price,
+            notional=result.notional,
+            order_id=result.order_id,
+            status=result.status,
+            ok=result.ok,
+            estimated=result.estimated,
+            error=result.error,
+            raw={**result.raw, "confirm_source": "clob_post_ack_error"},
+        )
     if gates.exec_user_ws_enabled:
-        if post_ack_immediate_no_fill(result):
-            return ExecutionLegResult(
-                label=result.label,
-                token_id=result.token_id,
-                requested_qty=result.requested_qty,
-                filled_qty=0.0,
-                avg_price=0.0,
-                notional=0.0,
-                order_id=result.order_id,
-                status=result.status or "post_ack_no_fill",
-                ok=False,
-                estimated=False,
-                error="no_fill",
-                raw={**result.raw, "confirm_source": "post_ack_no_fill"},
-            )
-        if result.ok and result.filled_qty > 0 and result.avg_price > 0:
-            return ExecutionLegResult(
-                label=result.label,
-                token_id=result.token_id,
-                requested_qty=result.requested_qty,
-                filled_qty=result.filled_qty,
-                avg_price=result.avg_price,
-                notional=result.notional,
-                order_id=result.order_id,
-                status=result.status,
-                ok=True,
-                estimated=True,
-                error="",
-                raw={
-                    **result.raw,
-                    "confirm_source": "post_ack_after_user_ws_timeout",
-                    "user_ws_timeout": True,
-                },
-            )
         return ExecutionLegResult(
             label=result.label,
             token_id=result.token_id,
@@ -854,7 +886,7 @@ async def confirm_live_result(
             ok=False,
             estimated=False,
             error="user_ws_timeout",
-            raw={**result.raw, "confirm_source": "user_ws_timeout", "post_response_ignored": True},
+            raw={**result.raw, "confirm_source": "user_ws_timeout", "clob_fill_unconfirmed": True},
         )
     return out
 
@@ -949,8 +981,22 @@ def post_ack_immediate_no_fill(result: ExecutionLegResult) -> bool:
     status = (result.status or "").strip().lower()
     if status in POST_ACK_NO_FILL_STATUSES:
         return True
-    if order_type == "GTC_SHARE_IOC" and (result.raw.get("cancel_response") or result.raw.get("order_lookup")):
-        return True
+    if order_type == "GTC_SHARE_IOC":
+        cancel_resp = result.raw.get("cancel_response")
+        canceled = []
+        if isinstance(cancel_resp, dict):
+            raw_canceled = cancel_resp.get("canceled")
+            if raw_canceled is True:
+                return True
+            if isinstance(raw_canceled, (list, tuple, set)):
+                canceled = [str(x) for x in raw_canceled]
+            elif raw_canceled:
+                canceled = [str(raw_canceled)]
+        if result.order_id and result.order_id in canceled:
+            return True
+        if result.raw.get("remainder_cancel_confirmed") is True:
+            return True
+        return False
     success = result.raw.get("success")
     if order_type in {"FAK", "FOK"} and success is True and result.order_id:
         return True
@@ -1531,14 +1577,13 @@ async def strategy_loop(
         # must bypass this gate so stops cannot be blocked by sizing caps.
         capacity_ok = (
             not entry_blocked
-            and user_ws_ready
             and len(main_combos) < gates.max_combos_per_round
             and total_cost < gates.max_cost_per_round_usd
         )
         if live_executor is not None and gates.exec_user_ws_enabled and not user_ws_ready and samples_since_eval == 0:
             ws_reason = live_order_block_reason(live_executor, gates, order_feed)
             _log(jsonl, {"kind": "entry_eval", "ts": now, "tte": tte,
-                         "reason": ws_reason or "user_ws_not_ready",
+                         "reason": ws_reason or "user_ws_observer_not_ready",
                          "connected": bool(order_feed and order_feed.connected)})
         if cooldown_ok and capacity_ok:
             sig, diag = try_entry(legs_by_asset, stats, gates, hist, tte)
@@ -2482,7 +2527,7 @@ def main() -> None:
         exec_flatten_slippage_ticks=_envi("CORR_EXEC_FLATTEN_SLIPPAGE_TICKS", 8),
         exec_flatten_max_attempts=_envi("CORR_EXEC_FLATTEN_MAX_ATTEMPTS", 3),
         exec_kill_retry_cooldown_s=_envf("CORR_EXEC_KILL_RETRY_COOLDOWN_S", 1.0),
-        exec_user_ws_enabled=_envb("CORR_USER_WS_ENABLED", True),
+        exec_user_ws_enabled=_envb("CORR_USER_WS_ENABLED", False),
         exec_user_ws_confirm_timeout_s=_envf("CORR_USER_WS_CONFIRM_TIMEOUT_S", 8.0),
     )
     asyncio.run(main_async(args.rounds, args.start_mode, gates))

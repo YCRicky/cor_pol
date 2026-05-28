@@ -9,6 +9,7 @@ from src.lab.correlation_arb_bot import (
     UserOrderFeed,
     confirm_live_result,
     execute_buy_pair,
+    live_order_block_reason,
     post_ack_immediate_no_fill,
 )
 
@@ -19,6 +20,22 @@ class SilentFeed:
 
     async def wait_for_order(self, order_id, *, timeout_s, min_qty, target_qty=0, settle_s=0.5):
         return 0.0, None, False
+
+
+class EmptyTerminalFeed:
+    ready = True
+    connected = True
+
+    async def wait_for_order(self, order_id, *, timeout_s, min_qty, target_qty=0, settle_s=0.5):
+        return 0.0, None, True
+
+
+class DisconnectedFeed:
+    ready = True
+    connected = False
+
+    async def wait_for_order(self, order_id, *, timeout_s, min_qty, target_qty=0, settle_s=0.5):
+        raise AssertionError("disconnected user websocket must not be awaited")
 
 
 class PairExecutor:
@@ -111,6 +128,21 @@ class LiveExecutionFlowTests(unittest.TestCase):
         self.assertEqual(confirmed.error, "no_fill")
         self.assertEqual(confirmed.raw["confirm_source"], "post_ack_no_fill")
 
+    def test_gtc_share_ioc_no_fill_requires_cancel_confirmation(self):
+        result = ExecutionLegResult(
+            "BTC_NO",
+            "tok",
+            5.0,
+            0.0,
+            0.0,
+            0.0,
+            order_id="o1",
+            status="live",
+            ok=False,
+            raw={"success": True, "order_type": "GTC_SHARE_IOC", "order_lookup": {"status": "live"}},
+        )
+        self.assertFalse(post_ack_immediate_no_fill(result))
+
     def test_post_ack_fill_survives_user_ws_timeout(self):
         result = ExecutionLegResult(
             "ETH_YES",
@@ -134,7 +166,56 @@ class LiveExecutionFlowTests(unittest.TestCase):
         )
         self.assertEqual(confirmed.filled_qty, 5.0)
         self.assertTrue(confirmed.ok)
-        self.assertEqual(confirmed.raw["confirm_source"], "post_ack_after_user_ws_timeout")
+        self.assertEqual(confirmed.raw["confirm_source"], "clob_post_ack")
+
+    def test_user_ws_empty_terminal_does_not_downgrade_clob_fill(self):
+        result = ExecutionLegResult(
+            "ETH_YES",
+            "tok",
+            5.0,
+            5.0,
+            0.86,
+            4.3,
+            order_id="o2",
+            status="matched",
+            ok=True,
+            raw={"order_type": "GTC_SHARE_IOC"},
+        )
+        confirmed = asyncio.run(
+            confirm_live_result(
+                result,
+                live_executor=object(),
+                order_feed=EmptyTerminalFeed(),
+                gates=GateConfig(exec_user_ws_enabled=True, exec_user_ws_confirm_timeout_s=0.01),
+            )
+        )
+        self.assertEqual(confirmed.filled_qty, 5.0)
+        self.assertTrue(confirmed.ok)
+        self.assertEqual(confirmed.raw["confirm_source"], "clob_after_user_ws_empty")
+
+    def test_disconnected_user_ws_does_not_delay_clob_confirmation(self):
+        result = ExecutionLegResult(
+            "ETH_YES",
+            "tok",
+            5.0,
+            5.0,
+            0.86,
+            4.3,
+            order_id="o2",
+            status="matched",
+            ok=True,
+            raw={"order_type": "GTC_SHARE_IOC"},
+        )
+        confirmed = asyncio.run(
+            confirm_live_result(
+                result,
+                live_executor=object(),
+                order_feed=DisconnectedFeed(),
+                gates=GateConfig(exec_user_ws_confirm_timeout_s=8.0),
+            )
+        )
+        self.assertEqual(confirmed.filled_qty, 5.0)
+        self.assertEqual(confirmed.raw["confirm_source"], "clob_post_ack")
 
     def test_clob_share_ioc_response_is_clamped_to_target_qty(self):
         raw = {
@@ -173,6 +254,15 @@ class LiveExecutionFlowTests(unittest.TestCase):
         self.assertEqual(res_a.filled_qty, 5.0)
         self.assertEqual(res_b.filled_qty, 5.0)
         self.assertEqual(executor.single_calls, [("BTC_YES", 5.0, 1)])
+
+    def test_user_ws_state_never_blocks_live_ordering(self):
+        self.assertIsNone(
+            live_order_block_reason(
+                live_executor=object(),
+                gates=GateConfig(exec_user_ws_enabled=True),
+                order_feed=None,
+            )
+        )
 
     def test_user_ws_trade_weighted_average_price(self):
         async def run_case():

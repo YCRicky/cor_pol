@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -66,6 +67,38 @@ def _normalize_amount(raw_value: Any, expected: float) -> Optional[float]:
     if not valid:
         return value
     return min(valid, key=lambda x: abs(x - expected))
+
+
+def _as_str_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(x) for x in value]
+    return [str(value)]
+
+
+def _cancel_response_has_order(cancel_resp: Any, order_id: str) -> bool:
+    if not isinstance(cancel_resp, dict) or not order_id:
+        return False
+    if cancel_resp.get("canceled") is True:
+        return True
+    canceled = _as_str_list(cancel_resp.get("canceled"))
+    return order_id in canceled
+
+
+def _matched_qty_from_raw(raw: dict[str, Any], target_qty: float) -> float:
+    qty_raw = _first(raw, (
+        "takingAmount",
+        "taking_amount",
+        "sizeMatched",
+        "size_matched",
+        "matchedAmount",
+        "matched_amount",
+        "filledSize",
+        "filled_size",
+    ))
+    qty = _normalize_amount(qty_raw, target_qty)
+    return max(0.0, float(qty or 0.0))
 
 
 def _round_up_to_tick(price: float, tick_size: str) -> float:
@@ -301,15 +334,31 @@ class PolymarketLiveExecutor:
         # immediately cancel any unfilled remainder.
         return self.OrderType.GTC
 
-    def _cancel_remainder(self, raw: dict[str, Any]) -> None:
+    def _client_cancel_order(self, order_id: str) -> Any:
+        try:
+            return self.client.cancel_order(self.OrderPayload(orderID=order_id))
+        except TypeError:
+            return self.client.cancel_order(order_id)
+
+    def _cancel_remainder(self, raw: dict[str, Any], target_qty: float) -> None:
         order_id = str(_first(raw, ("orderID", "order_id", "id")) or "")
         if not order_id:
             return
-        try:
-            cancel_resp = self.client.cancel_order(self.OrderPayload(orderID=order_id))
-            raw["cancel_response"] = _obj_to_dict(cancel_resp)
-        except Exception as exc:
-            raw["cancel_error"] = str(exc)
+        cancel_ok = False
+        for attempt in range(1, 4):
+            try:
+                cancel_resp = self._client_cancel_order(order_id)
+                raw["cancel_response"] = _obj_to_dict(cancel_resp)
+                raw["cancel_attempts"] = attempt
+                cancel_ok = _cancel_response_has_order(raw["cancel_response"], order_id)
+                if cancel_ok:
+                    break
+            except Exception as exc:
+                raw["cancel_error"] = str(exc)
+                raw["cancel_attempts"] = attempt
+            if attempt < 3:
+                time.sleep(0.15)
+        raw["remainder_cancel_confirmed"] = cancel_ok
         try:
             lookup = _obj_to_dict(self.client.get_order(order_id))
             raw["order_lookup"] = lookup
@@ -328,6 +377,14 @@ class PolymarketLiveExecutor:
                     raw[key] = lookup[key]
         except Exception as exc:
             raw["order_lookup_error"] = str(exc)
+        status = str(_first(raw, ("status", "state")) or "").strip().lower()
+        matched_qty = _matched_qty_from_raw(raw, target_qty)
+        live_remainder = status in {"live", "open", "delayed"} and matched_qty < target_qty
+        unverified_cancel = (not cancel_ok) and not raw.get("order_lookup")
+        if live_remainder:
+            raw.setdefault("errorMsg", "gtc_remainder_cancel_unconfirmed")
+        elif unverified_cancel and matched_qty <= 0:
+            raw.setdefault("errorMsg", "gtc_cancel_lookup_unconfirmed")
 
     def buy_limit_fak(
         self,
@@ -356,7 +413,7 @@ class PolymarketLiveExecutor:
                 order_type=self._share_buy_order_type(),
             )
             raw = _obj_to_dict(resp)
-            self._cancel_remainder(raw)
+            self._cancel_remainder(raw, target_qty)
             raw.setdefault("order_type", "GTC_SHARE_IOC")
             raw.setdefault("limit_price", limit_price)
             raw.setdefault("target_qty", target_qty)
@@ -403,7 +460,7 @@ class PolymarketLiveExecutor:
             resp = self.client.post_orders(post_args)
             raws = self._split_batch_response(resp, 2)
             for raw, limit_price, spec in zip(raws, limit_prices, specs):
-                self._cancel_remainder(raw)
+                self._cancel_remainder(raw, float(spec["target_qty"]))
                 raw.setdefault("order_type", "GTC_SHARE_IOC")
                 raw.setdefault("limit_price", limit_price)
                 raw.setdefault("target_qty", float(spec["target_qty"]))

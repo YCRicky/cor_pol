@@ -6,6 +6,7 @@ It is based on the Polymarket docs reviewed on 2026-05-29:
 - Polymarket USD: https://docs.polymarket.com/concepts/pusd
 - Deposit wallets: https://docs.polymarket.com/trading/deposit-wallets
 - CLOB create order: https://docs.polymarket.com/developers/CLOB/orders/create-order
+- CLOB cancel/query order: https://docs.polymarket.com/trading/orders/cancel
 - CLOB Python client: https://docs.polymarket.com/developers/CLOB/clients/python-client
 
 ## Polymarket changes that matter
@@ -55,6 +56,7 @@ CORR_EXEC_SLIPPAGE_TICKS=2
 CORR_EXEC_CHASE_SLIPPAGE_TICKS=1
 CORR_EXEC_MAX_CHASE_ATTEMPTS=2
 CORR_LEG_MISMATCH_TOLERANCE_SHARES=1.0
+CORR_USER_WS_ENABLED=false
 ```
 
 Entry execution:
@@ -64,11 +66,12 @@ Entry execution:
 2. Limit price is `best_ask + slippage_ticks * tick_size`, capped at `0.99`.
 3. If the two fills differ by at most 1 share, accept the residual and do not
    retry. This prevents the old 4.89 vs 5.00 infinite-retry failure.
-4. Fill reconciliation prefers the authenticated user websocket. If the
-   websocket misses an update but the synchronous CLOB post response already
-   reports a matched amount or an immediate terminal no-fill status, the bot
-   uses that post acknowledgement as provisional execution truth. It does not
-   call REST `get_order` as a fallback.
+4. Fill reconciliation treats CLOB submit/cancel/get_order as the execution
+   source of truth. The authenticated user websocket is optional telemetry: it
+   can add faster fill/price updates, but it cannot block order submission,
+   downgrade a CLOB-confirmed fill, or turn a CLOB-confirmed fill into no-fill.
+   Default live mode keeps `CORR_USER_WS_ENABLED=false` to avoid websocket
+   latency/noise in the critical order path.
 5. If the difference is more than 1 share, chase the underfilled leg by the
    real shortfall with 1 additional tick per chase attempt.
 6. If the imbalance still remains after all chase attempts, the entry is
@@ -83,6 +86,8 @@ Fourth-quadrant kill execution:
 2. Live kill orders use the same aggressive share-limit/cancel wrapper.
 3. Partial kill fills are logged and included in PM-settled PnL; the bot does
    not pretend a kill completed if the CLOB fill response says otherwise.
+4. User websocket connectivity does not block Q4 kill, entry-flatten, or
+   imbalance-chase orders.
 
 ## Required environment variables
 
