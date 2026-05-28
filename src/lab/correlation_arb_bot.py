@@ -225,6 +225,21 @@ def _float_or_none(value: Any) -> Optional[float]:
         return None
 
 
+def is_ws_heartbeat(raw: Any) -> bool:
+    if isinstance(raw, bytes):
+        try:
+            raw = raw.decode("utf-8")
+        except Exception:
+            return False
+    return isinstance(raw, str) and raw.strip().upper() in {"PING", "PONG"}
+
+
+async def ws_text_heartbeat(ws: Any, stop_at: float, interval_s: float = 8.0) -> None:
+    while time.time() < stop_at:
+        await asyncio.sleep(interval_s)
+        await ws.send("PING")
+
+
 async def ws_consumer(legs: list[MarketLeg], stop_at: float) -> None:
     token_map: dict[str, tuple[MarketLeg, str]] = {}
     for leg in legs:
@@ -232,30 +247,42 @@ async def ws_consumer(legs: list[MarketLeg], stop_at: float) -> None:
         token_map[leg.no_token] = (leg, "NO")
     while time.time() < stop_at:
         try:
-            async with websockets.connect(WS_URL, ping_interval=30) as ws:
+            async with websockets.connect(WS_URL, ping_interval=None, close_timeout=1) as ws:
                 await ws.send(json.dumps({
                     "type": "market",
                     "assets_ids": list(token_map.keys()),
                     "initial_dump": True,
                     "custom_feature_enabled": True,
                 }))
-                while time.time() < stop_at:
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=10)
-                    except asyncio.TimeoutError:
-                        continue
-                    payload = json.loads(raw)
-                    items = payload if isinstance(payload, list) else [payload]
-                    for item in items:
-                        asset_id = item.get("asset_id") or item.get("assetId")
-                        if asset_id not in token_map:
+                heartbeat = asyncio.create_task(ws_text_heartbeat(ws, stop_at))
+                try:
+                    while time.time() < stop_at:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+                        except asyncio.TimeoutError:
                             continue
-                        leg, side = token_map[asset_id]
-                        book = leg.yes_book if side == "YES" else leg.no_book
-                        if "bids" in item and "asks" in item:
-                            book.apply_snapshot(item["bids"], item["asks"])
-                        elif "changes" in item:
-                            book.apply_changes(item["changes"])
+                        if is_ws_heartbeat(raw):
+                            continue
+                        payload = json.loads(raw)
+                        items = payload if isinstance(payload, list) else [payload]
+                        for item in items:
+                            asset_id = item.get("asset_id") or item.get("assetId")
+                            if asset_id not in token_map:
+                                continue
+                            leg, side = token_map[asset_id]
+                            book = leg.yes_book if side == "YES" else leg.no_book
+                            if "bids" in item and "asks" in item:
+                                book.apply_snapshot(item["bids"], item["asks"])
+                            elif "changes" in item:
+                                book.apply_changes(item["changes"])
+                finally:
+                    heartbeat.cancel()
+                    try:
+                        await heartbeat
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        pass
         except Exception:
             await asyncio.sleep(1.0)
 
@@ -299,7 +326,7 @@ class UserOrderFeed:
             return
         while time.time() < stop_at:
             try:
-                async with websockets.connect(self.url, ping_interval=10, ping_timeout=5, close_timeout=1) as ws:
+                async with websockets.connect(self.url, ping_interval=None, close_timeout=1) as ws:
                     await ws.send(json.dumps({
                         "auth": {
                             "apiKey": self.api_key,
@@ -311,16 +338,29 @@ class UserOrderFeed:
                     }))
                     self.connected = True
                     _log(self.jsonl, {"kind": "user_ws_connected", "markets": self.markets})
-                    while time.time() < stop_at:
+                    heartbeat = asyncio.create_task(ws_text_heartbeat(ws, stop_at))
+                    try:
+                        while time.time() < stop_at:
+                            try:
+                                raw = await asyncio.wait_for(ws.recv(), timeout=10)
+                            except asyncio.TimeoutError:
+                                continue
+                            if is_ws_heartbeat(raw):
+                                continue
+                            payload = json.loads(raw)
+                            items = payload if isinstance(payload, list) else [payload]
+                            for item in items:
+                                if isinstance(item, dict):
+                                    await self._record(item)
+                    finally:
+                        heartbeat.cancel()
                         try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=10)
-                        except asyncio.TimeoutError:
-                            continue
-                        payload = json.loads(raw)
-                        items = payload if isinstance(payload, list) else [payload]
-                        for item in items:
-                            if isinstance(item, dict):
-                                await self._record(item)
+                            await heartbeat
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception:
+                            pass
+                        self.connected = False
             except Exception as exc:
                 self.connected = False
                 _log(self.jsonl, {"kind": "user_ws_error", "error": str(exc)})
