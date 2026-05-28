@@ -46,7 +46,9 @@ from notifier import TelegramConfig, TelegramNotifier  # noqa: E402
 
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 USER_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
-TERMINAL_ORDER_STATUSES = {"CANCELED", "CANCELLED", "EXPIRED", "FAILED", "MATCHED"}
+TERMINAL_ORDER_STATUSES = {"CANCELED", "CANCELLED", "CANCELLATION", "EXPIRED", "FAILED", "FILLED", "MATCHED"}
+TERMINAL_ORDER_EVENT_TYPES = {"CANCELED", "CANCELLED", "CANCELLATION"}
+POST_ACK_NO_FILL_STATUSES = {"canceled", "cancelled", "expired", "failed", "unmatched"}
 OUT = ROOT / "out"
 OUT.mkdir(parents=True, exist_ok=True)
 
@@ -310,9 +312,11 @@ class UserOrderFeed:
         )
         self.order_fills: dict[str, float] = {}
         self.order_prices: dict[str, float] = {}
+        self.order_notionals: dict[str, float] = {}
         self.order_statuses: dict[str, str] = {}
         self.order_seen: set[str] = set()
         self.trade_sizes: dict[tuple[str, str], float] = {}
+        self.trade_notionals: dict[tuple[str, str], float] = {}
         self.connected = False
         self._cond = asyncio.Condition()
 
@@ -368,8 +372,12 @@ class UserOrderFeed:
         self.connected = False
 
     async def _record(self, item: dict[str, Any]) -> None:
-        event_type = str(item.get("event_type") or item.get("type") or "").lower()
-        updates: list[tuple[str, Optional[float], Optional[float], str]] = []
+        raw_event_type = str(item.get("event_type") or "").lower()
+        raw_message_type = str(item.get("type") or "").upper()
+        event_type = raw_event_type or raw_message_type.lower()
+        if not raw_event_type and raw_message_type in {"PLACEMENT", "UPDATE", "CANCELLATION"}:
+            event_type = "order"
+        updates: list[tuple[str, Optional[float], Optional[float], str, Optional[float]]] = []
         if event_type in ("order", "placement", "update", "cancellation"):
             order_id = str(item.get("id") or item.get("order_id") or "")
             matched_raw = item.get("size_matched")
@@ -380,8 +388,11 @@ class UserOrderFeed:
             qty = _float_or_none(matched_raw)
             px = _float_or_none(item.get("price"))
             status = str(item.get("status") or item.get("order_status") or "").upper()
+            if not status and raw_message_type in TERMINAL_ORDER_EVENT_TYPES:
+                status = raw_message_type
             if order_id:
-                updates.append((order_id, qty, px, status))
+                notional = qty * px if qty is not None and px is not None and px > 0 else None
+                updates.append((order_id, qty, px, status, notional))
         elif event_type == "trade":
             status = str(item.get("status") or "").upper()
             trade_id = str(item.get("id") or item.get("trade_id") or "")
@@ -393,7 +404,12 @@ class UserOrderFeed:
                 if taker_order_id and qty is not None:
                     key = (taker_order_id, trade_id or f"trade_{len(self.trade_sizes)}")
                     self.trade_sizes[key] = max(qty, self.trade_sizes.get(key, 0.0))
-                    updates.append((taker_order_id, sum(v for (oid, _), v in self.trade_sizes.items() if oid == taker_order_id), px, ""))
+                    if px is not None and px > 0:
+                        self.trade_notionals[key] = self.trade_sizes[key] * px
+                    total_qty = sum(v for (oid, _), v in self.trade_sizes.items() if oid == taker_order_id)
+                    total_notional = sum(v for (oid, _), v in self.trade_notionals.items() if oid == taker_order_id)
+                    avg_px = total_notional / total_qty if total_qty > 0 and total_notional > 0 else px
+                    updates.append((taker_order_id, total_qty, avg_px, "", total_notional or None))
                 for maker_order in item.get("maker_orders") or []:
                     order_id = str(maker_order.get("order_id") or "")
                     qty = _float_or_none(maker_order.get("matched_amount"))
@@ -401,14 +417,19 @@ class UserOrderFeed:
                     if order_id and qty is not None:
                         key = (order_id, trade_id or f"maker_{len(self.trade_sizes)}")
                         self.trade_sizes[key] = max(qty, self.trade_sizes.get(key, 0.0))
-                        updates.append((order_id, sum(v for (oid, _), v in self.trade_sizes.items() if oid == order_id), px, ""))
+                        if px is not None and px > 0:
+                            self.trade_notionals[key] = self.trade_sizes[key] * px
+                        total_qty = sum(v for (oid, _), v in self.trade_sizes.items() if oid == order_id)
+                        total_notional = sum(v for (oid, _), v in self.trade_notionals.items() if oid == order_id)
+                        avg_px = total_notional / total_qty if total_qty > 0 and total_notional > 0 else px
+                        updates.append((order_id, total_qty, avg_px, "", total_notional or None))
             elif status == "FAILED":
                 _log(self.jsonl, {"kind": "user_ws_trade_failed", **item})
         if not updates:
             return
         async with self._cond:
             changed = False
-            for order_id, qty, px, status in updates:
+            for order_id, qty, px, status, notional in updates:
                 if order_id not in self.order_seen:
                     self.order_seen.add(order_id)
                     changed = True
@@ -420,6 +441,9 @@ class UserOrderFeed:
                     changed = True
                 if px is not None and px > 0:
                     self.order_prices[order_id] = px
+                if notional is not None and notional != self.order_notionals.get(order_id):
+                    self.order_notionals[order_id] = notional
+                    changed = True
             if changed:
                 self._cond.notify_all()
         _log(self.jsonl, {"kind": "user_ws_order_update", "updates": updates})
@@ -428,6 +452,10 @@ class UserOrderFeed:
         return self.order_fills.get(order_id, 0.0)
 
     def matched_price(self, order_id: str) -> Optional[float]:
+        qty = self.order_fills.get(order_id, 0.0)
+        notional = self.order_notionals.get(order_id, 0.0)
+        if qty > 0 and notional > 0:
+            return notional / qty
         return self.order_prices.get(order_id)
 
     def order_terminal(self, order_id: str) -> bool:
@@ -687,8 +715,8 @@ def _replace_exec_fill(
         order_id=result.order_id,
         status=result.status,
         ok=result.ok or filled_qty > 0,
-        estimated=result.estimated or source == "user_ws",
-        error=result.error,
+        estimated=result.estimated,
+        error="" if filled_qty > 0 else result.error,
         raw=raw,
     )
 
@@ -780,6 +808,40 @@ async def confirm_live_result(
                 )
             return out
     if gates.exec_user_ws_enabled:
+        if post_ack_immediate_no_fill(result):
+            return ExecutionLegResult(
+                label=result.label,
+                token_id=result.token_id,
+                requested_qty=result.requested_qty,
+                filled_qty=0.0,
+                avg_price=0.0,
+                notional=0.0,
+                order_id=result.order_id,
+                status=result.status or "post_ack_no_fill",
+                ok=False,
+                estimated=False,
+                error="no_fill",
+                raw={**result.raw, "confirm_source": "post_ack_no_fill"},
+            )
+        if result.ok and result.filled_qty > 0 and result.avg_price > 0:
+            return ExecutionLegResult(
+                label=result.label,
+                token_id=result.token_id,
+                requested_qty=result.requested_qty,
+                filled_qty=result.filled_qty,
+                avg_price=result.avg_price,
+                notional=result.notional,
+                order_id=result.order_id,
+                status=result.status,
+                ok=True,
+                estimated=True,
+                error="",
+                raw={
+                    **result.raw,
+                    "confirm_source": "post_ack_after_user_ws_timeout",
+                    "user_ws_timeout": True,
+                },
+            )
         return ExecutionLegResult(
             label=result.label,
             token_id=result.token_id,
@@ -871,6 +933,26 @@ def entry_execution_status(
 
 def execution_unknown(*results: ExecutionLegResult) -> bool:
     return any((res.error or "").startswith("user_ws_") for res in results)
+
+
+def execution_unknown_reason(*results: ExecutionLegResult) -> str:
+    errors = [res.error for res in results if (res.error or "").startswith("user_ws_")]
+    return ",".join(errors) if errors else ""
+
+
+def post_ack_immediate_no_fill(result: ExecutionLegResult) -> bool:
+    if result.filled_qty > 0 or result.error:
+        return False
+    order_type = str(result.raw.get("order_type") or os.getenv("CORR_EXEC_ORDER_TYPE", "FAK")).upper()
+    if order_type not in {"FAK", "FOK"}:
+        return False
+    status = (result.status or "").strip().lower()
+    if status in POST_ACK_NO_FILL_STATUSES:
+        return True
+    success = result.raw.get("success")
+    if success is True and result.order_id:
+        return True
+    return False
 
 
 async def execute_buy_pair_once(
@@ -1001,10 +1083,11 @@ async def execute_buy_pair(
 
     for attempt in range(1, gates.exec_max_chase_attempts + 1):
         if execution_unknown(res_a, res_b):
+            reason = execution_unknown_reason(res_a, res_b) or "user_ws_unknown"
             events.append({
                 "phase": f"chase_{attempt}_skip",
                 "leg": "pair",
-                "reason": "user_ws_timeout",
+                "reason": reason,
                 "qty_a": res_a.filled_qty,
                 "qty_b": res_b.filled_qty,
             })
@@ -1451,8 +1534,9 @@ async def strategy_loop(
             and total_cost < gates.max_cost_per_round_usd
         )
         if live_executor is not None and gates.exec_user_ws_enabled and not user_ws_ready and samples_since_eval == 0:
+            ws_reason = live_order_block_reason(live_executor, gates, order_feed)
             _log(jsonl, {"kind": "entry_eval", "ts": now, "tte": tte,
-                         "reason": "user_ws_not_ready",
+                         "reason": ws_reason or "user_ws_not_ready",
                          "connected": bool(order_feed and order_feed.connected)})
         if cooldown_ok and capacity_ok:
             sig, diag = try_entry(legs_by_asset, stats, gates, hist, tte)
@@ -1493,7 +1577,7 @@ async def strategy_loop(
                     )
                     if execution_unknown(res_a, res_b):
                         entry_ok = False
-                        entry_fail_reason = "user_ws_timeout"
+                        entry_fail_reason = execution_unknown_reason(res_a, res_b) or "user_ws_unknown"
                     if not entry_ok:
                         abort_combo_id = next_combo_id
                         flat_a, flat_b, flat_ok, flat_events = await flatten_entry_exposure(
@@ -1509,8 +1593,13 @@ async def strategy_loop(
                         for ev in flat_events:
                             _log(jsonl, {"kind": "entry_abort_flatten_order", "ts": now, "tte": tte,
                                          "combo_id": abort_combo_id, **ev})
-                        entry_blocked = True
-                        last_fill_at = now
+                        risk_exists = (
+                            max(fa, fb, flat_a.filled_qty, flat_b.filled_qty) > 0
+                            or execution_unknown(res_a, res_b, flat_a, flat_b)
+                        )
+                        entry_blocked = risk_exists
+                        if risk_exists:
+                            last_fill_at = now
                         residual_a = max(0.0, fa - flat_a.filled_qty)
                         residual_b = max(0.0, fb - flat_b.filled_qty)
                         abort_tracked = False

@@ -32,6 +32,9 @@ It is based on the Polymarket docs reviewed on 2026-05-27:
 - SDK market BUY orders take `amount` as dollars/pUSD, not shares. Because this
   strategy needs "send 5 shares", the bot uses marketable aggressive limit
   orders with `OrderArgs(size=5)` and `OrderType.FAK` instead of SDK market BUY.
+- Market and user websocket channels require text `PING` heartbeats every 10
+  seconds. The bot sends `PING` every 8 seconds and ignores text `PING/PONG`
+  frames before JSON parsing.
 - Resolved CTF tokens redeem back into pUSD through Polymarket settlement
   tooling. This bot computes PnL from Gamma/UMA outcomes; redemption is handled
   by the Polymarket UI auto-redeem setting, not by this process.
@@ -47,7 +50,7 @@ CORR_MAX_COMBOS_PER_ROUND=3
 CORR_MAX_COST_PER_ROUND_USD=15
 CORR_EXEC_ORDER_TYPE=FAK
 CORR_EXEC_SLIPPAGE_TICKS=2
-CORR_EXEC_CHASE_SLIPPAGE_TICKS=4
+CORR_EXEC_CHASE_SLIPPAGE_TICKS=1
 CORR_EXEC_MAX_CHASE_ATTEMPTS=2
 CORR_LEG_MISMATCH_TOLERANCE_SHARES=1.0
 ```
@@ -58,12 +61,16 @@ Entry execution:
 2. Limit price is `best_ask + slippage_ticks * tick_size`, capped at `0.99`.
 3. If the two fills differ by at most 1 share, accept the residual and do not
    retry. This prevents the old 4.89 vs 5.00 infinite-retry failure.
-4. If the difference is more than 1 share, chase the underfilled leg by the
-   real shortfall with wider slippage.
-5. If the imbalance still remains after all chase attempts, buy the opposite
-   side of the overfilled leg for `imbalance - tolerance`. That converts excess
-   naked exposure back toward locked $1 payoff instead of leaving a one-leg bet.
-6. `CORR_MAX_COMBOS_PER_ROUND` and `CORR_MAX_COST_PER_ROUND_USD` apply only to
+4. Fill reconciliation prefers the authenticated user websocket. If the
+   websocket misses an update but the synchronous CLOB post response already
+   reports a matched amount or an immediate terminal no-fill status, the bot
+   uses that post acknowledgement as provisional execution truth. It does not
+   call REST `get_order` as a fallback.
+5. If the difference is more than 1 share, chase the underfilled leg by the
+   real shortfall with 1 additional tick per chase attempt.
+6. If the imbalance still remains after all chase attempts, the entry is
+   aborted and the filled exposure is flattened by buying the opposite side.
+7. `CORR_MAX_COMBOS_PER_ROUND` and `CORR_MAX_COST_PER_ROUND_USD` apply only to
    new entries. Entry-imbalance hedges and Q4 kill orders bypass those caps.
 
 Fourth-quadrant kill execution:

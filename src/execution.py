@@ -320,6 +320,9 @@ class PolymarketLiveExecutor:
                 order_type=getattr(self.OrderType, self.config.order_type, self.OrderType.FAK),
             )
             raw = _obj_to_dict(resp)
+            raw.setdefault("order_type", self.config.order_type)
+            raw.setdefault("limit_price", limit_price)
+            raw.setdefault("target_qty", target_qty)
             return self._parse_buy_response(label, token_id, target_qty, limit_price, raw)
         except Exception as exc:
             return ExecutionLegResult(
@@ -362,6 +365,10 @@ class PolymarketLiveExecutor:
             ]
             resp = self.client.post_orders(post_args)
             raws = self._split_batch_response(resp, 2)
+            for raw, limit_price, spec in zip(raws, limit_prices, specs):
+                raw.setdefault("order_type", self.config.order_type)
+                raw.setdefault("limit_price", limit_price)
+                raw.setdefault("target_qty", float(spec["target_qty"]))
             return (
                 self._parse_buy_response(
                     str(leg_a["label"]),
