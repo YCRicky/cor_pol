@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Optional
 
 
@@ -144,9 +146,11 @@ class LiveExecutionConfig:
     builder_code: str = ""
     order_type: str = "FAK"
     slippage_ticks: int = 2
-    chase_slippage_ticks: int = 4
+    chase_slippage_ticks: int = 1
     mismatch_tolerance: float = 1.0
     max_chase_attempts: int = 2
+    confirm_timeout_s: float = 3.0
+    confirm_poll_s: float = 0.2
 
     @classmethod
     def from_env(cls) -> "LiveExecutionConfig":
@@ -204,9 +208,11 @@ class LiveExecutionConfig:
             builder_code=_builder_code_from_env(),
             order_type=os.getenv("CORR_EXEC_ORDER_TYPE", "FAK").upper(),
             slippage_ticks=int(os.getenv("CORR_EXEC_SLIPPAGE_TICKS", "2")),
-            chase_slippage_ticks=int(os.getenv("CORR_EXEC_CHASE_SLIPPAGE_TICKS", "4")),
+            chase_slippage_ticks=int(os.getenv("CORR_EXEC_CHASE_SLIPPAGE_TICKS", "1")),
             mismatch_tolerance=float(os.getenv("CORR_LEG_MISMATCH_TOLERANCE_SHARES", "1.0")),
             max_chase_attempts=int(os.getenv("CORR_EXEC_MAX_CHASE_ATTEMPTS", "2")),
+            confirm_timeout_s=float(os.getenv("CORR_EXEC_CONFIRM_TIMEOUT_S", "3.0")),
+            confirm_poll_s=float(os.getenv("CORR_EXEC_CONFIRM_POLL_S", "0.2")),
         )
 
 
@@ -229,9 +235,14 @@ class PolymarketLiveExecutor:
             raise RuntimeError(
                 "py-clob-client-v2 is required for live trading; install requirements.txt"
             ) from exc
+        try:
+            from py_clob_client_v2 import PostOrdersV2Args  # type: ignore
+        except Exception:
+            PostOrdersV2Args = SimpleNamespace
         self.OrderArgs = OrderArgs
         self.OrderType = OrderType
         self.PartialCreateOrderOptions = PartialCreateOrderOptions
+        self.PostOrdersV2Args = PostOrdersV2Args
         self.Side = Side
         sig_type = getattr(SignatureTypeV2, config.signature_type, None)
         if sig_type is None:
@@ -261,6 +272,32 @@ class PolymarketLiveExecutor:
             )
         )
 
+    def _build_buy_order(
+        self,
+        *,
+        token_id: str,
+        target_qty: float,
+        best_ask: float,
+        tick_size: str,
+        neg_risk: bool,
+        slippage_ticks: int,
+    ) -> tuple[Any, float]:
+        tick = float(tick_size or "0.01")
+        limit_price = _round_up_to_tick(best_ask + max(slippage_ticks, 0) * tick, tick_size)
+        order_kwargs: dict[str, Any] = {
+            "token_id": token_id,
+            "price": limit_price,
+            "size": target_qty,
+            "side": self.Side.BUY,
+        }
+        if self.config.builder_code:
+            order_kwargs["builder_code"] = self.config.builder_code
+        signed_order = self.client.create_order(
+            order_args=self.OrderArgs(**order_kwargs),
+            options=self.PartialCreateOrderOptions(tick_size=str(tick_size), neg_risk=bool(neg_risk)),
+        )
+        return signed_order, limit_price
+
     def buy_limit_fak(
         self,
         *,
@@ -274,20 +311,17 @@ class PolymarketLiveExecutor:
     ) -> ExecutionLegResult:
         if target_qty <= 0:
             return ExecutionLegResult(label, token_id, target_qty, 0.0, 0.0, 0.0, ok=False, error="target_qty<=0")
-        tick = float(tick_size or "0.01")
-        limit_price = _round_up_to_tick(best_ask + max(slippage_ticks, 0) * tick, tick_size)
         try:
-            order_kwargs: dict[str, Any] = {
-                "token_id": token_id,
-                "price": limit_price,
-                "size": target_qty,
-                "side": self.Side.BUY,
-            }
-            if self.config.builder_code:
-                order_kwargs["builder_code"] = self.config.builder_code
-            resp = self.client.create_and_post_order(
-                order_args=self.OrderArgs(**order_kwargs),
-                options=self.PartialCreateOrderOptions(tick_size=str(tick_size), neg_risk=bool(neg_risk)),
+            signed_order, limit_price = self._build_buy_order(
+                token_id=token_id,
+                target_qty=target_qty,
+                best_ask=best_ask,
+                tick_size=tick_size,
+                neg_risk=neg_risk,
+                slippage_ticks=slippage_ticks,
+            )
+            resp = self.client.post_order(
+                signed_order,
                 order_type=getattr(self.OrderType, self.config.order_type, self.OrderType.FAK),
             )
             raw = _obj_to_dict(resp)
@@ -303,6 +337,101 @@ class PolymarketLiveExecutor:
                 ok=False,
                 error=str(exc),
             )
+
+    def buy_pair_limit_fak(
+        self,
+        *,
+        leg_a: dict[str, Any],
+        leg_b: dict[str, Any],
+        slippage_ticks: int,
+    ) -> tuple[ExecutionLegResult, ExecutionLegResult]:
+        specs = (leg_a, leg_b)
+        try:
+            signed_orders: list[Any] = []
+            limit_prices: list[float] = []
+            for spec in specs:
+                signed_order, limit_price = self._build_buy_order(
+                    token_id=str(spec["token_id"]),
+                    target_qty=float(spec["target_qty"]),
+                    best_ask=float(spec["best_ask"]),
+                    tick_size=str(spec["tick_size"]),
+                    neg_risk=bool(spec["neg_risk"]),
+                    slippage_ticks=slippage_ticks,
+                )
+                signed_orders.append(signed_order)
+                limit_prices.append(limit_price)
+            order_type = getattr(self.OrderType, self.config.order_type, self.OrderType.FAK)
+            post_args = [
+                self.PostOrdersV2Args(order=signed_orders[0], orderType=order_type),
+                self.PostOrdersV2Args(order=signed_orders[1], orderType=order_type),
+            ]
+            resp = self.client.post_orders(post_args)
+            raws = self._split_batch_response(resp, 2)
+            return (
+                self._parse_buy_response(
+                    str(leg_a["label"]),
+                    str(leg_a["token_id"]),
+                    float(leg_a["target_qty"]),
+                    limit_prices[0],
+                    raws[0],
+                ),
+                self._parse_buy_response(
+                    str(leg_b["label"]),
+                    str(leg_b["token_id"]),
+                    float(leg_b["target_qty"]),
+                    limit_prices[1],
+                    raws[1],
+                ),
+            )
+        except Exception as exc:
+            err = str(exc)
+            return (
+                ExecutionLegResult(
+                    label=str(leg_a.get("label", "")),
+                    token_id=str(leg_a.get("token_id", "")),
+                    requested_qty=float(leg_a.get("target_qty", 0.0) or 0.0),
+                    filled_qty=0.0,
+                    avg_price=0.0,
+                    notional=0.0,
+                    ok=False,
+                    error=err,
+                ),
+                ExecutionLegResult(
+                    label=str(leg_b.get("label", "")),
+                    token_id=str(leg_b.get("token_id", "")),
+                    requested_qty=float(leg_b.get("target_qty", 0.0) or 0.0),
+                    filled_qty=0.0,
+                    avg_price=0.0,
+                    notional=0.0,
+                    ok=False,
+                    error=err,
+                ),
+            )
+
+    def _split_batch_response(self, resp: Any, expected: int) -> list[dict[str, Any]]:
+        if isinstance(resp, list):
+            items = resp
+        elif isinstance(resp, dict):
+            items = resp.get("orders") or resp.get("data") or resp.get("results") or resp.get("responses")
+            if not isinstance(items, list):
+                items = []
+        else:
+            items = []
+        raw_batch = _obj_to_dict(resp)
+        out: list[dict[str, Any]] = []
+        for idx in range(expected):
+            if idx < len(items):
+                raw = _obj_to_dict(items[idx])
+                raw["batch_index"] = idx
+                out.append(raw)
+            else:
+                out.append({
+                    "success": False,
+                    "errorMsg": "missing_batch_response",
+                    "batch_index": idx,
+                    "batch_response": raw_batch,
+                })
+        return out
 
     def _parse_buy_response(
         self,
@@ -331,35 +460,28 @@ class PolymarketLiveExecutor:
         filled_qty = _normalize_amount(qty_raw, target_qty)
         notional = _normalize_amount(notional_raw, target_qty * limit_price)
 
-        if filled_qty is None and order_id:
-            try:
-                order = _obj_to_dict(self.client.get_order(order_id))
-                qty_raw = _first(order, ("size_matched", "sizeMatched", "matchedAmount", "matched_amount"))
-                filled_qty = _normalize_amount(qty_raw, target_qty)
-                px = _float_or_none(_first(order, ("price", "avg_price", "average_price")))
-                if filled_qty is not None and px is not None:
-                    notional = filled_qty * px
-                raw = {**raw, "order_lookup": order}
-            except Exception as exc:
-                raw = {**raw, "order_lookup_error": str(exc)}
+        if order_id and (filled_qty is None or filled_qty < target_qty):
+            filled_qty, notional, status, raw = self._confirm_buy_fill(
+                order_id=order_id,
+                target_qty=target_qty,
+                limit_price=limit_price,
+                current_qty=filled_qty,
+                current_notional=notional,
+                current_status=status,
+                raw=raw,
+            )
 
         estimated = False
         if filled_qty is None:
-            matched_status = status.lower() in ("matched", "filled", "mined", "confirmed")
-            if success is True and matched_status:
-                filled_qty = target_qty
-                notional = target_qty * limit_price
-                estimated = True
-            else:
-                filled_qty = 0.0
-                notional = 0.0
+            filled_qty = 0.0
+            notional = 0.0
 
         if notional is None:
             notional = filled_qty * limit_price
             estimated = True
 
         avg_price = notional / filled_qty if filled_qty > 0 else 0.0
-        ok = (success is not False) and not error_msg
+        ok = (success is not False) and not error_msg and filled_qty > 0
         return ExecutionLegResult(
             label=label,
             token_id=token_id,
@@ -374,6 +496,64 @@ class PolymarketLiveExecutor:
             error=error_msg,
             raw=raw,
         )
+
+    def _confirm_buy_fill(
+        self,
+        *,
+        order_id: str,
+        target_qty: float,
+        limit_price: float,
+        current_qty: Optional[float],
+        current_notional: Optional[float],
+        current_status: str,
+        raw: dict[str, Any],
+    ) -> tuple[Optional[float], Optional[float], str, dict[str, Any]]:
+        best_qty = current_qty
+        best_notional = current_notional
+        best_status = current_status
+        lookups: list[dict[str, Any]] = []
+        errors: list[str] = []
+        timeout_s = max(0.0, self.config.confirm_timeout_s)
+        deadline = time.time() + timeout_s
+        while True:
+            try:
+                order = _obj_to_dict(self.client.get_order(order_id))
+                if order:
+                    lookups.append(order)
+                    qty = _normalize_amount(
+                        _first(order, ("size_matched", "sizeMatched", "matchedAmount", "matched_amount")),
+                        target_qty,
+                    )
+                    status = str(_first(order, ("status", "state")) or best_status)
+                    if status:
+                        best_status = status
+                    if qty is not None and (best_qty is None or qty > best_qty):
+                        best_qty = qty
+                        px = _float_or_none(_first(order, ("avg_price", "average_price", "price")))
+                        best_notional = qty * (px if px is not None else limit_price)
+                    if best_qty is not None and best_qty >= target_qty:
+                        break
+                    if status.upper() in (
+                        "ORDER_STATUS_MATCHED",
+                        "ORDER_STATUS_CANCELED",
+                        "ORDER_STATUS_INVALID",
+                        "MATCHED",
+                        "FILLED",
+                        "CANCELED",
+                        "CANCELLED",
+                        "INVALID",
+                    ):
+                        break
+            except Exception as exc:
+                errors.append(str(exc))
+            if time.time() >= deadline:
+                break
+            time.sleep(max(0.05, self.config.confirm_poll_s))
+        if lookups:
+            raw = {**raw, "order_lookups": lookups}
+        if errors:
+            raw = {**raw, "order_lookup_errors": errors[-3:]}
+        return best_qty, best_notional, best_status, raw
 
 
 def merge_execution_results(base: ExecutionLegResult, extra: ExecutionLegResult) -> ExecutionLegResult:

@@ -386,8 +386,10 @@ class GateConfig:
     poll_fast_s: float = 0.1
     leg_mismatch_tolerance_shares: float = 1.0
     exec_slippage_ticks: int = 2
-    exec_chase_slippage_ticks: int = 4
+    exec_chase_slippage_ticks: int = 1
     exec_max_chase_attempts: int = 2
+    exec_flatten_slippage_ticks: int = 8
+    exec_flatten_max_attempts: int = 3
 
 
 def shadow_fill(book: SimpleBook, side: str, target_qty: float) -> Tuple[float, float]:
@@ -458,6 +460,114 @@ async def execute_buy_leg(
     )
 
 
+def entry_execution_status(
+    res_a: ExecutionLegResult,
+    res_b: ExecutionLegResult,
+    qty_target: float,
+    gates: GateConfig,
+) -> tuple[bool, str, float, float]:
+    tolerance = max(0.0, gates.leg_mismatch_tolerance_shares)
+    min_required = max(0.0, qty_target - tolerance)
+    imbalance = abs(res_a.filled_qty - res_b.filled_qty)
+    if res_a.filled_qty < min_required or res_b.filled_qty < min_required:
+        return (
+            False,
+            f"underfill:min_required={min_required:.2f},qtyA={res_a.filled_qty:.2f},qtyB={res_b.filled_qty:.2f}",
+            min_required,
+            imbalance,
+        )
+    if imbalance > tolerance:
+        return (
+            False,
+            f"imbalance:{imbalance:.2f}>{tolerance:.2f}",
+            min_required,
+            imbalance,
+        )
+    return True, "ok", min_required, imbalance
+
+
+async def execute_buy_pair_once(
+    *,
+    legs_by_asset: dict[str, MarketLeg],
+    leg_a: str,
+    leg_b: str,
+    qty_a: float,
+    qty_b: float,
+    live_executor: Optional[PolymarketLiveExecutor],
+    slippage_ticks: int,
+    allow_partial_submit: bool = False,
+) -> tuple[ExecutionLegResult, ExecutionLegResult]:
+    if live_executor is None:
+        return await asyncio.gather(
+            execute_buy_leg(
+                legs_by_asset=legs_by_asset,
+                label=leg_a,
+                qty=qty_a,
+                live_executor=None,
+                slippage_ticks=slippage_ticks,
+            ),
+            execute_buy_leg(
+                legs_by_asset=legs_by_asset,
+                label=leg_b,
+                qty=qty_b,
+                live_executor=None,
+                slippage_ticks=slippage_ticks,
+            ),
+        )
+
+    def live_spec(label: str, qty: float) -> tuple[Optional[dict], Optional[ExecutionLegResult]]:
+        token_id = token_id_for_label(legs_by_asset, label)
+        if qty <= 0:
+            return None, ExecutionLegResult(label, token_id, qty, 0.0, 0.0, 0.0, ok=False, error="target_qty<=0")
+        book = get_book_for_label(legs_by_asset, label)
+        ask = best_ask_tuple(book)
+        if ask is None:
+            return None, ExecutionLegResult(label, token_id, qty, 0.0, 0.0, 0.0, ok=False, error="no_best_ask")
+        leg = get_leg_for_label(legs_by_asset, label)
+        return {
+            "label": label,
+            "token_id": token_id,
+            "target_qty": qty,
+            "best_ask": ask[0],
+            "tick_size": leg.tick_size,
+            "neg_risk": leg.neg_risk,
+        }, None
+
+    spec_a, err_a = live_spec(leg_a, qty_a)
+    spec_b, err_b = live_spec(leg_b, qty_b)
+    if spec_a is not None and spec_b is not None:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: live_executor.buy_pair_limit_fak(
+                leg_a=spec_a,
+                leg_b=spec_b,
+                slippage_ticks=slippage_ticks,
+            ),
+        )
+    if not allow_partial_submit:
+        return (
+            err_a or ExecutionLegResult(leg_a, token_id_for_label(legs_by_asset, leg_a), qty_a, 0.0, 0.0, 0.0, ok=False, error="batch_leg_missing"),
+            err_b or ExecutionLegResult(leg_b, token_id_for_label(legs_by_asset, leg_b), qty_b, 0.0, 0.0, 0.0, ok=False, error="batch_leg_missing"),
+        )
+
+    async def maybe_single(label: str, qty: float, spec: Optional[dict], err: Optional[ExecutionLegResult]) -> ExecutionLegResult:
+        if spec is None:
+            return err or ExecutionLegResult(label, token_id_for_label(legs_by_asset, label), qty, 0.0, 0.0, 0.0, ok=False, error="no_live_spec")
+        return await execute_buy_leg(
+            legs_by_asset=legs_by_asset,
+            label=label,
+            qty=qty,
+            live_executor=live_executor,
+            slippage_ticks=slippage_ticks,
+        )
+
+    return await asyncio.gather(
+        maybe_single(leg_a, qty_a, spec_a, err_a),
+        maybe_single(leg_b, qty_b, spec_b, err_b),
+    )
+
+
 async def execute_buy_pair(
     *,
     legs_by_asset: dict[str, MarketLeg],
@@ -468,53 +578,168 @@ async def execute_buy_pair(
     live_executor: Optional[PolymarketLiveExecutor],
 ) -> tuple[ExecutionLegResult, ExecutionLegResult, list[dict]]:
     events: list[dict] = []
-    res_a = await execute_buy_leg(
+    res_a, res_b = await execute_buy_pair_once(
         legs_by_asset=legs_by_asset,
-        label=leg_a,
-        qty=qty,
+        leg_a=leg_a,
+        leg_b=leg_b,
+        qty_a=qty,
+        qty_b=qty,
         live_executor=live_executor,
         slippage_ticks=gates.exec_slippage_ticks,
-    )
-    res_b = await execute_buy_leg(
-        legs_by_asset=legs_by_asset,
-        label=leg_b,
-        qty=qty,
-        live_executor=live_executor,
-        slippage_ticks=gates.exec_slippage_ticks,
+        allow_partial_submit=False,
     )
     events.append({"phase": "initial", "leg": leg_a, **res_a.__dict__})
     events.append({"phase": "initial", "leg": leg_b, **res_b.__dict__})
 
     for attempt in range(1, gates.exec_max_chase_attempts + 1):
-        diff = res_a.filled_qty - res_b.filled_qty
-        if abs(diff) <= gates.leg_mismatch_tolerance_shares:
+        ok, _reason, min_required, _imbalance = entry_execution_status(res_a, res_b, qty, gates)
+        if ok:
             break
-        if diff > 0:
+        diff = res_a.filled_qty - res_b.filled_qty
+        tolerance = max(0.0, gates.leg_mismatch_tolerance_shares)
+        need_a = 0.0
+        need_b = 0.0
+        if res_a.filled_qty < min_required:
+            need_a = max(need_a, qty - res_a.filled_qty)
+        if res_b.filled_qty < min_required:
+            need_b = max(need_b, qty - res_b.filled_qty)
+        if diff > tolerance:
+            need_b = max(need_b, diff)
+        elif -diff > tolerance:
+            need_a = max(need_a, -diff)
+        if need_a <= 0 and need_b <= 0:
+            break
+        chase_slip = gates.exec_chase_slippage_ticks * attempt
+        if need_a > 0 and need_b > 0:
+            extra_a, extra_b = await execute_buy_pair_once(
+                legs_by_asset=legs_by_asset,
+                leg_a=leg_a,
+                leg_b=leg_b,
+                qty_a=need_a,
+                qty_b=need_b,
+                live_executor=live_executor,
+                slippage_ticks=chase_slip,
+                allow_partial_submit=False,
+            )
+            res_a = merge_execution_results(res_a, extra_a)
+            res_b = merge_execution_results(res_b, extra_b)
+            events.append({"phase": f"chase_{attempt}", "leg": leg_a, **extra_a.__dict__})
+            events.append({"phase": f"chase_{attempt}", "leg": leg_b, **extra_b.__dict__})
+            if extra_a.filled_qty <= 0 and extra_b.filled_qty <= 0:
+                break
+        elif need_b > 0:
             chase_label = leg_b
-            chase_qty = diff
             extra = await execute_buy_leg(
                 legs_by_asset=legs_by_asset,
                 label=chase_label,
-                qty=chase_qty,
+                qty=need_b,
                 live_executor=live_executor,
-                slippage_ticks=gates.exec_chase_slippage_ticks,
+                slippage_ticks=chase_slip,
             )
             res_b = merge_execution_results(res_b, extra)
+            events.append({"phase": f"chase_{attempt}", "leg": chase_label, **extra.__dict__})
+            if extra.filled_qty <= 0:
+                break
         else:
             chase_label = leg_a
-            chase_qty = -diff
             extra = await execute_buy_leg(
                 legs_by_asset=legs_by_asset,
                 label=chase_label,
-                qty=chase_qty,
+                qty=need_a,
                 live_executor=live_executor,
-                slippage_ticks=gates.exec_chase_slippage_ticks,
+                slippage_ticks=chase_slip,
             )
             res_a = merge_execution_results(res_a, extra)
-        events.append({"phase": f"chase_{attempt}", "leg": chase_label, **extra.__dict__})
-        if extra.filled_qty <= 0:
-            break
+            events.append({"phase": f"chase_{attempt}", "leg": chase_label, **extra.__dict__})
+            if extra.filled_qty <= 0:
+                break
     return res_a, res_b, events
+
+
+def _empty_exec_result(label: str, token_id: str, status: str = "not_needed") -> ExecutionLegResult:
+    return ExecutionLegResult(
+        label=label,
+        token_id=token_id,
+        requested_qty=0.0,
+        filled_qty=0.0,
+        avg_price=0.0,
+        notional=0.0,
+        order_id="",
+        status=status,
+        ok=True,
+    )
+
+
+async def flatten_entry_exposure(
+    *,
+    legs_by_asset: dict[str, MarketLeg],
+    leg_a: str,
+    leg_b: str,
+    res_a: ExecutionLegResult,
+    res_b: ExecutionLegResult,
+    gates: GateConfig,
+    live_executor: Optional[PolymarketLiveExecutor],
+) -> tuple[ExecutionLegResult, ExecutionLegResult, bool, list[dict]]:
+    events: list[dict] = []
+    opp_a = opposite_label(leg_a)
+    opp_b = opposite_label(leg_b)
+    flat_a = _empty_exec_result(opp_a, token_id_for_label(legs_by_asset, opp_a))
+    flat_b = _empty_exec_result(opp_b, token_id_for_label(legs_by_asset, opp_b))
+    tolerance = max(0.0, gates.leg_mismatch_tolerance_shares)
+
+    for attempt in range(1, gates.exec_flatten_max_attempts + 1):
+        need_a = max(0.0, res_a.filled_qty - flat_a.filled_qty)
+        need_b = max(0.0, res_b.filled_qty - flat_b.filled_qty)
+        if need_a <= tolerance and need_b <= tolerance:
+            break
+        slip = gates.exec_flatten_slippage_ticks * attempt
+        if need_a > tolerance and need_b > tolerance:
+            extra_a, extra_b = await execute_buy_pair_once(
+                legs_by_asset=legs_by_asset,
+                leg_a=opp_a,
+                leg_b=opp_b,
+                qty_a=need_a,
+                qty_b=need_b,
+                live_executor=live_executor,
+                slippage_ticks=slip,
+                allow_partial_submit=True,
+            )
+            flat_a = merge_execution_results(flat_a, extra_a)
+            flat_b = merge_execution_results(flat_b, extra_b)
+            events.append({"phase": f"entry_flatten_{attempt}", "source_leg": leg_a, "leg": opp_a, **extra_a.__dict__})
+            events.append({"phase": f"entry_flatten_{attempt}", "source_leg": leg_b, "leg": opp_b, **extra_b.__dict__})
+            if extra_a.filled_qty <= 0 and extra_b.filled_qty <= 0:
+                break
+        elif need_a > tolerance:
+            extra_a = await execute_buy_leg(
+                legs_by_asset=legs_by_asset,
+                label=opp_a,
+                qty=need_a,
+                live_executor=live_executor,
+                slippage_ticks=slip,
+            )
+            flat_a = merge_execution_results(flat_a, extra_a)
+            events.append({"phase": f"entry_flatten_{attempt}", "source_leg": leg_a, "leg": opp_a, **extra_a.__dict__})
+            if extra_a.filled_qty <= 0:
+                break
+        elif need_b > tolerance:
+            extra_b = await execute_buy_leg(
+                legs_by_asset=legs_by_asset,
+                label=opp_b,
+                qty=need_b,
+                live_executor=live_executor,
+                slippage_ticks=slip,
+            )
+            flat_b = merge_execution_results(flat_b, extra_b)
+            events.append({"phase": f"entry_flatten_{attempt}", "source_leg": leg_b, "leg": opp_b, **extra_b.__dict__})
+            if extra_b.filled_qty <= 0:
+                break
+
+    ok = (
+        max(0.0, res_a.filled_qty - flat_a.filled_qty) <= tolerance
+        and max(0.0, res_b.filled_qty - flat_b.filled_qty) <= tolerance
+    )
+    return flat_a, flat_b, ok, events
 
 
 def pm_long_mark_from_opposite(
@@ -742,6 +967,7 @@ async def strategy_loop(
     last_fill_at = 0.0
     next_combo_id = 1
     total_cost = 0.0
+    entry_blocked = False
 
     def aggregate_cost() -> float:
         return sum(c.price_a * max(c.qty_a, c.qty) + c.price_b * max(c.qty_b, c.qty) for c in combos)
@@ -778,6 +1004,7 @@ async def strategy_loop(
                 "samples": len(hist.samples),
                 "combos_open": len(combos),
                 "total_cost": round(total_cost, 4),
+                "entry_blocked": entry_blocked,
             })
             last_log = now
 
@@ -785,7 +1012,11 @@ async def strategy_loop(
         cooldown_ok = (now - last_fill_at) >= gates.combo_cooldown_s
         # Entry-only risk budget. Defensive imbalance hedges and Q4 kills below
         # must bypass this gate so stops cannot be blocked by sizing caps.
-        capacity_ok = len(main_combos) < gates.max_combos_per_round and total_cost < gates.max_cost_per_round_usd
+        capacity_ok = (
+            not entry_blocked
+            and len(main_combos) < gates.max_combos_per_round
+            and total_cost < gates.max_cost_per_round_usd
+        )
         if cooldown_ok and capacity_ok:
             sig, diag = try_entry(legs_by_asset, stats, gates, hist, tte)
             if samples_since_eval == 0:
@@ -819,6 +1050,106 @@ async def strategy_loop(
                     fb, pb = res_b.filled_qty, res_b.avg_price
                     qty = min(fa, fb)
                     imbalance = abs(fa - fb)
+                    entry_ok, entry_fail_reason, min_required, imbalance = entry_execution_status(
+                        res_a, res_b, qty_target, gates,
+                    )
+                    if not entry_ok:
+                        abort_combo_id = next_combo_id
+                        flat_a, flat_b, flat_ok, flat_events = await flatten_entry_exposure(
+                            legs_by_asset=legs_by_asset,
+                            leg_a=sig.leg_a,
+                            leg_b=sig.leg_b,
+                            res_a=res_a,
+                            res_b=res_b,
+                            gates=gates,
+                            live_executor=live_executor,
+                        )
+                        for ev in flat_events:
+                            _log(jsonl, {"kind": "entry_abort_flatten_order", "ts": now, "tte": tte,
+                                         "combo_id": abort_combo_id, **ev})
+                        entry_blocked = True
+                        last_fill_at = now
+                        residual_a = max(0.0, fa - flat_a.filled_qty)
+                        residual_b = max(0.0, fb - flat_b.filled_qty)
+                        residual_tracked = False
+                        if not flat_ok and (residual_a > gates.leg_mismatch_tolerance_shares
+                                            or residual_b > gates.leg_mismatch_tolerance_shares):
+                            residual = LabCombo(
+                                combo_id=abort_combo_id,
+                                direction=sig.direction,
+                                leg_a=sig.leg_a,
+                                leg_b=sig.leg_b,
+                                price_a=pa,
+                                price_b=pb,
+                                qty=0.0,
+                                entered_at=now,
+                                qty_a=fa,
+                                qty_b=fb,
+                                flip_price_a=flat_a.avg_price,
+                                flip_price_b=flat_b.avg_price,
+                                flip_qty_a=flat_a.filled_qty,
+                                flip_qty_b=flat_b.filled_qty,
+                                flip_reason_a="entry_abort_flatten",
+                                flip_reason_b="entry_abort_flatten",
+                                is_hedge=True,
+                                entry_gap=sig.gap,
+                                entry_fav_bp_a=float(diag.get("fav_bp_a", 0.0)),
+                                entry_fav_bp_b=float(diag.get("fav_bp_b", 0.0)),
+                            )
+                            combos.append(residual)
+                            residual_tracked = True
+                            next_combo_id += 1
+                        total_cost = aggregate_cost()
+                        _log(jsonl, {
+                            "kind": "entry_abort_flatten",
+                            "ts": now,
+                            "tte": tte,
+                            "combo_id": abort_combo_id,
+                            "reason": entry_fail_reason,
+                            "min_required": min_required,
+                            "leg_a": sig.leg_a,
+                            "price_a": pa,
+                            "qty_a": fa,
+                            "flat_a": flat_a.filled_qty,
+                            "flat_price_a": flat_a.avg_price,
+                            "residual_a": residual_a,
+                            "leg_b": sig.leg_b,
+                            "price_b": pb,
+                            "qty_b": fb,
+                            "flat_b": flat_b.filled_qty,
+                            "flat_price_b": flat_b.avg_price,
+                            "residual_b": residual_b,
+                            "flat_ok": flat_ok,
+                            "execution": "live" if live_executor else "shadow",
+                            "order_id_a": res_a.order_id,
+                            "order_id_b": res_b.order_id,
+                            "status_a": res_a.status,
+                            "status_b": res_b.status,
+                            "error_a": res_a.error,
+                            "error_b": res_b.error,
+                            "total_cost": round(total_cost, 4),
+                        })
+                        if notify:
+                            notify("alert", {
+                                "round": round_idx,
+                                "combo_id": abort_combo_id,
+                                "tte": tte,
+                                "reason": entry_fail_reason,
+                                "flat_ok": flat_ok,
+                                "leg_a": sig.leg_a,
+                                "qty_a": fa,
+                                "flat_a": flat_a.filled_qty,
+                                "residual_a": residual_a,
+                                "leg_b": sig.leg_b,
+                                "qty_b": fb,
+                                "flat_b": flat_b.filled_qty,
+                                "residual_b": residual_b,
+                                "execution": "live" if live_executor else "shadow",
+                            })
+                        if not residual_tracked:
+                            next_combo_id += 1
+                        continue
+
                     if max(fa, fb) > 0:
                         combo = LabCombo(
                             combo_id=next_combo_id,
@@ -834,45 +1165,6 @@ async def strategy_loop(
                         )
                         combos.append(combo)
                         last_fill_at = now
-                        hedge_result = None
-                        if imbalance > gates.leg_mismatch_tolerance_shares:
-                            excess_qty = imbalance - gates.leg_mismatch_tolerance_shares
-                            if fa > fb:
-                                hedge_label = opposite_label(sig.leg_a)
-                                hedge_result = await execute_buy_leg(
-                                    legs_by_asset=legs_by_asset,
-                                    label=hedge_label,
-                                    qty=excess_qty,
-                                    live_executor=live_executor,
-                                    slippage_ticks=gates.exec_chase_slippage_ticks,
-                                )
-                                if hedge_result.filled_qty > 0:
-                                    combo.flip_qty_a += hedge_result.filled_qty
-                                    combo.flip_price_a = hedge_result.avg_price
-                                    combo.flip_reason_a = "entry_imbalance_hedge"
-                            else:
-                                hedge_label = opposite_label(sig.leg_b)
-                                hedge_result = await execute_buy_leg(
-                                    legs_by_asset=legs_by_asset,
-                                    label=hedge_label,
-                                    qty=excess_qty,
-                                    live_executor=live_executor,
-                                    slippage_ticks=gates.exec_chase_slippage_ticks,
-                                )
-                                if hedge_result.filled_qty > 0:
-                                    combo.flip_qty_b += hedge_result.filled_qty
-                                    combo.flip_price_b = hedge_result.avg_price
-                                    combo.flip_reason_b = "entry_imbalance_hedge"
-                            _log(jsonl, {
-                                "kind": "entry_imbalance_hedge",
-                                "ts": now,
-                                "tte": tte,
-                                "combo_id": combo.combo_id,
-                                "imbalance": imbalance,
-                                "tolerance": gates.leg_mismatch_tolerance_shares,
-                                "hedge_label": hedge_label,
-                                **(hedge_result.__dict__ if hedge_result else {}),
-                            })
                         total_cost = aggregate_cost()
                         next_combo_id += 1
                         _log(jsonl, {
@@ -1031,12 +1323,18 @@ async def strategy_loop(
                     combo.flipped_a = True
                     combo.flipped_b = True
                     continue
-                if live_executor is None:
-                    ffa, fpa = shadow_fill(opp_a_book, "BUY", remaining_flip_a)
-                    ffb, fpb = shadow_fill(opp_b_book, "BUY", remaining_flip_b)
-                    res_flip_a = make_shadow_result(opp_a_label, token_id_for_label(legs_by_asset, opp_a_label), remaining_flip_a, ffa, fpa)
-                    res_flip_b = make_shadow_result(opp_b_label, token_id_for_label(legs_by_asset, opp_b_label), remaining_flip_b, ffb, fpb)
-                else:
+                if remaining_flip_a > 0 and remaining_flip_b > 0:
+                    res_flip_a, res_flip_b = await execute_buy_pair_once(
+                        legs_by_asset=legs_by_asset,
+                        leg_a=opp_a_label,
+                        leg_b=opp_b_label,
+                        qty_a=remaining_flip_a,
+                        qty_b=remaining_flip_b,
+                        live_executor=live_executor,
+                        slippage_ticks=gates.exec_chase_slippage_ticks,
+                        allow_partial_submit=True,
+                    )
+                elif remaining_flip_a > 0:
                     res_flip_a = await execute_buy_leg(
                         legs_by_asset=legs_by_asset,
                         label=opp_a_label,
@@ -1044,6 +1342,9 @@ async def strategy_loop(
                         live_executor=live_executor,
                         slippage_ticks=gates.exec_chase_slippage_ticks,
                     )
+                    res_flip_b = _empty_exec_result(opp_b_label, token_id_for_label(legs_by_asset, opp_b_label))
+                else:
+                    res_flip_a = _empty_exec_result(opp_a_label, token_id_for_label(legs_by_asset, opp_a_label))
                     res_flip_b = await execute_buy_leg(
                         legs_by_asset=legs_by_asset,
                         label=opp_b_label,
@@ -1051,10 +1352,10 @@ async def strategy_loop(
                         live_executor=live_executor,
                         slippage_ticks=gates.exec_chase_slippage_ticks,
                     )
-                    _log(jsonl, {"kind": "kill_order_fill", "ts": now, "tte": tte, "combo_id": combo.combo_id,
-                                 "phase": "kill", "leg": opp_a_label, **res_flip_a.__dict__})
-                    _log(jsonl, {"kind": "kill_order_fill", "ts": now, "tte": tte, "combo_id": combo.combo_id,
-                                 "phase": "kill", "leg": opp_b_label, **res_flip_b.__dict__})
+                _log(jsonl, {"kind": "kill_order_fill", "ts": now, "tte": tte, "combo_id": combo.combo_id,
+                             "phase": "kill", "leg": opp_a_label, **res_flip_a.__dict__})
+                _log(jsonl, {"kind": "kill_order_fill", "ts": now, "tte": tte, "combo_id": combo.combo_id,
+                             "phase": "kill", "leg": opp_b_label, **res_flip_b.__dict__})
                 ffa, fpa = res_flip_a.filled_qty, res_flip_a.avg_price
                 ffb, fpb = res_flip_b.filled_qty, res_flip_b.avg_price
                 if ffa > 0:
@@ -1341,6 +1642,14 @@ def _format_event(kind: str, data: dict) -> str:
                 f"  {data['leg_b']} entry={data['entry_b']:.3f} -> flip={data['flip_b']:.3f}\n"
                 f"  qtyA={data.get('qty_a', data.get('qty', 0.0)):.2f} qtyB={data.get('qty_b', data.get('qty', 0.0)):.2f} "
                 f"exec={data.get('execution', 'shadow')}")
+    if kind == "alert":
+        return (f"ALERT R{data['round']} c{data['combo_id']} tte={data['tte']}s\n"
+                f"  reason: {data['reason']} flat_ok={data.get('flat_ok')}\n"
+                f"  {data['leg_a']} qty={data.get('qty_a', 0.0):.2f} flat={data.get('flat_a', 0.0):.2f} "
+                f"res={data.get('residual_a', 0.0):.2f}\n"
+                f"  {data['leg_b']} qty={data.get('qty_b', 0.0):.2f} flat={data.get('flat_b', 0.0):.2f} "
+                f"res={data.get('residual_b', 0.0):.2f}\n"
+                f"  exec={data.get('execution', 'shadow')}")
     if kind == "settle":
         div = " (DIV)" if data.get("divergence") else ""
         return (f"SETTLE R{data['round']}{div} pnl=${data['pnl']:+.2f}\n"
@@ -1570,8 +1879,10 @@ def main() -> None:
         q4_fav_worsen_bp=_envf("CORR_Q4_FAV_WORSEN_BP", 1.0),
         leg_mismatch_tolerance_shares=_envf("CORR_LEG_MISMATCH_TOLERANCE_SHARES", 1.0),
         exec_slippage_ticks=_envi("CORR_EXEC_SLIPPAGE_TICKS", 2),
-        exec_chase_slippage_ticks=_envi("CORR_EXEC_CHASE_SLIPPAGE_TICKS", 4),
+        exec_chase_slippage_ticks=_envi("CORR_EXEC_CHASE_SLIPPAGE_TICKS", 1),
         exec_max_chase_attempts=_envi("CORR_EXEC_MAX_CHASE_ATTEMPTS", 2),
+        exec_flatten_slippage_ticks=_envi("CORR_EXEC_FLATTEN_SLIPPAGE_TICKS", 8),
+        exec_flatten_max_attempts=_envi("CORR_EXEC_FLATTEN_MAX_ATTEMPTS", 3),
     )
     asyncio.run(main_async(args.rounds, args.start_mode, gates))
 
