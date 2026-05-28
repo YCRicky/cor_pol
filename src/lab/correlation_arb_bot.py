@@ -297,6 +297,7 @@ class LabCombo:
     is_hedge: bool = False
     parent_combo_id: int = 0
     q4_watch_last_log: float = 0.0
+    kill_last_attempt_at: float = 0.0
 
 
 def best_ask_tuple(book: SimpleBook) -> Optional[Tuple[float, float]]:
@@ -390,6 +391,7 @@ class GateConfig:
     exec_max_chase_attempts: int = 2
     exec_flatten_slippage_ticks: int = 8
     exec_flatten_max_attempts: int = 3
+    exec_kill_retry_cooldown_s: float = 1.0
 
 
 def shadow_fill(book: SimpleBook, side: str, target_qty: float) -> Tuple[float, float]:
@@ -1071,10 +1073,9 @@ async def strategy_loop(
                         last_fill_at = now
                         residual_a = max(0.0, fa - flat_a.filled_qty)
                         residual_b = max(0.0, fb - flat_b.filled_qty)
-                        residual_tracked = False
-                        if not flat_ok and (residual_a > gates.leg_mismatch_tolerance_shares
-                                            or residual_b > gates.leg_mismatch_tolerance_shares):
-                            residual = LabCombo(
+                        abort_tracked = False
+                        if max(fa, fb, flat_a.filled_qty, flat_b.filled_qty) > 0:
+                            aborted = LabCombo(
                                 combo_id=abort_combo_id,
                                 direction=sig.direction,
                                 leg_a=sig.leg_a,
@@ -1091,13 +1092,15 @@ async def strategy_loop(
                                 flip_qty_b=flat_b.filled_qty,
                                 flip_reason_a="entry_abort_flatten",
                                 flip_reason_b="entry_abort_flatten",
+                                flipped_a=flat_a.filled_qty >= max(0.0, fa - gates.leg_mismatch_tolerance_shares),
+                                flipped_b=flat_b.filled_qty >= max(0.0, fb - gates.leg_mismatch_tolerance_shares),
                                 is_hedge=True,
                                 entry_gap=sig.gap,
                                 entry_fav_bp_a=float(diag.get("fav_bp_a", 0.0)),
                                 entry_fav_bp_b=float(diag.get("fav_bp_b", 0.0)),
                             )
-                            combos.append(residual)
-                            residual_tracked = True
+                            combos.append(aborted)
+                            abort_tracked = True
                             next_combo_id += 1
                         total_cost = aggregate_cost()
                         _log(jsonl, {
@@ -1146,7 +1149,7 @@ async def strategy_loop(
                                 "residual_b": residual_b,
                                 "execution": "live" if live_executor else "shadow",
                             })
-                        if not residual_tracked:
+                        if not abort_tracked:
                             next_combo_id += 1
                         continue
 
@@ -1323,6 +1326,9 @@ async def strategy_loop(
                     combo.flipped_a = True
                     combo.flipped_b = True
                     continue
+                if now - combo.kill_last_attempt_at < gates.exec_kill_retry_cooldown_s:
+                    continue
+                combo.kill_last_attempt_at = now
                 if remaining_flip_a > 0 and remaining_flip_b > 0:
                     res_flip_a, res_flip_b = await execute_buy_pair_once(
                         legs_by_asset=legs_by_asset,
@@ -1491,6 +1497,7 @@ async def resolve_round(pending: dict, gates: GateConfig, notify=None) -> dict:
         summary["status"] = "UNRESOLVED"
         summary["combos"] = [{
             "combo_id": c.combo_id, "direction": c.direction,
+            "is_hedge": c.is_hedge,
             "leg_a": c.leg_a, "price_a": c.price_a,
             "leg_b": c.leg_b, "price_b": c.price_b, "qty": c.qty,
             "qty_a": max(c.qty_a, c.qty), "qty_b": max(c.qty_b, c.qty),
@@ -1522,6 +1529,7 @@ async def resolve_round(pending: dict, gates: GateConfig, notify=None) -> dict:
         total_flip += flip_pnl_a + flip_pnl_b
         combo_rows.append({
             "combo_id": c.combo_id, "direction": c.direction,
+            "is_hedge": c.is_hedge,
             "leg_a": c.leg_a, "price_a": c.price_a, "payoff_a": payoffs[c.leg_a],
             "leg_b": c.leg_b, "price_b": c.price_b, "payoff_b": payoffs[c.leg_b],
             "qty": c.qty, "qty_a": qty_a, "qty_b": qty_b,
@@ -1883,6 +1891,7 @@ def main() -> None:
         exec_max_chase_attempts=_envi("CORR_EXEC_MAX_CHASE_ATTEMPTS", 2),
         exec_flatten_slippage_ticks=_envi("CORR_EXEC_FLATTEN_SLIPPAGE_TICKS", 8),
         exec_flatten_max_attempts=_envi("CORR_EXEC_FLATTEN_MAX_ATTEMPTS", 3),
+        exec_kill_retry_cooldown_s=_envf("CORR_EXEC_KILL_RETRY_COOLDOWN_S", 1.0),
     )
     asyncio.run(main_async(args.rounds, args.start_mode, gates))
 
