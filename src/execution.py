@@ -143,7 +143,7 @@ class LiveExecutionConfig:
     funder: str
     signature_type: str = "POLY_PROXY"
     builder_code: str = ""
-    order_type: str = "FAK"
+    order_type: str = "GTC"
     slippage_ticks: int = 2
     chase_slippage_ticks: int = 1
     mismatch_tolerance: float = 1.0
@@ -203,7 +203,7 @@ class LiveExecutionConfig:
             funder=funder,
             signature_type=signature_type,
             builder_code=_builder_code_from_env(),
-            order_type=os.getenv("CORR_EXEC_ORDER_TYPE", "FAK").upper(),
+            order_type=os.getenv("CORR_EXEC_ORDER_TYPE", "GTC").upper(),
             slippage_ticks=int(os.getenv("CORR_EXEC_SLIPPAGE_TICKS", "2")),
             chase_slippage_ticks=int(os.getenv("CORR_EXEC_CHASE_SLIPPAGE_TICKS", "1")),
             mismatch_tolerance=float(os.getenv("CORR_LEG_MISMATCH_TOLERANCE_SHARES", "1.0")),
@@ -222,6 +222,7 @@ class PolymarketLiveExecutor:
                 ClobClient,
                 OrderArgs,
                 OrderType,
+                OrderPayload,
                 PartialCreateOrderOptions,
                 Side,
                 SignatureTypeV2,
@@ -236,6 +237,7 @@ class PolymarketLiveExecutor:
             PostOrdersV2Args = SimpleNamespace
         self.OrderArgs = OrderArgs
         self.OrderType = OrderType
+        self.OrderPayload = OrderPayload
         self.PartialCreateOrderOptions = PartialCreateOrderOptions
         self.PostOrdersV2Args = PostOrdersV2Args
         self.Side = Side
@@ -293,6 +295,40 @@ class PolymarketLiveExecutor:
         )
         return signed_order, limit_price
 
+    def _share_buy_order_type(self):
+        # Polymarket FOK/FAK BUY orders are dollar-amount market orders. This
+        # strategy sizes in shares, so live BUYs use a marketable GTC limit and
+        # immediately cancel any unfilled remainder.
+        return self.OrderType.GTC
+
+    def _cancel_remainder(self, raw: dict[str, Any]) -> None:
+        order_id = str(_first(raw, ("orderID", "order_id", "id")) or "")
+        if not order_id:
+            return
+        try:
+            cancel_resp = self.client.cancel_order(self.OrderPayload(orderID=order_id))
+            raw["cancel_response"] = _obj_to_dict(cancel_resp)
+        except Exception as exc:
+            raw["cancel_error"] = str(exc)
+        try:
+            lookup = _obj_to_dict(self.client.get_order(order_id))
+            raw["order_lookup"] = lookup
+            for key in (
+                "status",
+                "state",
+                "sizeMatched",
+                "size_matched",
+                "matchedAmount",
+                "matched_amount",
+                "filledSize",
+                "filled_size",
+                "price",
+            ):
+                if key in lookup and raw.get(key) in (None, ""):
+                    raw[key] = lookup[key]
+        except Exception as exc:
+            raw["order_lookup_error"] = str(exc)
+
     def buy_limit_fak(
         self,
         *,
@@ -317,10 +353,11 @@ class PolymarketLiveExecutor:
             )
             resp = self.client.post_order(
                 signed_order,
-                order_type=getattr(self.OrderType, self.config.order_type, self.OrderType.FAK),
+                order_type=self._share_buy_order_type(),
             )
             raw = _obj_to_dict(resp)
-            raw.setdefault("order_type", self.config.order_type)
+            self._cancel_remainder(raw)
+            raw.setdefault("order_type", "GTC_SHARE_IOC")
             raw.setdefault("limit_price", limit_price)
             raw.setdefault("target_qty", target_qty)
             return self._parse_buy_response(label, token_id, target_qty, limit_price, raw)
@@ -358,7 +395,7 @@ class PolymarketLiveExecutor:
                 )
                 signed_orders.append(signed_order)
                 limit_prices.append(limit_price)
-            order_type = getattr(self.OrderType, self.config.order_type, self.OrderType.FAK)
+            order_type = self._share_buy_order_type()
             post_args = [
                 self.PostOrdersV2Args(order=signed_orders[0], orderType=order_type),
                 self.PostOrdersV2Args(order=signed_orders[1], orderType=order_type),
@@ -366,7 +403,8 @@ class PolymarketLiveExecutor:
             resp = self.client.post_orders(post_args)
             raws = self._split_batch_response(resp, 2)
             for raw, limit_price, spec in zip(raws, limit_prices, specs):
-                raw.setdefault("order_type", self.config.order_type)
+                self._cancel_remainder(raw)
+                raw.setdefault("order_type", "GTC_SHARE_IOC")
                 raw.setdefault("limit_price", limit_price)
                 raw.setdefault("target_qty", float(spec["target_qty"]))
             return (
@@ -461,6 +499,9 @@ class PolymarketLiveExecutor:
         notional_raw = _first(raw, ("makingAmount", "making_amount", "notional", "amount"))
         filled_qty = _normalize_amount(qty_raw, target_qty)
         notional = _normalize_amount(notional_raw, target_qty * limit_price)
+        if filled_qty is not None and filled_qty > target_qty:
+            raw["filled_qty_clamped_from"] = filled_qty
+            filled_qty = target_qty
 
         estimated = False
         if filled_qty is None:
@@ -468,6 +509,10 @@ class PolymarketLiveExecutor:
             notional = 0.0
 
         if notional is None:
+            notional = filled_qty * limit_price
+            estimated = True
+        elif filled_qty > 0 and notional > filled_qty * limit_price:
+            raw["notional_clamped_from"] = notional
             notional = filled_qty * limit_price
             estimated = True
 

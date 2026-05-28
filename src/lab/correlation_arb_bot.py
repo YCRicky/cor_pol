@@ -944,13 +944,15 @@ def post_ack_immediate_no_fill(result: ExecutionLegResult) -> bool:
     if result.filled_qty > 0 or result.error:
         return False
     order_type = str(result.raw.get("order_type") or os.getenv("CORR_EXEC_ORDER_TYPE", "FAK")).upper()
-    if order_type not in {"FAK", "FOK"}:
+    if order_type not in {"FAK", "FOK", "GTC_SHARE_IOC"}:
         return False
     status = (result.status or "").strip().lower()
     if status in POST_ACK_NO_FILL_STATUSES:
         return True
+    if order_type == "GTC_SHARE_IOC" and (result.raw.get("cancel_response") or result.raw.get("order_lookup")):
+        return True
     success = result.raw.get("success")
-    if success is True and result.order_id:
+    if order_type in {"FAK", "FOK"} and success is True and result.order_id:
         return True
     return False
 

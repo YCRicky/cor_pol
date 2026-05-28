@@ -1,7 +1,7 @@
 # Live trading runbook
 
 This document locks the current live-trading design before EC2 deployment.
-It is based on the Polymarket docs reviewed on 2026-05-27:
+It is based on the Polymarket docs reviewed on 2026-05-29:
 
 - Polymarket USD: https://docs.polymarket.com/concepts/pusd
 - Deposit wallets: https://docs.polymarket.com/trading/deposit-wallets
@@ -28,10 +28,12 @@ It is based on the Polymarket docs reviewed on 2026-05-27:
 - Legacy builder users can set `POLY_BUILDER_CODE` to their bytes32 builder
   code. The bot attaches it to every live order.
 - The CLOB order docs classify `FOK` and `FAK` as immediate execution order
-  types. `FAK` fills whatever is available immediately and cancels the rest.
-- SDK market BUY orders take `amount` as dollars/pUSD, not shares. Because this
-  strategy needs "send 5 shares", the bot uses marketable aggressive limit
-  orders with `OrderArgs(size=5)` and `OrderType.FAK` instead of SDK market BUY.
+  types, but for BUY orders they use dollar amount, not share count.
+- SDK market BUY orders and `FOK`/`FAK` BUY types take dollar amount, not shares.
+  Because this strategy needs "send 5 shares", the bot forces live BUYs through
+  marketable GTC limit orders with `OrderArgs(size=5)` and immediately cancels
+  any unfilled remainder. This behaves as share-sized IOC from the bot's
+  perspective and prevents fills above the requested share count.
 - Market and user websocket channels require text `PING` heartbeats every 10
   seconds. The bot sends `PING` every 8 seconds and ignores text `PING/PONG`
   frames before JSON parsing.
@@ -48,7 +50,7 @@ DRY_RUN=false
 CORR_COMBO_QTY=5
 CORR_MAX_COMBOS_PER_ROUND=3
 CORR_MAX_COST_PER_ROUND_USD=15
-CORR_EXEC_ORDER_TYPE=FAK
+CORR_EXEC_ORDER_TYPE=GTC
 CORR_EXEC_SLIPPAGE_TICKS=2
 CORR_EXEC_CHASE_SLIPPAGE_TICKS=1
 CORR_EXEC_MAX_CHASE_ATTEMPTS=2
@@ -57,7 +59,8 @@ CORR_LEG_MISMATCH_TOLERANCE_SHARES=1.0
 
 Entry execution:
 
-1. Buy leg A and leg B with `size = 5` shares each, using aggressive FAK limits.
+1. Buy leg A and leg B with `size = 5` shares each, using aggressive GTC limits
+   that are cancelled immediately after submission.
 2. Limit price is `best_ask + slippage_ticks * tick_size`, capped at `0.99`.
 3. If the two fills differ by at most 1 share, accept the residual and do not
    retry. This prevents the old 4.89 vs 5.00 infinite-retry failure.
@@ -77,7 +80,7 @@ Fourth-quadrant kill execution:
 
 1. When the asymmetric Q4 kill rule fires, buy the opposite side of each open
    long leg for the remaining uncovered quantity.
-2. Live kill orders use the same aggressive FAK wrapper.
+2. Live kill orders use the same aggressive share-limit/cancel wrapper.
 3. Partial kill fills are logged and included in PM-settled PnL; the bot does
    not pretend a kill completed if the CLOB fill response says otherwise.
 

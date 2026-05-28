@@ -2,7 +2,7 @@ import asyncio
 import unittest
 from pathlib import Path
 
-from src.execution import ExecutionLegResult
+from src.execution import ExecutionLegResult, PolymarketLiveExecutor
 from src.lab.correlation_arb_bot import (
     GateConfig,
     MarketLeg,
@@ -37,19 +37,19 @@ class PairExecutor:
                 order_id="a",
                 status="",
                 ok=False,
-                raw={"success": True, "order_type": "FAK"},
+                raw={"success": True, "order_type": "GTC_SHARE_IOC", "cancel_response": {"canceled": ["a"]}},
             ),
             ExecutionLegResult(
                 leg_b["label"],
                 leg_b["token_id"],
                 leg_b["target_qty"],
-                5.82,
+                5.0,
                 0.86,
-                5.0052,
+                4.3,
                 order_id="b",
                 status="matched",
                 ok=True,
-                raw={"order_type": "FAK"},
+                raw={"order_type": "GTC_SHARE_IOC"},
             ),
         )
 
@@ -65,7 +65,7 @@ class PairExecutor:
             order_id="c",
             status="matched",
             ok=True,
-            raw={"order_type": "FAK"},
+            raw={"order_type": "GTC_SHARE_IOC"},
         )
 
 
@@ -97,7 +97,7 @@ class LiveExecutionFlowTests(unittest.TestCase):
             order_id="o1",
             status="",
             ok=False,
-            raw={"success": True, "order_type": "FAK"},
+            raw={"success": True, "order_type": "GTC_SHARE_IOC", "cancel_response": {"canceled": ["o1"]}},
         )
         self.assertTrue(post_ack_immediate_no_fill(result))
         confirmed = asyncio.run(
@@ -116,13 +116,13 @@ class LiveExecutionFlowTests(unittest.TestCase):
             "ETH_YES",
             "tok",
             5.0,
-            5.82,
+            5.0,
             0.86,
-            5.0052,
+            4.3,
             order_id="o2",
             status="matched",
             ok=True,
-            raw={"order_type": "FAK"},
+            raw={"order_type": "GTC_SHARE_IOC"},
         )
         confirmed = asyncio.run(
             confirm_live_result(
@@ -132,9 +132,30 @@ class LiveExecutionFlowTests(unittest.TestCase):
                 gates=GateConfig(exec_user_ws_confirm_timeout_s=0.01),
             )
         )
-        self.assertEqual(confirmed.filled_qty, 5.82)
+        self.assertEqual(confirmed.filled_qty, 5.0)
         self.assertTrue(confirmed.ok)
         self.assertEqual(confirmed.raw["confirm_source"], "post_ack_after_user_ws_timeout")
+
+    def test_clob_share_ioc_response_is_clamped_to_target_qty(self):
+        raw = {
+            "success": True,
+            "orderID": "o3",
+            "takingAmount": "5.82",
+            "makingAmount": "5.0052",
+            "order_type": "GTC_SHARE_IOC",
+        }
+        result = PolymarketLiveExecutor._parse_buy_response(
+            object(),
+            "ETH_NO",
+            "tok",
+            5.0,
+            0.86,
+            raw,
+        )
+        self.assertEqual(result.filled_qty, 5.0)
+        self.assertEqual(result.notional, 4.3)
+        self.assertEqual(result.raw["filled_qty_clamped_from"], 5.82)
+        self.assertEqual(result.raw["notional_clamped_from"], 5.0052)
 
     def test_one_leg_fill_one_leg_no_fill_chases_short_leg(self):
         executor = PairExecutor()
@@ -149,9 +170,9 @@ class LiveExecutionFlowTests(unittest.TestCase):
                 order_feed=SilentFeed(),
             )
         )
-        self.assertEqual(res_a.filled_qty, 5.82)
-        self.assertEqual(res_b.filled_qty, 5.82)
-        self.assertEqual(executor.single_calls, [("BTC_YES", 5.82, 1)])
+        self.assertEqual(res_a.filled_qty, 5.0)
+        self.assertEqual(res_b.filled_qty, 5.0)
+        self.assertEqual(executor.single_calls, [("BTC_YES", 5.0, 1)])
 
     def test_user_ws_trade_weighted_average_price(self):
         async def run_case():
