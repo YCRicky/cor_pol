@@ -149,7 +149,7 @@ class LiveExecutionConfig:
     chase_slippage_ticks: int = 1
     mismatch_tolerance: float = 1.0
     max_chase_attempts: int = 2
-    confirm_timeout_s: float = 3.0
+    confirm_timeout_s: float = 8.0
     confirm_poll_s: float = 0.2
 
     @classmethod
@@ -211,7 +211,7 @@ class LiveExecutionConfig:
             chase_slippage_ticks=int(os.getenv("CORR_EXEC_CHASE_SLIPPAGE_TICKS", "1")),
             mismatch_tolerance=float(os.getenv("CORR_LEG_MISMATCH_TOLERANCE_SHARES", "1.0")),
             max_chase_attempts=int(os.getenv("CORR_EXEC_MAX_CHASE_ATTEMPTS", "2")),
-            confirm_timeout_s=float(os.getenv("CORR_EXEC_CONFIRM_TIMEOUT_S", "3.0")),
+            confirm_timeout_s=float(os.getenv("CORR_EXEC_CONFIRM_TIMEOUT_S", "8.0")),
             confirm_poll_s=float(os.getenv("CORR_EXEC_CONFIRM_POLL_S", "0.2")),
         )
 
