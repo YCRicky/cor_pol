@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import time
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -149,8 +148,6 @@ class LiveExecutionConfig:
     chase_slippage_ticks: int = 1
     mismatch_tolerance: float = 1.0
     max_chase_attempts: int = 2
-    confirm_timeout_s: float = 8.0
-    confirm_poll_s: float = 0.2
 
     @classmethod
     def from_env(cls) -> "LiveExecutionConfig":
@@ -211,8 +208,6 @@ class LiveExecutionConfig:
             chase_slippage_ticks=int(os.getenv("CORR_EXEC_CHASE_SLIPPAGE_TICKS", "1")),
             mismatch_tolerance=float(os.getenv("CORR_LEG_MISMATCH_TOLERANCE_SHARES", "1.0")),
             max_chase_attempts=int(os.getenv("CORR_EXEC_MAX_CHASE_ATTEMPTS", "2")),
-            confirm_timeout_s=float(os.getenv("CORR_EXEC_CONFIRM_TIMEOUT_S", "8.0")),
-            confirm_poll_s=float(os.getenv("CORR_EXEC_CONFIRM_POLL_S", "0.2")),
         )
 
 
@@ -460,17 +455,6 @@ class PolymarketLiveExecutor:
         filled_qty = _normalize_amount(qty_raw, target_qty)
         notional = _normalize_amount(notional_raw, target_qty * limit_price)
 
-        if order_id and (filled_qty is None or filled_qty < target_qty):
-            filled_qty, notional, status, raw = self._confirm_buy_fill(
-                order_id=order_id,
-                target_qty=target_qty,
-                limit_price=limit_price,
-                current_qty=filled_qty,
-                current_notional=notional,
-                current_status=status,
-                raw=raw,
-            )
-
         estimated = False
         if filled_qty is None:
             filled_qty = 0.0
@@ -496,64 +480,6 @@ class PolymarketLiveExecutor:
             error=error_msg,
             raw=raw,
         )
-
-    def _confirm_buy_fill(
-        self,
-        *,
-        order_id: str,
-        target_qty: float,
-        limit_price: float,
-        current_qty: Optional[float],
-        current_notional: Optional[float],
-        current_status: str,
-        raw: dict[str, Any],
-    ) -> tuple[Optional[float], Optional[float], str, dict[str, Any]]:
-        best_qty = current_qty
-        best_notional = current_notional
-        best_status = current_status
-        lookups: list[dict[str, Any]] = []
-        errors: list[str] = []
-        timeout_s = max(0.0, self.config.confirm_timeout_s)
-        deadline = time.time() + timeout_s
-        while True:
-            try:
-                order = _obj_to_dict(self.client.get_order(order_id))
-                if order:
-                    lookups.append(order)
-                    qty = _normalize_amount(
-                        _first(order, ("size_matched", "sizeMatched", "matchedAmount", "matched_amount")),
-                        target_qty,
-                    )
-                    status = str(_first(order, ("status", "state")) or best_status)
-                    if status:
-                        best_status = status
-                    if qty is not None and (best_qty is None or qty > best_qty):
-                        best_qty = qty
-                        px = _float_or_none(_first(order, ("avg_price", "average_price", "price")))
-                        best_notional = qty * (px if px is not None else limit_price)
-                    if best_qty is not None and best_qty >= target_qty:
-                        break
-                    if status.upper() in (
-                        "ORDER_STATUS_MATCHED",
-                        "ORDER_STATUS_CANCELED",
-                        "ORDER_STATUS_INVALID",
-                        "MATCHED",
-                        "FILLED",
-                        "CANCELED",
-                        "CANCELLED",
-                        "INVALID",
-                    ):
-                        break
-            except Exception as exc:
-                errors.append(str(exc))
-            if time.time() >= deadline:
-                break
-            time.sleep(max(0.05, self.config.confirm_poll_s))
-        if lookups:
-            raw = {**raw, "order_lookups": lookups}
-        if errors:
-            raw = {**raw, "order_lookup_errors": errors[-3:]}
-        return best_qty, best_notional, best_status, raw
 
 
 def merge_execution_results(base: ExecutionLegResult, extra: ExecutionLegResult) -> ExecutionLegResult:

@@ -10,7 +10,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Deque, Optional, Tuple
+from typing import Any, Deque, Optional, Tuple
 
 import websockets
 
@@ -45,6 +45,7 @@ from lab.correlation_arb_core import (  # noqa: E402
 from notifier import TelegramConfig, TelegramNotifier  # noqa: E402
 
 WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+USER_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
 OUT = ROOT / "out"
 OUT.mkdir(parents=True, exist_ok=True)
 
@@ -212,6 +213,17 @@ def _log(path: Path, record: dict) -> None:
         pass
 
 
+def _env_clean(name: str) -> str:
+    return (os.getenv(name, "") or "").strip().strip('"').strip("'")
+
+
+def _float_or_none(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 async def ws_consumer(legs: list[MarketLeg], stop_at: float) -> None:
     token_map: dict[str, tuple[MarketLeg, str]] = {}
     for leg in legs:
@@ -245,6 +257,138 @@ async def ws_consumer(legs: list[MarketLeg], stop_at: float) -> None:
                             book.apply_changes(item["changes"])
         except Exception:
             await asyncio.sleep(1.0)
+
+
+class UserOrderFeed:
+    def __init__(self, *, markets: list[str], jsonl: Path):
+        self.markets = [m for m in markets if m]
+        self.jsonl = jsonl
+        self.url = _env_clean("POLYMARKET_USER_WS_URL") or USER_WS_URL
+        self.api_key = _env_clean("CLOB_API_KEY") or _env_clean("POLYMARKET_API_KEY") or _env_clean("POLY_API_KEY")
+        self.secret = (
+            _env_clean("CLOB_SECRET")
+            or _env_clean("CLOB_API_SECRET")
+            or _env_clean("POLYMARKET_API_SECRET")
+            or _env_clean("POLY_SECRET")
+        )
+        self.passphrase = (
+            _env_clean("CLOB_PASS_PHRASE")
+            or _env_clean("CLOB_API_PASS_PHRASE")
+            or _env_clean("CLOB_API_PASSPHRASE")
+            or _env_clean("CLOB_PASSPHRASE")
+            or _env_clean("POLYMARKET_PASSPHRASE")
+            or _env_clean("POLYMARKET_PASS_PHRASE")
+            or _env_clean("POLY_PASSPHRASE")
+        )
+        self.order_fills: dict[str, float] = {}
+        self.order_prices: dict[str, float] = {}
+        self.trade_sizes: dict[tuple[str, str], float] = {}
+        self.connected = False
+        self._cond = asyncio.Condition()
+
+    @property
+    def ready(self) -> bool:
+        return bool(self.api_key and self.secret and self.passphrase and self.markets)
+
+    async def run(self, stop_at: float) -> None:
+        if not self.ready:
+            _log(self.jsonl, {"kind": "user_ws_disabled", "reason": "missing_creds_or_markets"})
+            return
+        while time.time() < stop_at:
+            try:
+                async with websockets.connect(self.url, ping_interval=30) as ws:
+                    await ws.send(json.dumps({
+                        "auth": {
+                            "apiKey": self.api_key,
+                            "secret": self.secret,
+                            "passphrase": self.passphrase,
+                        },
+                        "markets": self.markets,
+                        "type": "user",
+                    }))
+                    self.connected = True
+                    _log(self.jsonl, {"kind": "user_ws_connected", "markets": self.markets})
+                    while time.time() < stop_at:
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=10)
+                        except asyncio.TimeoutError:
+                            continue
+                        payload = json.loads(raw)
+                        items = payload if isinstance(payload, list) else [payload]
+                        for item in items:
+                            if isinstance(item, dict):
+                                await self._record(item)
+            except Exception as exc:
+                self.connected = False
+                _log(self.jsonl, {"kind": "user_ws_error", "error": str(exc)})
+                await asyncio.sleep(1.0)
+
+    async def _record(self, item: dict[str, Any]) -> None:
+        event_type = str(item.get("event_type") or item.get("type") or "").lower()
+        updates: list[tuple[str, float, Optional[float]]] = []
+        if event_type in ("order", "placement", "update", "cancellation"):
+            order_id = str(item.get("id") or "")
+            qty = _float_or_none(item.get("size_matched"))
+            px = _float_or_none(item.get("price"))
+            if order_id and qty is not None:
+                updates.append((order_id, qty, px))
+        elif event_type == "trade":
+            status = str(item.get("status") or "").upper()
+            trade_id = str(item.get("id") or item.get("trade_id") or "")
+            active_trade = status in ("MATCHED", "MINED", "CONFIRMED", "RETRYING")
+            if active_trade:
+                taker_order_id = str(item.get("taker_order_id") or "")
+                qty = _float_or_none(item.get("size"))
+                px = _float_or_none(item.get("price"))
+                if taker_order_id and qty is not None:
+                    key = (taker_order_id, trade_id or f"trade_{len(self.trade_sizes)}")
+                    self.trade_sizes[key] = max(qty, self.trade_sizes.get(key, 0.0))
+                    updates.append((taker_order_id, sum(v for (oid, _), v in self.trade_sizes.items() if oid == taker_order_id), px))
+                for maker_order in item.get("maker_orders") or []:
+                    order_id = str(maker_order.get("order_id") or "")
+                    qty = _float_or_none(maker_order.get("matched_amount"))
+                    px = _float_or_none(maker_order.get("price"))
+                    if order_id and qty is not None:
+                        key = (order_id, trade_id or f"maker_{len(self.trade_sizes)}")
+                        self.trade_sizes[key] = max(qty, self.trade_sizes.get(key, 0.0))
+                        updates.append((order_id, sum(v for (oid, _), v in self.trade_sizes.items() if oid == order_id), px))
+            elif status == "FAILED":
+                _log(self.jsonl, {"kind": "user_ws_trade_failed", **item})
+        if not updates:
+            return
+        async with self._cond:
+            changed = False
+            for order_id, qty, px in updates:
+                if qty > self.order_fills.get(order_id, 0.0):
+                    self.order_fills[order_id] = qty
+                    changed = True
+                if px is not None and px > 0:
+                    self.order_prices[order_id] = px
+            if changed:
+                self._cond.notify_all()
+        _log(self.jsonl, {"kind": "user_ws_order_update", "updates": updates})
+
+    def matched_qty(self, order_id: str) -> float:
+        return self.order_fills.get(order_id, 0.0)
+
+    def matched_price(self, order_id: str) -> Optional[float]:
+        return self.order_prices.get(order_id)
+
+    async def wait_for_order(self, order_id: str, *, timeout_s: float, min_qty: float) -> tuple[float, Optional[float]]:
+        if not order_id or timeout_s <= 0:
+            return self.matched_qty(order_id), self.matched_price(order_id)
+        deadline = time.time() + timeout_s
+        async with self._cond:
+            while time.time() < deadline:
+                qty = self.matched_qty(order_id)
+                if qty >= min_qty:
+                    return qty, self.matched_price(order_id)
+                remaining = max(0.0, deadline - time.time())
+                try:
+                    await asyncio.wait_for(self._cond.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    break
+        return self.matched_qty(order_id), self.matched_price(order_id)
 
 
 async def spot_pump(legs: list[MarketLeg], stop_at: float, stats: RollingStats) -> None:
@@ -392,6 +536,8 @@ class GateConfig:
     exec_flatten_slippage_ticks: int = 8
     exec_flatten_max_attempts: int = 3
     exec_kill_retry_cooldown_s: float = 1.0
+    exec_user_ws_enabled: bool = True
+    exec_user_ws_confirm_timeout_s: float = 8.0
 
 
 def shadow_fill(book: SimpleBook, side: str, target_qty: float) -> Tuple[float, float]:
@@ -430,6 +576,78 @@ def make_shadow_result(label: str, token_id: str, target_qty: float, filled: flo
     )
 
 
+def _replace_exec_fill(
+    result: ExecutionLegResult,
+    *,
+    filled_qty: float,
+    price: Optional[float],
+    source: str,
+    force: bool = False,
+) -> ExecutionLegResult:
+    if not force and filled_qty <= result.filled_qty:
+        return result
+    px = price if price is not None and price > 0 else result.avg_price
+    notional = filled_qty * px if px > 0 else result.notional
+    avg_price = notional / filled_qty if filled_qty > 0 else 0.0
+    raw = {**result.raw, "confirm_source": source}
+    return ExecutionLegResult(
+        label=result.label,
+        token_id=result.token_id,
+        requested_qty=result.requested_qty,
+        filled_qty=filled_qty,
+        avg_price=avg_price,
+        notional=notional,
+        order_id=result.order_id,
+        status=result.status,
+        ok=result.ok or filled_qty > 0,
+        estimated=result.estimated or source == "user_ws",
+        error=result.error,
+        raw=raw,
+    )
+
+
+async def confirm_live_result(
+    result: ExecutionLegResult,
+    *,
+    live_executor: Optional[PolymarketLiveExecutor],
+    order_feed: Optional[UserOrderFeed],
+    gates: GateConfig,
+) -> ExecutionLegResult:
+    if live_executor is None or not result.order_id:
+        return result
+    out = result
+    if order_feed is not None and order_feed.ready and gates.exec_user_ws_confirm_timeout_s > 0:
+        min_ws_qty = (
+            result.requested_qty
+            if result.requested_qty <= gates.leg_mismatch_tolerance_shares
+            else result.requested_qty - gates.leg_mismatch_tolerance_shares
+        )
+        qty, px = await order_feed.wait_for_order(
+            result.order_id,
+            timeout_s=gates.exec_user_ws_confirm_timeout_s,
+            min_qty=max(0.0, min_ws_qty),
+        )
+        out = _replace_exec_fill(out, filled_qty=qty, price=px, source="user_ws", force=True)
+        if qty > 0:
+            return out
+    if gates.exec_user_ws_enabled:
+        return ExecutionLegResult(
+            label=result.label,
+            token_id=result.token_id,
+            requested_qty=result.requested_qty,
+            filled_qty=0.0,
+            avg_price=0.0,
+            notional=0.0,
+            order_id=result.order_id,
+            status=result.status,
+            ok=False,
+            estimated=False,
+            error="user_ws_timeout",
+            raw={**result.raw, "confirm_source": "user_ws_timeout", "post_response_ignored": True},
+        )
+    return out
+
+
 async def execute_buy_leg(
     *,
     legs_by_asset: dict[str, MarketLeg],
@@ -437,6 +655,8 @@ async def execute_buy_leg(
     qty: float,
     live_executor: Optional[PolymarketLiveExecutor],
     slippage_ticks: int,
+    gates: Optional[GateConfig] = None,
+    order_feed: Optional[UserOrderFeed] = None,
 ) -> ExecutionLegResult:
     token_id = token_id_for_label(legs_by_asset, label)
     book = get_book_for_label(legs_by_asset, label)
@@ -448,7 +668,7 @@ async def execute_buy_leg(
         return ExecutionLegResult(label, token_id, qty, 0.0, 0.0, 0.0, ok=False, error="no_best_ask")
     leg = get_leg_for_label(legs_by_asset, label)
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
+    result = await loop.run_in_executor(
         None,
         lambda: live_executor.buy_limit_fak(
             label=label,
@@ -459,6 +679,14 @@ async def execute_buy_leg(
             neg_risk=leg.neg_risk,
             slippage_ticks=slippage_ticks,
         ),
+    )
+    if gates is None:
+        return result
+    return await confirm_live_result(
+        result,
+        live_executor=live_executor,
+        order_feed=order_feed,
+        gates=gates,
     )
 
 
@@ -488,6 +716,10 @@ def entry_execution_status(
     return True, "ok", min_required, imbalance
 
 
+def execution_unknown(*results: ExecutionLegResult) -> bool:
+    return any("user_ws_timeout" in (res.error or "") for res in results)
+
+
 async def execute_buy_pair_once(
     *,
     legs_by_asset: dict[str, MarketLeg],
@@ -497,6 +729,8 @@ async def execute_buy_pair_once(
     qty_b: float,
     live_executor: Optional[PolymarketLiveExecutor],
     slippage_ticks: int,
+    gates: GateConfig,
+    order_feed: Optional[UserOrderFeed],
     allow_partial_submit: bool = False,
 ) -> tuple[ExecutionLegResult, ExecutionLegResult]:
     if live_executor is None:
@@ -507,6 +741,8 @@ async def execute_buy_pair_once(
                 qty=qty_a,
                 live_executor=None,
                 slippage_ticks=slippage_ticks,
+                gates=gates,
+                order_feed=order_feed,
             ),
             execute_buy_leg(
                 legs_by_asset=legs_by_asset,
@@ -514,6 +750,8 @@ async def execute_buy_pair_once(
                 qty=qty_b,
                 live_executor=None,
                 slippage_ticks=slippage_ticks,
+                gates=gates,
+                order_feed=order_feed,
             ),
         )
 
@@ -539,13 +777,17 @@ async def execute_buy_pair_once(
     spec_b, err_b = live_spec(leg_b, qty_b)
     if spec_a is not None and spec_b is not None:
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
+        res_a, res_b = await loop.run_in_executor(
             None,
             lambda: live_executor.buy_pair_limit_fak(
                 leg_a=spec_a,
                 leg_b=spec_b,
                 slippage_ticks=slippage_ticks,
             ),
+        )
+        return await asyncio.gather(
+            confirm_live_result(res_a, live_executor=live_executor, order_feed=order_feed, gates=gates),
+            confirm_live_result(res_b, live_executor=live_executor, order_feed=order_feed, gates=gates),
         )
     if not allow_partial_submit:
         return (
@@ -562,6 +804,8 @@ async def execute_buy_pair_once(
             qty=qty,
             live_executor=live_executor,
             slippage_ticks=slippage_ticks,
+            gates=gates,
+            order_feed=order_feed,
         )
 
     return await asyncio.gather(
@@ -578,6 +822,7 @@ async def execute_buy_pair(
     qty: float,
     gates: GateConfig,
     live_executor: Optional[PolymarketLiveExecutor],
+    order_feed: Optional[UserOrderFeed],
 ) -> tuple[ExecutionLegResult, ExecutionLegResult, list[dict]]:
     events: list[dict] = []
     res_a, res_b = await execute_buy_pair_once(
@@ -588,12 +833,23 @@ async def execute_buy_pair(
         qty_b=qty,
         live_executor=live_executor,
         slippage_ticks=gates.exec_slippage_ticks,
+        gates=gates,
+        order_feed=order_feed,
         allow_partial_submit=False,
     )
     events.append({"phase": "initial", "leg": leg_a, **res_a.__dict__})
     events.append({"phase": "initial", "leg": leg_b, **res_b.__dict__})
 
     for attempt in range(1, gates.exec_max_chase_attempts + 1):
+        if execution_unknown(res_a, res_b):
+            events.append({
+                "phase": f"chase_{attempt}_skip",
+                "leg": "pair",
+                "reason": "user_ws_timeout",
+                "qty_a": res_a.filled_qty,
+                "qty_b": res_b.filled_qty,
+            })
+            break
         ok, _reason, min_required, _imbalance = entry_execution_status(res_a, res_b, qty, gates)
         if ok:
             break
@@ -621,6 +877,8 @@ async def execute_buy_pair(
                 qty_b=need_b,
                 live_executor=live_executor,
                 slippage_ticks=chase_slip,
+                gates=gates,
+                order_feed=order_feed,
                 allow_partial_submit=False,
             )
             res_a = merge_execution_results(res_a, extra_a)
@@ -637,6 +895,8 @@ async def execute_buy_pair(
                 qty=need_b,
                 live_executor=live_executor,
                 slippage_ticks=chase_slip,
+                gates=gates,
+                order_feed=order_feed,
             )
             res_b = merge_execution_results(res_b, extra)
             events.append({"phase": f"chase_{attempt}", "leg": chase_label, **extra.__dict__})
@@ -650,6 +910,8 @@ async def execute_buy_pair(
                 qty=need_a,
                 live_executor=live_executor,
                 slippage_ticks=chase_slip,
+                gates=gates,
+                order_feed=order_feed,
             )
             res_a = merge_execution_results(res_a, extra)
             events.append({"phase": f"chase_{attempt}", "leg": chase_label, **extra.__dict__})
@@ -681,6 +943,7 @@ async def flatten_entry_exposure(
     res_b: ExecutionLegResult,
     gates: GateConfig,
     live_executor: Optional[PolymarketLiveExecutor],
+    order_feed: Optional[UserOrderFeed],
 ) -> tuple[ExecutionLegResult, ExecutionLegResult, bool, list[dict]]:
     events: list[dict] = []
     opp_a = opposite_label(leg_a)
@@ -704,6 +967,8 @@ async def flatten_entry_exposure(
                 qty_b=need_b,
                 live_executor=live_executor,
                 slippage_ticks=slip,
+                gates=gates,
+                order_feed=order_feed,
                 allow_partial_submit=True,
             )
             flat_a = merge_execution_results(flat_a, extra_a)
@@ -719,6 +984,8 @@ async def flatten_entry_exposure(
                 qty=need_a,
                 live_executor=live_executor,
                 slippage_ticks=slip,
+                gates=gates,
+                order_feed=order_feed,
             )
             flat_a = merge_execution_results(flat_a, extra_a)
             events.append({"phase": f"entry_flatten_{attempt}", "source_leg": leg_a, "leg": opp_a, **extra_a.__dict__})
@@ -731,6 +998,8 @@ async def flatten_entry_exposure(
                 qty=need_b,
                 live_executor=live_executor,
                 slippage_ticks=slip,
+                gates=gates,
+                order_feed=order_feed,
             )
             flat_b = merge_execution_results(flat_b, extra_b)
             events.append({"phase": f"entry_flatten_{attempt}", "source_leg": leg_b, "leg": opp_b, **extra_b.__dict__})
@@ -962,6 +1231,7 @@ async def strategy_loop(
     round_idx: int,
     notify=None,
     live_executor: Optional[PolymarketLiveExecutor] = None,
+    order_feed: Optional[UserOrderFeed] = None,
 ) -> dict:
     combos: list[LabCombo] = []
     last_log = 0.0
@@ -1012,13 +1282,23 @@ async def strategy_loop(
 
         main_combos = [c for c in combos if not c.is_hedge]
         cooldown_ok = (now - last_fill_at) >= gates.combo_cooldown_s
+        user_ws_ready = (
+            live_executor is None
+            or not gates.exec_user_ws_enabled
+            or (order_feed is not None and order_feed.ready and order_feed.connected)
+        )
         # Entry-only risk budget. Defensive imbalance hedges and Q4 kills below
         # must bypass this gate so stops cannot be blocked by sizing caps.
         capacity_ok = (
             not entry_blocked
+            and user_ws_ready
             and len(main_combos) < gates.max_combos_per_round
             and total_cost < gates.max_cost_per_round_usd
         )
+        if live_executor is not None and gates.exec_user_ws_enabled and not user_ws_ready and samples_since_eval == 0:
+            _log(jsonl, {"kind": "entry_eval", "ts": now, "tte": tte,
+                         "reason": "user_ws_not_ready",
+                         "connected": bool(order_feed and order_feed.connected)})
         if cooldown_ok and capacity_ok:
             sig, diag = try_entry(legs_by_asset, stats, gates, hist, tte)
             if samples_since_eval == 0:
@@ -1045,6 +1325,7 @@ async def strategy_loop(
                         qty=qty_target,
                         gates=gates,
                         live_executor=live_executor,
+                        order_feed=order_feed,
                     )
                     for ev in exec_events:
                         _log(jsonl, {"kind": "order_fill", "ts": now, "tte": tte, "combo_id": next_combo_id, **ev})
@@ -1055,6 +1336,9 @@ async def strategy_loop(
                     entry_ok, entry_fail_reason, min_required, imbalance = entry_execution_status(
                         res_a, res_b, qty_target, gates,
                     )
+                    if execution_unknown(res_a, res_b):
+                        entry_ok = False
+                        entry_fail_reason = "user_ws_timeout"
                     if not entry_ok:
                         abort_combo_id = next_combo_id
                         flat_a, flat_b, flat_ok, flat_events = await flatten_entry_exposure(
@@ -1065,6 +1349,7 @@ async def strategy_loop(
                             res_b=res_b,
                             gates=gates,
                             live_executor=live_executor,
+                            order_feed=order_feed,
                         )
                         for ev in flat_events:
                             _log(jsonl, {"kind": "entry_abort_flatten_order", "ts": now, "tte": tte,
@@ -1338,6 +1623,8 @@ async def strategy_loop(
                         qty_b=remaining_flip_b,
                         live_executor=live_executor,
                         slippage_ticks=gates.exec_chase_slippage_ticks,
+                        gates=gates,
+                        order_feed=order_feed,
                         allow_partial_submit=True,
                     )
                 elif remaining_flip_a > 0:
@@ -1347,6 +1634,8 @@ async def strategy_loop(
                         qty=remaining_flip_a,
                         live_executor=live_executor,
                         slippage_ticks=gates.exec_chase_slippage_ticks,
+                        gates=gates,
+                        order_feed=order_feed,
                     )
                     res_flip_b = _empty_exec_result(opp_b_label, token_id_for_label(legs_by_asset, opp_b_label))
                 else:
@@ -1357,6 +1646,8 @@ async def strategy_loop(
                         qty=remaining_flip_b,
                         live_executor=live_executor,
                         slippage_ticks=gates.exec_chase_slippage_ticks,
+                        gates=gates,
+                        order_feed=order_feed,
                     )
                 _log(jsonl, {"kind": "kill_order_fill", "ts": now, "tte": tte, "combo_id": combo.combo_id,
                              "phase": "kill", "leg": opp_a_label, **res_flip_a.__dict__})
@@ -1602,12 +1893,20 @@ async def run_round(round_idx: int, gates: GateConfig, stats: RollingStats,
         "gates": gates.__dict__,
         "execution": "live" if live_executor else "shadow",
     })
-    results = await asyncio.gather(
+    order_feed = (
+        UserOrderFeed(markets=[btc_leg.condition_id, eth_leg.condition_id], jsonl=jsonl)
+        if live_executor is not None and gates.exec_user_ws_enabled
+        else None
+    )
+    tasks = [
         ws_consumer(legs, stop_at),
         spot_pump(legs, stop_at, stats),
         strategy_loop(legs_by_asset, stats, gates, hist, stop_at, end_ts, jsonl, round_idx,
-                      notify=notify, live_executor=live_executor),
-    )
+                      notify=notify, live_executor=live_executor, order_feed=order_feed),
+    ]
+    if order_feed is not None:
+        tasks.append(order_feed.run(stop_at))
+    results = await asyncio.gather(*tasks)
     pending = results[2]
     return pending
 
@@ -1763,7 +2062,8 @@ async def main_async(rounds: int, start_mode: str, gates: GateConfig) -> None:
         )
         print(f"[BOOT] LIVE CLOB enabled host={cfg.host} chain={cfg.chain_id} "
               f"sig={cfg.signature_type} funder={cfg.funder[:6]}... "
-              f"order_type={cfg.order_type} builder={'yes' if cfg.builder_code else 'no'}")
+              f"order_type={cfg.order_type} builder={'yes' if cfg.builder_code else 'no'} "
+              f"user_ws={'on' if gates.exec_user_ws_enabled else 'off'}")
     if notifier is not None:
         try:
             notifier.send(f"cor_pol boot\nDRY_RUN={dry_run} rounds={rounds} mode={start_mode}\n"
@@ -1856,6 +2156,13 @@ def _envi(name: str, default: int) -> int:
         return default
 
 
+def _envb(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="cor_pol: BTC/ETH correlation arb bot (shadow / dry-run)")
     parser.add_argument("--rounds", type=int, default=_envi("CORR_ROUNDS", 1000000))
@@ -1892,6 +2199,8 @@ def main() -> None:
         exec_flatten_slippage_ticks=_envi("CORR_EXEC_FLATTEN_SLIPPAGE_TICKS", 8),
         exec_flatten_max_attempts=_envi("CORR_EXEC_FLATTEN_MAX_ATTEMPTS", 3),
         exec_kill_retry_cooldown_s=_envf("CORR_EXEC_KILL_RETRY_COOLDOWN_S", 1.0),
+        exec_user_ws_enabled=_envb("CORR_USER_WS_ENABLED", True),
+        exec_user_ws_confirm_timeout_s=_envf("CORR_USER_WS_CONFIRM_TIMEOUT_S", 8.0),
     )
     asyncio.run(main_async(args.rounds, args.start_mode, gates))
 
