@@ -605,7 +605,7 @@ class GateConfig:
     max_gap: float = 0.22
     min_book_size: float = 5.0
     tte_min_s: int = 60
-    tte_max_s: int = 270
+    tte_max_s: int = 210
     combo_qty: float = 5.0
     max_combos_per_round: int = 3
     max_cost_per_round_usd: float = 15.0
@@ -2503,7 +2503,7 @@ def main() -> None:
         max_gap=_envf("CORR_MAX_GAP", 0.22),
         min_book_size=_envf("CORR_MIN_BOOK_SIZE", 5.0),
         tte_min_s=_envi("CORR_TTE_MIN_S", 60),
-        tte_max_s=_envi("CORR_TTE_MAX_S", 270),
+        tte_max_s=_envi("CORR_TTE_MAX_S", 210),
         combo_qty=_envf("CORR_COMBO_QTY", 5.0),
         max_combos_per_round=_envi("CORR_MAX_COMBOS_PER_ROUND", 3),
         max_cost_per_round_usd=_envf("CORR_MAX_COST_PER_ROUND_USD", 15.0),
