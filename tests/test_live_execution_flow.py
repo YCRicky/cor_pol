@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 
 from src.execution import ExecutionLegResult, PolymarketLiveExecutor
@@ -9,8 +10,12 @@ from src.lab.correlation_arb_bot import (
     UserOrderFeed,
     confirm_live_result,
     execute_buy_pair,
+    is_us_stock_hours_utc8,
+    is_weekend_rest_utc8,
     live_order_block_reason,
     post_ack_immediate_no_fill,
+    us_stock_hours_price_gate_ok,
+    weekend_rest_resume_ts_utc8,
 )
 
 
@@ -100,6 +105,13 @@ def _leg(asset: str) -> MarketLeg:
     leg.yes_book.asks[0.50] = 100.0
     leg.no_book.asks[0.50] = 100.0
     return leg
+
+
+UTC8 = timezone(timedelta(hours=8))
+
+
+def _ts_utc8(year: int, month: int, day: int, hour: int, minute: int = 0) -> float:
+    return datetime(year, month, day, hour, minute, tzinfo=UTC8).timestamp()
 
 
 class LiveExecutionFlowTests(unittest.TestCase):
@@ -288,6 +300,29 @@ class LiveExecutionFlowTests(unittest.TestCase):
         qty, price = asyncio.run(run_case())
         self.assertEqual(qty, 5.0)
         self.assertAlmostEqual(price, 0.52)
+
+    def test_weekend_rest_window_uses_utc8_boundaries(self):
+        self.assertFalse(is_weekend_rest_utc8(_ts_utc8(2026, 6, 6, 4, 59)))
+        self.assertTrue(is_weekend_rest_utc8(_ts_utc8(2026, 6, 6, 5, 0)))
+        self.assertTrue(is_weekend_rest_utc8(_ts_utc8(2026, 6, 7, 12, 0)))
+        self.assertTrue(is_weekend_rest_utc8(_ts_utc8(2026, 6, 8, 4, 59)))
+        self.assertFalse(is_weekend_rest_utc8(_ts_utc8(2026, 6, 8, 5, 0)))
+        resume = datetime.fromtimestamp(weekend_rest_resume_ts_utc8(_ts_utc8(2026, 6, 6, 5, 1)), UTC8)
+        self.assertEqual(resume.weekday(), 0)
+        self.assertEqual(resume.time(), time(5, 0))
+
+    def test_us_stock_hours_window_uses_utc8(self):
+        self.assertFalse(is_us_stock_hours_utc8(_ts_utc8(2026, 6, 1, 21, 29)))
+        self.assertTrue(is_us_stock_hours_utc8(_ts_utc8(2026, 6, 1, 21, 30)))
+        self.assertTrue(is_us_stock_hours_utc8(_ts_utc8(2026, 6, 2, 3, 59)))
+        self.assertFalse(is_us_stock_hours_utc8(_ts_utc8(2026, 6, 2, 4, 0)))
+        self.assertTrue(is_us_stock_hours_utc8(_ts_utc8(2026, 6, 6, 3, 59)))
+        self.assertFalse(is_us_stock_hours_utc8(_ts_utc8(2026, 6, 6, 4, 0)))
+
+    def test_us_stock_hours_price_gate_is_strictly_above_threshold(self):
+        gates = GateConfig(us_stock_hours_min_leg_price=0.70)
+        self.assertFalse(us_stock_hours_price_gate_ok(0.70, 0.40, gates))
+        self.assertTrue(us_stock_hours_price_gate_ok(0.71, 0.20, gates))
 
 
 if __name__ == "__main__":

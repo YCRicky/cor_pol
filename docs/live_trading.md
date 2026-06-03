@@ -51,6 +51,10 @@ DRY_RUN=false
 CORR_COMBO_QTY=5
 CORR_MAX_COMBOS_PER_ROUND=3
 CORR_MAX_COST_PER_ROUND_USD=15
+CORR_TTE_MAX_S=210
+CORR_WEEKEND_REST_ENABLED=true
+CORR_US_STOCK_HOURS_FILTER_ENABLED=true
+CORR_US_STOCK_HOURS_MIN_LEG_PRICE=0.70
 CORR_EXEC_ORDER_TYPE=GTC
 CORR_EXEC_SLIPPAGE_TICKS=2
 CORR_EXEC_CHASE_SLIPPAGE_TICKS=1
@@ -78,6 +82,16 @@ Entry execution:
    aborted and the filled exposure is flattened by buying the opposite side.
 7. `CORR_MAX_COMBOS_PER_ROUND` and `CORR_MAX_COST_PER_ROUND_USD` apply only to
    new entries. Entry-imbalance hedges and Q4 kill orders bypass those caps.
+
+Time gates:
+
+1. All time rules use UTC+8.
+2. Weekend rest runs from UTC+8 Saturday 05:00 through Monday 05:00. During
+   this window the bot does not start new trading rounds and suppresses
+   Telegram notifications.
+3. During US stock regular hours in UTC+8, Monday-Friday 21:30 through the
+   next day 04:00, a candidate combo is accepted only when at least one leg is
+   priced strictly above `CORR_US_STOCK_HOURS_MIN_LEG_PRICE`.
 
 Fourth-quadrant kill execution:
 

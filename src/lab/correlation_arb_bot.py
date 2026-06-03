@@ -9,6 +9,7 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime as dt_datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Deque, Optional, Tuple
 
@@ -51,6 +52,50 @@ TERMINAL_ORDER_EVENT_TYPES = {"CANCELED", "CANCELLED", "CANCELLATION"}
 POST_ACK_NO_FILL_STATUSES = {"canceled", "cancelled", "expired", "failed", "unmatched"}
 OUT = ROOT / "out"
 OUT.mkdir(parents=True, exist_ok=True)
+UTC8 = timezone(timedelta(hours=8))
+
+
+def utc8_now(ts: Optional[float] = None) -> dt_datetime:
+    return dt_datetime.fromtimestamp(time.time() if ts is None else ts, UTC8)
+
+
+def is_weekend_rest_utc8(ts: Optional[float] = None) -> bool:
+    local = utc8_now(ts)
+    weekday = local.weekday()
+    tod = local.time()
+    if weekday == 5 and tod >= dt_time(5, 0):
+        return True
+    if weekday == 6:
+        return True
+    return weekday == 0 and tod < dt_time(5, 0)
+
+
+def weekend_rest_resume_ts_utc8(ts: Optional[float] = None) -> float:
+    local = utc8_now(ts)
+    weekday = local.weekday()
+    if weekday == 5:
+        days = 2
+    elif weekday == 6:
+        days = 1
+    elif weekday == 0 and local.time() < dt_time(5, 0):
+        days = 0
+    else:
+        return local.timestamp()
+    resume_date = (local + timedelta(days=days)).date()
+    return dt_datetime.combine(resume_date, dt_time(5, 0), tzinfo=UTC8).timestamp()
+
+
+def is_us_stock_hours_utc8(ts: Optional[float] = None) -> bool:
+    local = utc8_now(ts)
+    weekday = local.weekday()
+    tod = local.time()
+    evening_open = weekday <= 4 and tod >= dt_time(21, 30)
+    after_midnight = 1 <= weekday <= 5 and tod < dt_time(4, 0)
+    return evening_open or after_midnight
+
+
+def us_stock_hours_price_gate_ok(price_a: float, price_b: float, gates: "GateConfig") -> bool:
+    return max(price_a, price_b) > gates.us_stock_hours_min_leg_price
 
 
 class SimpleBook:
@@ -615,6 +660,9 @@ class GateConfig:
     pm_resolution_wait_s: float = 1200.0
     pm_resolution_poll_s: float = 15.0
     min_vol_bp_60s: float = 0.0
+    weekend_rest_enabled: bool = True
+    us_stock_hours_filter_enabled: bool = True
+    us_stock_hours_min_leg_price: float = 0.70
     # Four-quadrant EV/tail diagnostic. The entry is still a cheap diagonal, but
     # it must also have model edge and a bounded lose/lose quadrant.
     min_model_edge: float = 0.01
@@ -1374,10 +1422,16 @@ def try_entry(
     gates: GateConfig,
     hist: GapHistogram,
     tte_s: int,
+    now_ts: Optional[float] = None,
 ) -> Tuple[Optional[ArbSignal], dict]:
     btc = legs_by_asset["BTC"]
     eth = legs_by_asset["ETH"]
     diag = {"reason": "ok"}
+    now_ts = time.time() if now_ts is None else now_ts
+    diag["utc8"] = utc8_now(now_ts).isoformat()
+    if gates.weekend_rest_enabled and is_weekend_rest_utc8(now_ts):
+        diag["reason"] = "weekend_rest_utc8"
+        return None, diag
     rho = stats.correlation()
     if rho is None:
         diag["reason"] = "rho_warming"
@@ -1437,6 +1491,18 @@ def try_entry(
     if sig.size_a < gates.min_book_size or sig.size_b < gates.min_book_size:
         diag["reason"] = f"thin_book:{sig.size_a:.1f}/{sig.size_b:.1f}"
         return None, diag
+    us_stock_hours = gates.us_stock_hours_filter_enabled and is_us_stock_hours_utc8(now_ts)
+    diag["us_stock_hours_utc8"] = us_stock_hours
+    if us_stock_hours:
+        max_leg_price = max(sig.price_a, sig.price_b)
+        diag["us_stock_hours_max_leg_price"] = max_leg_price
+        diag["us_stock_hours_min_leg_price"] = gates.us_stock_hours_min_leg_price
+        if not us_stock_hours_price_gate_ok(sig.price_a, sig.price_b, gates):
+            diag["reason"] = (
+                f"us_stock_hours_leg_price_low:{max_leg_price:.3f}"
+                f"<={gates.us_stock_hours_min_leg_price:.3f}"
+            )
+            return None, diag
     fair_a = fair_up_btc if sig.leg_a == "BTC_YES" else (1.0 - fair_up_btc) if sig.leg_a == "BTC_NO" else fair_up_eth if sig.leg_a == "ETH_YES" else (1.0 - fair_up_eth)
     fair_b = fair_up_btc if sig.leg_b == "BTC_YES" else (1.0 - fair_up_btc) if sig.leg_b == "BTC_NO" else fair_up_eth if sig.leg_b == "ETH_YES" else (1.0 - fair_up_eth)
     cost = sig.price_a + sig.price_b
@@ -1586,7 +1652,7 @@ async def strategy_loop(
                          "reason": ws_reason or "user_ws_observer_not_ready",
                          "connected": bool(order_feed and order_feed.connected)})
         if cooldown_ok and capacity_ok:
-            sig, diag = try_entry(legs_by_asset, stats, gates, hist, tte)
+            sig, diag = try_entry(legs_by_asset, stats, gates, hist, tte, now_ts=now)
             if samples_since_eval == 0:
                 _log(jsonl, {"kind": "entry_eval", "ts": now, "tte": tte,
                              "combos_open": len(combos), "total_cost": round(total_cost, 4), **diag})
@@ -2294,7 +2360,11 @@ def _format_event(kind: str, data: dict) -> str:
     return f"{kind}: {data}"
 
 
-def _make_notify(notifier):
+def notifications_paused(gates: GateConfig, ts: Optional[float] = None) -> bool:
+    return gates.weekend_rest_enabled and is_weekend_rest_utc8(ts)
+
+
+def _make_notify(notifier, gates: Optional[GateConfig] = None):
     def _notify(kind: str, data: dict) -> None:
         try:
             text = _format_event(kind, data)
@@ -2302,6 +2372,9 @@ def _make_notify(notifier):
             text = f"{kind} (fmt_err={exc}): {data}"
         print(f"[NOTIFY] {text.splitlines()[0]}")
         if notifier is None:
+            return
+        if gates is not None and notifications_paused(gates):
+            print("[NOTIFY] suppressed during UTC+8 weekend rest")
             return
         try:
             notifier.send(text)
@@ -2375,7 +2448,7 @@ async def main_async(rounds: int, start_mode: str, gates: GateConfig) -> None:
     stats = RollingStats(window=120)
     hist = GapHistogram(window=600)
     notifier = _build_notifier()
-    notify = _make_notify(notifier)
+    notify = _make_notify(notifier, gates)
     dry_run = os.getenv("DRY_RUN", "true").strip().lower() not in ("0", "false", "no")
     live_executor: Optional[PolymarketLiveExecutor] = None
     execution_note = "shadow"
@@ -2392,19 +2465,23 @@ async def main_async(rounds: int, start_mode: str, gates: GateConfig) -> None:
               f"sig={cfg.signature_type} funder={cfg.funder[:6]}... "
               f"order_type={cfg.order_type} builder={'yes' if cfg.builder_code else 'no'} "
               f"user_ws={'on' if gates.exec_user_ws_enabled else 'off'}")
-    if notifier is not None:
+    if notifier is not None and not notifications_paused(gates):
         try:
             notifier.send(f"cor_pol boot\nDRY_RUN={dry_run} rounds={rounds} mode={start_mode}\n"
                           f"asym=[{gates.entry_asym_mid_lo:.2f},{gates.entry_asym_mid_hi:.2f}] "
                           f"min_fav_bp={gates.entry_min_fav_bp:+.1f}\n"
                           f"combo_cap={gates.max_combos_per_round} qty={gates.combo_qty:.2f} "
                           f"tol={gates.leg_mismatch_tolerance_shares:.2f}\n"
+                          f"time=UTC+8 weekend_rest={'on' if gates.weekend_rest_enabled else 'off'} "
+                          f"us_hours_min_leg={gates.us_stock_hours_min_leg_price:.2f}\n"
                           f"EV>={gates.min_model_edge:+.3f} bad<={gates.max_bad_quad_prob:.2f}\n"
                           f"Q4 asym dead={gates.q4_dead_loss_gap_mult:.1f}x gap "
                           f"fav_worse={gates.q4_fav_worsen_bp:.1f}bp\n"
                           f"execution={execution_note}")
         except Exception as exc:
             print(f"[BOOT] tg boot ping failed: {exc}")
+    elif notifier is not None:
+        print("[BOOT] TG boot ping suppressed during UTC+8 weekend rest")
     if start_mode == "next" and rounds > 0:
         wait = 300 - (int(time.time()) % 300)
         print(f"[LAB] waiting {wait + 1}s for next 5m boundary")
@@ -2436,7 +2513,19 @@ async def main_async(rounds: int, start_mode: str, gates: GateConfig) -> None:
                     summaries.append(item)
             resolve_tasks -= done
 
+    async def wait_for_active_time() -> None:
+        while gates.weekend_rest_enabled and is_weekend_rest_utc8():
+            now_ts = time.time()
+            resume_ts = weekend_rest_resume_ts_utc8(now_ts)
+            wait_s = max(1.0, resume_ts - now_ts)
+            resume_local = utc8_now(resume_ts).strftime("%Y-%m-%d %H:%M:%S UTC+8")
+            print(f"[LAB] UTC+8 weekend rest active; sleeping until {resume_local} "
+                  f"({int(wait_s)}s remaining)")
+            await drain_resolved(done_only=True)
+            await asyncio.sleep(min(wait_s, 3600.0))
+
     for i in range(1, rounds + 1):
+        await wait_for_active_time()
         try:
             pending = await run_round(i, gates, stats, hist, notify=notify, live_executor=live_executor)
             if pending.get("status") == "SKIPPED":
@@ -2463,7 +2552,7 @@ async def main_async(rounds: int, start_mode: str, gates: GateConfig) -> None:
     n_div = sum(1 for s in summaries if s.get("divergence"))
     total_pnl = sum(s.get("pnl", 0.0) for s in summaries if s.get("status") == "OK")
     print(f"[LAB] resolution complete: {n_ok}/{len(summaries)} resolved, {n_div} divergences, total_pnl=${total_pnl:+.2f}")
-    if notifier is not None:
+    if notifier is not None and not notifications_paused(gates):
         try:
             notifier.send(f"cor_pol run done\nresolved={n_ok}/{len(summaries)} div={n_div} total_pnl=${total_pnl:+.2f}")
         except Exception:
@@ -2511,6 +2600,9 @@ def main() -> None:
         pm_resolution_wait_s=_envf("CORR_PM_RESOLUTION_WAIT_S", 1200.0),
         pm_resolution_poll_s=_envf("CORR_PM_RESOLUTION_POLL_S", 15.0),
         min_vol_bp_60s=_envf("CORR_MIN_VOL_BP_60S", 0.0),
+        weekend_rest_enabled=_envb("CORR_WEEKEND_REST_ENABLED", True),
+        us_stock_hours_filter_enabled=_envb("CORR_US_STOCK_HOURS_FILTER_ENABLED", True),
+        us_stock_hours_min_leg_price=_envf("CORR_US_STOCK_HOURS_MIN_LEG_PRICE", 0.70),
         min_model_edge=_envf("CORR_MIN_MODEL_EDGE", 0.01),
         max_bad_quad_prob=_envf("CORR_MAX_BAD_QUAD_PROB", 0.22),
         max_bad_to_normal_ratio=_envf("CORR_MAX_BAD_TO_NORMAL_RATIO", 0.38),
