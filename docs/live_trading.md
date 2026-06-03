@@ -91,7 +91,7 @@ Time gates:
    Telegram notifications.
 3. During US stock regular hours in UTC+8, Monday-Friday 21:30 through the
    next day 04:00, a candidate combo is accepted only when at least one leg is
-   priced strictly above `CORR_US_STOCK_HOURS_MIN_LEG_PRICE`.
+   priced at or above `CORR_US_STOCK_HOURS_MIN_LEG_PRICE`.
 
 Fourth-quadrant kill execution:
 

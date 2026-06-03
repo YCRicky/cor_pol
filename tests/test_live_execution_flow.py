@@ -319,9 +319,10 @@ class LiveExecutionFlowTests(unittest.TestCase):
         self.assertTrue(is_us_stock_hours_utc8(_ts_utc8(2026, 6, 6, 3, 59)))
         self.assertFalse(is_us_stock_hours_utc8(_ts_utc8(2026, 6, 6, 4, 0)))
 
-    def test_us_stock_hours_price_gate_is_strictly_above_threshold(self):
+    def test_us_stock_hours_price_gate_accepts_threshold(self):
         gates = GateConfig(us_stock_hours_min_leg_price=0.70)
-        self.assertFalse(us_stock_hours_price_gate_ok(0.70, 0.40, gates))
+        self.assertFalse(us_stock_hours_price_gate_ok(0.69, 0.40, gates))
+        self.assertTrue(us_stock_hours_price_gate_ok(0.70, 0.20, gates))
         self.assertTrue(us_stock_hours_price_gate_ok(0.71, 0.20, gates))
 
 

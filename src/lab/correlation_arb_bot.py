@@ -95,7 +95,7 @@ def is_us_stock_hours_utc8(ts: Optional[float] = None) -> bool:
 
 
 def us_stock_hours_price_gate_ok(price_a: float, price_b: float, gates: "GateConfig") -> bool:
-    return max(price_a, price_b) > gates.us_stock_hours_min_leg_price
+    return max(price_a, price_b) >= gates.us_stock_hours_min_leg_price
 
 
 class SimpleBook:
@@ -1500,7 +1500,7 @@ def try_entry(
         if not us_stock_hours_price_gate_ok(sig.price_a, sig.price_b, gates):
             diag["reason"] = (
                 f"us_stock_hours_leg_price_low:{max_leg_price:.3f}"
-                f"<={gates.us_stock_hours_min_leg_price:.3f}"
+                f"<{gates.us_stock_hours_min_leg_price:.3f}"
             )
             return None, diag
     fair_a = fair_up_btc if sig.leg_a == "BTC_YES" else (1.0 - fair_up_btc) if sig.leg_a == "BTC_NO" else fair_up_eth if sig.leg_a == "ETH_YES" else (1.0 - fair_up_eth)
