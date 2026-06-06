@@ -87,7 +87,8 @@ def _cancel_response_has_order(cancel_resp: Any, order_id: str) -> bool:
 
 
 def _matched_qty_from_raw(raw: dict[str, Any], target_qty: float) -> float:
-    qty_raw = _first(raw, (
+    qty_fields = (
+        "final_size_matched",
         "takingAmount",
         "taking_amount",
         "sizeMatched",
@@ -96,9 +97,30 @@ def _matched_qty_from_raw(raw: dict[str, Any], target_qty: float) -> float:
         "matched_amount",
         "filledSize",
         "filled_size",
-    ))
-    qty = _normalize_amount(qty_raw, target_qty)
-    return max(0.0, float(qty or 0.0))
+    )
+    quantities = [
+        qty
+        for qty in (_normalize_amount(raw.get(name), target_qty) for name in qty_fields)
+        if qty is not None
+    ]
+    return max(0.0, max(quantities, default=0.0))
+
+
+def _normalize_order_status(value: Any) -> str:
+    status = str(value or "").strip().upper()
+    if status.startswith("ORDER_STATUS_"):
+        status = status[len("ORDER_STATUS_"):]
+    return status
+
+
+def _terminal_order_status(value: Any) -> bool:
+    return _normalize_order_status(value) in {
+        "CANCELED",
+        "CANCELLED",
+        "CANCELED_MARKET_RESOLVED",
+        "INVALID",
+        "MATCHED",
+    }
 
 
 def _round_up_to_tick(price: float, tick_size: str) -> float:
@@ -181,6 +203,8 @@ class LiveExecutionConfig:
     chase_slippage_ticks: int = 1
     mismatch_tolerance: float = 1.0
     max_chase_attempts: int = 2
+    reconcile_timeout_s: float = 6.0
+    reconcile_poll_s: float = 0.25
 
     @classmethod
     def from_env(cls) -> "LiveExecutionConfig":
@@ -241,6 +265,8 @@ class LiveExecutionConfig:
             chase_slippage_ticks=int(os.getenv("CORR_EXEC_CHASE_SLIPPAGE_TICKS", "1")),
             mismatch_tolerance=float(os.getenv("CORR_LEG_MISMATCH_TOLERANCE_SHARES", "1.0")),
             max_chase_attempts=int(os.getenv("CORR_EXEC_MAX_CHASE_ATTEMPTS", "2")),
+            reconcile_timeout_s=float(os.getenv("CORR_EXEC_RECONCILE_TIMEOUT_S", "6.0")),
+            reconcile_poll_s=float(os.getenv("CORR_EXEC_RECONCILE_POLL_S", "0.25")),
         )
 
 
@@ -340,10 +366,16 @@ class PolymarketLiveExecutor:
         except TypeError:
             return self.client.cancel_order(order_id)
 
-    def _cancel_remainder(self, raw: dict[str, Any], target_qty: float) -> None:
+    def _cancel_order_remainder(self, raw: dict[str, Any]) -> None:
         order_id = str(_first(raw, ("orderID", "order_id", "id")) or "")
         if not order_id:
+            if raw.get("success") is True:
+                raw["submission_state"] = "unknown"
+                raw.setdefault("errorMsg", "missing_order_id_after_submit")
             return
+        if raw.get("remainder_cancel_attempted"):
+            return
+        raw["remainder_cancel_attempted"] = True
         cancel_ok = False
         for attempt in range(1, 4):
             try:
@@ -359,32 +391,57 @@ class PolymarketLiveExecutor:
             if attempt < 3:
                 time.sleep(0.15)
         raw["remainder_cancel_confirmed"] = cancel_ok
-        try:
-            lookup = _obj_to_dict(self.client.get_order(order_id))
-            raw["order_lookup"] = lookup
-            for key in (
-                "status",
-                "state",
-                "sizeMatched",
-                "size_matched",
-                "matchedAmount",
-                "matched_amount",
-                "filledSize",
-                "filled_size",
-                "price",
-            ):
-                if key in lookup and raw.get(key) in (None, ""):
-                    raw[key] = lookup[key]
-        except Exception as exc:
-            raw["order_lookup_error"] = str(exc)
-        status = str(_first(raw, ("status", "state")) or "").strip().lower()
+
+    def _reconcile_order(self, raw: dict[str, Any], target_qty: float) -> None:
+        order_id = str(_first(raw, ("orderID", "order_id", "id")) or "")
+        if not order_id:
+            return
+        cancel_ok = raw.get("remainder_cancel_confirmed") is True
+        deadline = time.monotonic() + max(0.0, self.config.reconcile_timeout_s)
+        lookup: dict[str, Any] = {}
+        while True:
+            try:
+                lookup = _obj_to_dict(self.client.get_order(order_id))
+                raw["order_lookup"] = lookup
+                lookup_status = _first(lookup, ("status", "state"))
+                lookup_qty = _first(lookup, (
+                    "sizeMatched",
+                    "size_matched",
+                    "matchedAmount",
+                    "matched_amount",
+                    "filledSize",
+                    "filled_size",
+                ))
+                if lookup_status not in (None, ""):
+                    raw["final_order_status"] = lookup_status
+                if lookup_qty not in (None, ""):
+                    prior_qty = _normalize_amount(raw.get("final_size_matched"), target_qty) or 0.0
+                    current_qty = _normalize_amount(lookup_qty, target_qty) or 0.0
+                    raw["final_size_matched"] = max(prior_qty, current_qty)
+                if _terminal_order_status(lookup_status):
+                    break
+            except Exception as exc:
+                raw["order_lookup_error"] = str(exc)
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(max(0.05, self.config.reconcile_poll_s))
+
+        status = _normalize_order_status(
+            raw.get("final_order_status") or _first(raw, ("status", "state"))
+        )
         matched_qty = _matched_qty_from_raw(raw, target_qty)
-        live_remainder = status in {"live", "open", "delayed"} and matched_qty < target_qty
-        unverified_cancel = (not cancel_ok) and not raw.get("order_lookup")
-        if live_remainder:
-            raw.setdefault("errorMsg", "gtc_remainder_cancel_unconfirmed")
-        elif unverified_cancel and matched_qty <= 0:
-            raw.setdefault("errorMsg", "gtc_cancel_lookup_unconfirmed")
+        terminal = cancel_ok or _terminal_order_status(status)
+        raw["execution_terminal_confirmed"] = terminal
+        if not terminal:
+            raw["submission_state"] = "unknown"
+            if status in {"LIVE", "OPEN", "DELAYED", "UNMATCHED"} and matched_qty < target_qty:
+                raw.setdefault("errorMsg", "gtc_remainder_cancel_unconfirmed")
+            else:
+                raw.setdefault("errorMsg", "gtc_cancel_lookup_unconfirmed")
+
+    def _cancel_remainder(self, raw: dict[str, Any], target_qty: float) -> None:
+        self._cancel_order_remainder(raw)
+        self._reconcile_order(raw, target_qty)
 
     def buy_limit_fak(
         self,
@@ -399,6 +456,7 @@ class PolymarketLiveExecutor:
     ) -> ExecutionLegResult:
         if target_qty <= 0:
             return ExecutionLegResult(label, token_id, target_qty, 0.0, 0.0, 0.0, ok=False, error="target_qty<=0")
+        submission_started = False
         try:
             signed_order, limit_price = self._build_buy_order(
                 token_id=token_id,
@@ -408,11 +466,13 @@ class PolymarketLiveExecutor:
                 neg_risk=neg_risk,
                 slippage_ticks=slippage_ticks,
             )
+            submission_started = True
             resp = self.client.post_order(
                 signed_order,
                 order_type=self._share_buy_order_type(),
             )
             raw = _obj_to_dict(resp)
+            raw.setdefault("submission_state", "acknowledged")
             self._cancel_remainder(raw, target_qty)
             raw.setdefault("order_type", "GTC_SHARE_IOC")
             raw.setdefault("limit_price", limit_price)
@@ -428,6 +488,7 @@ class PolymarketLiveExecutor:
                 notional=0.0,
                 ok=False,
                 error=str(exc),
+                raw={"submission_state": "unknown" if submission_started else "not_submitted"},
             )
 
     def buy_pair_limit_fak(
@@ -438,6 +499,7 @@ class PolymarketLiveExecutor:
         slippage_ticks: int,
     ) -> tuple[ExecutionLegResult, ExecutionLegResult]:
         specs = (leg_a, leg_b)
+        submission_started = False
         try:
             signed_orders: list[Any] = []
             limit_prices: list[float] = []
@@ -457,10 +519,14 @@ class PolymarketLiveExecutor:
                 self.PostOrdersV2Args(order=signed_orders[0], orderType=order_type),
                 self.PostOrdersV2Args(order=signed_orders[1], orderType=order_type),
             ]
+            submission_started = True
             resp = self.client.post_orders(post_args)
             raws = self._split_batch_response(resp, 2)
+            for raw in raws:
+                raw.setdefault("submission_state", "acknowledged")
+                self._cancel_order_remainder(raw)
             for raw, limit_price, spec in zip(raws, limit_prices, specs):
-                self._cancel_remainder(raw, float(spec["target_qty"]))
+                self._reconcile_order(raw, float(spec["target_qty"]))
                 raw.setdefault("order_type", "GTC_SHARE_IOC")
                 raw.setdefault("limit_price", limit_price)
                 raw.setdefault("target_qty", float(spec["target_qty"]))
@@ -482,6 +548,7 @@ class PolymarketLiveExecutor:
             )
         except Exception as exc:
             err = str(exc)
+            raw_state = {"submission_state": "unknown" if submission_started else "not_submitted"}
             return (
                 ExecutionLegResult(
                     label=str(leg_a.get("label", "")),
@@ -492,6 +559,7 @@ class PolymarketLiveExecutor:
                     notional=0.0,
                     ok=False,
                     error=err,
+                    raw=dict(raw_state),
                 ),
                 ExecutionLegResult(
                     label=str(leg_b.get("label", "")),
@@ -502,6 +570,7 @@ class PolymarketLiveExecutor:
                     notional=0.0,
                     ok=False,
                     error=err,
+                    raw=dict(raw_state),
                 ),
             )
 
@@ -527,6 +596,7 @@ class PolymarketLiveExecutor:
                     "errorMsg": "missing_batch_response",
                     "batch_index": idx,
                     "batch_response": raw_batch,
+                    "submission_state": "unknown",
                 })
         return out
 
@@ -539,33 +609,21 @@ class PolymarketLiveExecutor:
         raw: dict[str, Any],
     ) -> ExecutionLegResult:
         order_id = str(_first(raw, ("orderID", "order_id", "id")) or "")
-        status = str(_first(raw, ("status", "state")) or "")
+        status = str(raw.get("final_order_status") or _first(raw, ("status", "state")) or "")
         success = raw.get("success")
         error_msg = str(_first(raw, ("errorMsg", "error_msg", "error")) or "")
 
-        qty_raw = _first(raw, (
-            "takingAmount",
-            "taking_amount",
-            "sizeMatched",
-            "size_matched",
-            "matchedAmount",
-            "matched_amount",
-            "filledSize",
-            "filled_size",
-        ))
         notional_raw = _first(raw, ("makingAmount", "making_amount", "notional", "amount"))
-        filled_qty = _normalize_amount(qty_raw, target_qty)
+        filled_qty = _matched_qty_from_raw(raw, target_qty)
         notional = _normalize_amount(notional_raw, target_qty * limit_price)
         if filled_qty is not None and filled_qty > target_qty:
             raw["filled_qty_clamped_from"] = filled_qty
             filled_qty = target_qty
 
         estimated = False
-        if filled_qty is None:
-            filled_qty = 0.0
+        if filled_qty <= 0:
             notional = 0.0
-
-        if notional is None:
+        elif notional is None:
             notional = filled_qty * limit_price
             estimated = True
         elif filled_qty > 0 and notional > filled_qty * limit_price:

@@ -59,8 +59,13 @@ CORR_EXEC_ORDER_TYPE=GTC
 CORR_EXEC_SLIPPAGE_TICKS=2
 CORR_EXEC_CHASE_SLIPPAGE_TICKS=1
 CORR_EXEC_MAX_CHASE_ATTEMPTS=2
+CORR_EXEC_RECONCILE_TIMEOUT_S=6.0
+CORR_EXEC_RECONCILE_POLL_S=0.25
+CORR_EXEC_FLATTEN_SLIPPAGE_TICKS=24
+CORR_EXEC_FLATTEN_MAX_ATTEMPTS=3
 CORR_LEG_MISMATCH_TOLERANCE_SHARES=1.0
 CORR_USER_WS_ENABLED=false
+CORR_PM_RESOLUTION_RETRY_S=60.0
 ```
 
 Entry execution:
@@ -78,9 +83,19 @@ Entry execution:
    latency/noise in the critical order path.
 5. If the difference is more than 1 share, chase the underfilled leg by the
    real shortfall with 1 additional tick per chase attempt.
-6. If the imbalance still remains after all chase attempts, the entry is
+6. A confirmed zero-fill consumes one attempt but does not terminate the
+   remaining finite chase attempts.
+7. A replacement order is allowed only after CLOB proves the preceding order
+   matched or its remainder was canceled. Unknown submission/cancel state
+   blocks resubmission to prevent duplicate fills.
+8. If the imbalance still remains after all chase attempts, the entry is
    aborted and the filled exposure is flattened by buying the opposite side.
-7. `CORR_MAX_COMBOS_PER_ROUND` and `CORR_MAX_COST_PER_ROUND_USD` apply only to
+   Emergency flatten starts immediately with the full 24-tick worst-price
+   ceiling; retries refresh the current ask instead of widening 8/16/24.
+9. Entry-abort residual exposure above the 1-share tolerance is retried every
+   strategy cycle until flat or the market window ends. It does not wait for a
+   fourth-quadrant signal.
+10. `CORR_MAX_COMBOS_PER_ROUND` and `CORR_MAX_COST_PER_ROUND_USD` apply only to
    new entries. Entry-imbalance hedges and Q4 kill orders bypass those caps.
 
 Time gates:
@@ -160,7 +175,9 @@ Telegram sends:
 - final summary for finite `--rounds` runs.
 
 PnL uses PM/UMA outcome from Gamma only. Binance prices are recorded only for
-divergence diagnostics and never drive realized PnL.
+divergence diagnostics and never drive realized PnL. If Gamma has not published
+an outcome within one polling window, the background resolver waits
+`CORR_PM_RESOLUTION_RETRY_S` and retries until the round is recorded.
 
 ## Known live risks
 

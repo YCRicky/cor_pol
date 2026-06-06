@@ -1,19 +1,28 @@
 import asyncio
+import tempfile
 import unittest
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from src.execution import ExecutionLegResult, PolymarketLiveExecutor
 from src.lab.correlation_arb_bot import (
     GateConfig,
+    LabCombo,
     MarketLeg,
+    RunLedger,
     UserOrderFeed,
+    combo_exit_reason,
     confirm_live_result,
     execute_buy_pair,
+    execution_unknown,
+    flatten_entry_exposure,
     is_us_stock_hours_utc8,
     is_weekend_rest_utc8,
     live_order_block_reason,
     post_ack_immediate_no_fill,
+    resolve_and_record,
     us_stock_hours_price_gate_ok,
     weekend_rest_resume_ts_utc8,
 )
@@ -91,6 +100,83 @@ class PairExecutor:
         )
 
 
+class RetryExecutor:
+    def __init__(self, single_fills):
+        self.single_fills = list(single_fills)
+        self.single_calls = []
+
+    def buy_pair_limit_fak(self, *, leg_a, leg_b, slippage_ticks):
+        return (
+            ExecutionLegResult(
+                leg_a["label"],
+                leg_a["token_id"],
+                leg_a["target_qty"],
+                leg_a["target_qty"],
+                0.50,
+                leg_a["target_qty"] * 0.50,
+                order_id="initial-a",
+                status="ORDER_STATUS_MATCHED",
+                ok=True,
+                raw={"submission_state": "acknowledged", "execution_terminal_confirmed": True},
+            ),
+            ExecutionLegResult(
+                leg_b["label"],
+                leg_b["token_id"],
+                leg_b["target_qty"],
+                0.0,
+                0.0,
+                0.0,
+                order_id="initial-b",
+                status="ORDER_STATUS_CANCELED",
+                ok=False,
+                error="no_fill",
+                raw={"submission_state": "acknowledged", "execution_terminal_confirmed": True},
+            ),
+        )
+
+    def buy_limit_fak(self, *, label, token_id, target_qty, best_ask, tick_size, neg_risk, slippage_ticks):
+        self.single_calls.append((label, target_qty, slippage_ticks))
+        fill = self.single_fills.pop(0)
+        return ExecutionLegResult(
+            label,
+            token_id,
+            target_qty,
+            fill,
+            0.51 if fill > 0 else 0.0,
+            fill * 0.51,
+            order_id=f"single-{len(self.single_calls)}",
+            status="ORDER_STATUS_MATCHED" if fill > 0 else "ORDER_STATUS_CANCELED",
+            ok=fill > 0,
+            error="" if fill > 0 else "no_fill",
+            raw={"submission_state": "acknowledged", "execution_terminal_confirmed": True},
+        )
+
+
+class UnknownPairExecutor(RetryExecutor):
+    def __init__(self):
+        super().__init__([])
+
+    def buy_pair_limit_fak(self, *, leg_a, leg_b, slippage_ticks):
+        known, _ = super().buy_pair_limit_fak(
+            leg_a=leg_a,
+            leg_b=leg_b,
+            slippage_ticks=slippage_ticks,
+        )
+        unknown = ExecutionLegResult(
+            leg_b["label"],
+            leg_b["token_id"],
+            leg_b["target_qty"],
+            0.0,
+            0.0,
+            0.0,
+            status="",
+            ok=False,
+            error="request timeout",
+            raw={"submission_state": "unknown"},
+        )
+        return known, unknown
+
+
 def _leg(asset: str) -> MarketLeg:
     leg = MarketLeg(
         asset=asset,
@@ -115,6 +201,15 @@ def _ts_utc8(year: int, month: int, day: int, hour: int, minute: int = 0) -> flo
 
 
 class LiveExecutionFlowTests(unittest.TestCase):
+    def test_restored_strategy_defaults_remain_unchanged(self):
+        gates = GateConfig()
+        self.assertEqual(gates.max_combos_per_round, 3)
+        self.assertTrue(gates.weekend_rest_enabled)
+        self.assertTrue(gates.us_stock_hours_filter_enabled)
+        self.assertEqual(gates.min_model_edge, 0.01)
+        self.assertEqual(gates.max_bad_quad_prob, 0.22)
+        self.assertEqual(gates.max_bad_to_normal_ratio, 0.38)
+
     def test_post_ack_no_fill_is_not_unknown(self):
         result = ExecutionLegResult(
             "BTC_NO",
@@ -250,6 +345,51 @@ class LiveExecutionFlowTests(unittest.TestCase):
         self.assertEqual(result.raw["filled_qty_clamped_from"], 5.82)
         self.assertEqual(result.raw["notional_clamped_from"], 5.0052)
 
+    def test_stale_zero_lookup_does_not_override_post_ack_fill(self):
+        raw = {
+            "success": True,
+            "orderID": "o4",
+            "takingAmount": "5",
+            "makingAmount": "2.5",
+            "final_size_matched": "0",
+            "final_order_status": "ORDER_STATUS_CANCELED",
+            "order_type": "GTC_SHARE_IOC",
+        }
+        result = PolymarketLiveExecutor._parse_buy_response(
+            object(),
+            "BTC_YES",
+            "tok",
+            5.0,
+            0.50,
+            raw,
+        )
+        self.assertEqual(result.filled_qty, 5.0)
+        self.assertEqual(result.notional, 2.5)
+
+    def test_reconcile_waits_for_terminal_fill_after_cancel_ack(self):
+        class ReconcileClient:
+            def __init__(self):
+                self.calls = 0
+
+            def get_order(self, _order_id):
+                self.calls += 1
+                if self.calls == 1:
+                    return {"status": "ORDER_STATUS_LIVE", "sizeMatched": "0"}
+                return {"status": "ORDER_STATUS_CANCELED", "sizeMatched": "5"}
+
+        executor = object.__new__(PolymarketLiveExecutor)
+        executor.config = SimpleNamespace(reconcile_timeout_s=1.0, reconcile_poll_s=0.0)
+        executor.client = ReconcileClient()
+        raw = {
+            "orderID": "o5",
+            "submission_state": "acknowledged",
+            "remainder_cancel_confirmed": True,
+        }
+        executor._reconcile_order(raw, 5.0)
+        self.assertEqual(executor.client.calls, 2)
+        self.assertEqual(raw["final_size_matched"], 5.0)
+        self.assertTrue(raw["execution_terminal_confirmed"])
+
     def test_one_leg_fill_one_leg_no_fill_chases_short_leg(self):
         executor = PairExecutor()
         res_a, res_b, _events = asyncio.run(
@@ -266,6 +406,134 @@ class LiveExecutionFlowTests(unittest.TestCase):
         self.assertEqual(res_a.filled_qty, 5.0)
         self.assertEqual(res_b.filled_qty, 5.0)
         self.assertEqual(executor.single_calls, [("BTC_YES", 5.0, 1)])
+
+    def test_zero_fill_does_not_skip_remaining_chase_attempt(self):
+        executor = RetryExecutor([0.0, 5.0])
+        res_a, res_b, _events = asyncio.run(
+            execute_buy_pair(
+                legs_by_asset={"BTC": _leg("BTC"), "ETH": _leg("ETH")},
+                leg_a="BTC_YES",
+                leg_b="ETH_NO",
+                qty=5.0,
+                gates=GateConfig(exec_max_chase_attempts=2),
+                live_executor=executor,
+                order_feed=None,
+            )
+        )
+        self.assertEqual(res_a.filled_qty, 5.0)
+        self.assertEqual(res_b.filled_qty, 5.0)
+        self.assertEqual(executor.single_calls, [
+            ("ETH_NO", 5.0, 1),
+            ("ETH_NO", 5.0, 2),
+        ])
+
+    def test_unknown_submission_never_chases_blindly(self):
+        executor = UnknownPairExecutor()
+        res_a, res_b, _events = asyncio.run(
+            execute_buy_pair(
+                legs_by_asset={"BTC": _leg("BTC"), "ETH": _leg("ETH")},
+                leg_a="BTC_YES",
+                leg_b="ETH_NO",
+                qty=5.0,
+                gates=GateConfig(exec_max_chase_attempts=2),
+                live_executor=executor,
+                order_feed=None,
+            )
+        )
+        self.assertTrue(execution_unknown(res_a, res_b))
+        self.assertEqual(executor.single_calls, [])
+
+    def test_flatten_uses_full_ceiling_and_retries_after_zero_fill(self):
+        executor = RetryExecutor([0.0, 5.0])
+        legs = {"BTC": _leg("BTC"), "ETH": _leg("ETH")}
+        res_a = ExecutionLegResult("BTC_YES", "BTCY", 5.0, 5.0, 0.5, 2.5)
+        res_b = ExecutionLegResult("ETH_NO", "ETHN", 5.0, 0.0, 0.0, 0.0, ok=False)
+        flat_a, flat_b, flat_ok, _events = asyncio.run(
+            flatten_entry_exposure(
+                legs_by_asset=legs,
+                leg_a="BTC_YES",
+                leg_b="ETH_NO",
+                res_a=res_a,
+                res_b=res_b,
+                gates=GateConfig(
+                    exec_flatten_slippage_ticks=24,
+                    exec_flatten_max_attempts=3,
+                ),
+                live_executor=executor,
+                order_feed=None,
+            )
+        )
+        self.assertTrue(flat_ok)
+        self.assertEqual(flat_a.filled_qty, 5.0)
+        self.assertEqual(flat_b.filled_qty, 0.0)
+        self.assertEqual(executor.single_calls, [
+            ("BTC_NO", 5.0, 24),
+            ("BTC_NO", 5.0, 24),
+        ])
+
+    def test_entry_abort_residual_bypasses_q4_signal(self):
+        combo = LabCombo(
+            combo_id=1,
+            direction="A",
+            leg_a="BTC_YES",
+            leg_b="ETH_NO",
+            price_a=0.7,
+            price_b=0.2,
+            qty=0.0,
+            entered_at=0.0,
+            qty_a=5.0,
+            is_hedge=True,
+        )
+        self.assertEqual(
+            combo_exit_reason(combo, -0.1, -0.1, 10.0, 10.0, GateConfig()),
+            "entry_abort_residual",
+        )
+
+    def test_unresolved_pm_outcome_is_retried_before_ledger_record(self):
+        unresolved = {"round": 7, "status": "UNRESOLVED"}
+        resolved = {
+            "round": 7,
+            "status": "OK",
+            "pnl": 1.25,
+            "cost": 4.0,
+            "gross": 5.0,
+            "flip_pnl": 0.25,
+            "combos_count": 1,
+            "pm_btc_up": 1.0,
+            "pm_eth_up": 0.0,
+            "divergence": False,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pending = {"round": 7, "jsonl": str(Path(temp_dir) / "round.jsonl")}
+            ledger = RunLedger()
+            resolve_calls = []
+            responses = iter((unresolved, resolved))
+
+            async def fake_resolve_round(*args, **kwargs):
+                resolve_calls.append((args, kwargs))
+                return next(responses)
+
+            async def fake_sleep(_seconds):
+                return None
+
+            with patch(
+                "src.lab.correlation_arb_bot.resolve_round",
+                new=fake_resolve_round,
+            ), patch(
+                "src.lab.correlation_arb_bot.asyncio.sleep",
+                new=fake_sleep,
+            ):
+                summary = asyncio.run(
+                    resolve_and_record(
+                        pending,
+                        GateConfig(pm_resolution_retry_s=1.0),
+                        ledger,
+                    )
+                )
+        self.assertEqual(len(resolve_calls), 2)
+        self.assertEqual(summary["status"], "OK")
+        self.assertEqual(summary["resolved_count"], 1)
+        self.assertEqual(summary["run_pnl"], 1.25)
 
     def test_user_ws_state_never_blocks_live_ordering(self):
         self.assertIsNone(

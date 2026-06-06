@@ -28,7 +28,7 @@ configured by `CLOB_SIGNATURE_TYPE` and `CLOB_FUNDER_ADDRESS`.
 | Entry: min favorable bp | `min(fav_bp_a, fav_bp_b) >= -4.0 bp` | Skip entries where either leg is already underwater vs its strike |
 | Entry: quadrant EV | `fair_a + fair_b - cost >= 0.01`, `P(lose,lose) <= 0.22` | Gap alone only proves same-direction breakeven; the bad diagonal must be bounded |
 | Sizing: round cap | `max_combos_per_round = 3`, `max_cost_per_round_usd = 15` | Entry-only cap. Defensive Q4/imbalance reverse buys bypass it so stops cannot be blocked |
-| Execution | aggressive limit `FAK`, 5 shares per leg, 1-share mismatch tolerance | Targets shares exactly and avoids infinite retries on tiny residual fills |
+| Execution | marketable GTC share-limit then immediate cancel, 5 shares per leg, 1-share mismatch tolerance | Targets shares exactly and avoids infinite retries on tiny residual fills |
 | Defense: asymmetric Q4 kill | If one executable leg loss exceeds `2 * entry_gap`, the other leg is also below entry, and both legs' `fav_bp` worsened vs entry, buy both opposite asks | Cut the true `(lose, lose)` path while leaving `(win, win)`, `(win, lose)`, and `(lose, win)` alive |
 | PnL settlement | PM/UMA outcome via Gamma API | No Binance fallback -- avoids divergence rounds |
 
@@ -84,6 +84,7 @@ docs/
 
 ## What is *not* in this build
 
-- No maker quoting. Live mode uses taker-only aggressive FAK orders.
+- No maker quoting. Live mode uses aggressive share-sized GTC orders and
+  immediately cancels unfilled remainders.
 - No tail-hedge, no Layer-4 spot kill -- fourth-quadrant control is handled by PM marks.
 - No research scripts. Backtest tooling lives in the prior `taker_pol` repo.

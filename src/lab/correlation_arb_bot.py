@@ -602,6 +602,8 @@ class LabCombo:
     parent_combo_id: int = 0
     q4_watch_last_log: float = 0.0
     kill_last_attempt_at: float = 0.0
+    exit_execution_unknown: bool = False
+    exit_unknown_reason: str = ""
 
 
 def best_ask_tuple(book: SimpleBook) -> Optional[Tuple[float, float]]:
@@ -659,6 +661,7 @@ class GateConfig:
     fair_block_margin: float = 0.05
     pm_resolution_wait_s: float = 1200.0
     pm_resolution_poll_s: float = 15.0
+    pm_resolution_retry_s: float = 60.0
     min_vol_bp_60s: float = 0.0
     weekend_rest_enabled: bool = True
     us_stock_hours_filter_enabled: bool = True
@@ -696,7 +699,7 @@ class GateConfig:
     exec_slippage_ticks: int = 2
     exec_chase_slippage_ticks: int = 1
     exec_max_chase_attempts: int = 2
-    exec_flatten_slippage_ticks: int = 8
+    exec_flatten_slippage_ticks: int = 24
     exec_flatten_max_attempts: int = 3
     exec_kill_retry_cooldown_s: float = 1.0
     exec_user_ws_enabled: bool = False
@@ -1012,12 +1015,38 @@ def entry_execution_status(
 
 
 def execution_unknown(*results: ExecutionLegResult) -> bool:
-    return any((res.error or "").startswith("user_ws_") for res in results)
+    return bool(execution_unknown_reason(*results))
 
 
 def execution_unknown_reason(*results: ExecutionLegResult) -> str:
-    errors = [res.error for res in results if (res.error or "").startswith("user_ws_")]
-    return ",".join(errors) if errors else ""
+    reasons: list[str] = []
+
+    def raw_unknown(raw: Any) -> bool:
+        if not isinstance(raw, dict):
+            return False
+        if str(raw.get("submission_state") or "").lower() == "unknown":
+            return True
+        parts = raw.get("parts")
+        return isinstance(parts, list) and any(raw_unknown(part) for part in parts)
+
+    for res in results:
+        error = res.error or ""
+        error_parts = [part.strip() for part in error.split(";") if part.strip()]
+        unknown_error = next((
+            part for part in error_parts
+            if part.startswith("user_ws_")
+            or part in {
+                "gtc_remainder_cancel_unconfirmed",
+                "gtc_cancel_lookup_unconfirmed",
+                "missing_order_id_after_submit",
+                "missing_batch_response",
+            }
+        ), "")
+        if unknown_error:
+            reasons.append(unknown_error)
+        elif raw_unknown(res.raw):
+            reasons.append(error or "clob_submission_unknown")
+    return ",".join(dict.fromkeys(reasons))
 
 
 def post_ack_immediate_no_fill(result: ExecutionLegResult) -> bool:
@@ -1223,8 +1252,6 @@ async def execute_buy_pair(
             res_b = merge_execution_results(res_b, extra_b)
             events.append({"phase": f"chase_{attempt}", "leg": leg_a, **extra_a.__dict__})
             events.append({"phase": f"chase_{attempt}", "leg": leg_b, **extra_b.__dict__})
-            if extra_a.filled_qty <= 0 and extra_b.filled_qty <= 0:
-                break
         elif need_b > 0:
             chase_label = leg_b
             extra = await execute_buy_leg(
@@ -1238,8 +1265,6 @@ async def execute_buy_pair(
             )
             res_b = merge_execution_results(res_b, extra)
             events.append({"phase": f"chase_{attempt}", "leg": chase_label, **extra.__dict__})
-            if extra.filled_qty <= 0:
-                break
         else:
             chase_label = leg_a
             extra = await execute_buy_leg(
@@ -1253,8 +1278,6 @@ async def execute_buy_pair(
             )
             res_a = merge_execution_results(res_a, extra)
             events.append({"phase": f"chase_{attempt}", "leg": chase_label, **extra.__dict__})
-            if extra.filled_qty <= 0:
-                break
     return res_a, res_b, events
 
 
@@ -1291,11 +1314,15 @@ async def flatten_entry_exposure(
     tolerance = max(0.0, gates.leg_mismatch_tolerance_shares)
 
     for attempt in range(1, gates.exec_flatten_max_attempts + 1):
+        if execution_unknown(flat_a, flat_b):
+            break
         need_a = max(0.0, res_a.filled_qty - flat_a.filled_qty)
         need_b = max(0.0, res_b.filled_qty - flat_b.filled_qty)
         if need_a <= tolerance and need_b <= tolerance:
             break
-        slip = gates.exec_flatten_slippage_ticks * attempt
+        # A flatten is defensive. Use the full worst-price ceiling immediately;
+        # retries refresh the current ask without widening the configured risk.
+        slip = gates.exec_flatten_slippage_ticks
         if need_a > tolerance and need_b > tolerance:
             extra_a, extra_b = await execute_buy_pair_once(
                 legs_by_asset=legs_by_asset,
@@ -1313,8 +1340,6 @@ async def flatten_entry_exposure(
             flat_b = merge_execution_results(flat_b, extra_b)
             events.append({"phase": f"entry_flatten_{attempt}", "source_leg": leg_a, "leg": opp_a, **extra_a.__dict__})
             events.append({"phase": f"entry_flatten_{attempt}", "source_leg": leg_b, "leg": opp_b, **extra_b.__dict__})
-            if extra_a.filled_qty <= 0 and extra_b.filled_qty <= 0:
-                break
         elif need_a > tolerance:
             extra_a = await execute_buy_leg(
                 legs_by_asset=legs_by_asset,
@@ -1327,8 +1352,6 @@ async def flatten_entry_exposure(
             )
             flat_a = merge_execution_results(flat_a, extra_a)
             events.append({"phase": f"entry_flatten_{attempt}", "source_leg": leg_a, "leg": opp_a, **extra_a.__dict__})
-            if extra_a.filled_qty <= 0:
-                break
         elif need_b > tolerance:
             extra_b = await execute_buy_leg(
                 legs_by_asset=legs_by_asset,
@@ -1341,8 +1364,6 @@ async def flatten_entry_exposure(
             )
             flat_b = merge_execution_results(flat_b, extra_b)
             events.append({"phase": f"entry_flatten_{attempt}", "source_leg": leg_b, "leg": opp_b, **extra_b.__dict__})
-            if extra_b.filled_qty <= 0:
-                break
 
     ok = (
         max(0.0, res_a.filled_qty - flat_a.filled_qty) <= tolerance
@@ -1413,6 +1434,21 @@ def fourth_quadrant_kill_reason(
         f"Q4_asym(lossA={loss_a:.3f},lossB={loss_b:.3f},"
         f"gap={entry_gap:.3f},favA={combo.entry_fav_bp_a:+.1f}->{fav_bp_a:+.1f},"
         f"favB={combo.entry_fav_bp_b:+.1f}->{fav_bp_b:+.1f})"
+    )
+
+
+def combo_exit_reason(
+    combo: LabCombo,
+    loss_a: float,
+    loss_b: float,
+    fav_bp_a: float,
+    fav_bp_b: float,
+    gates: GateConfig,
+) -> Optional[str]:
+    if combo.is_hedge:
+        return "entry_abort_residual"
+    return fourth_quadrant_kill_reason(
+        combo, loss_a, loss_b, fav_bp_a, fav_bp_b, gates,
     )
 
 
@@ -1740,6 +1776,8 @@ async def strategy_loop(
                                 entry_gap=sig.gap,
                                 entry_fav_bp_a=float(diag.get("fav_bp_a", 0.0)),
                                 entry_fav_bp_b=float(diag.get("fav_bp_b", 0.0)),
+                                exit_execution_unknown=execution_unknown(res_a, res_b, flat_a, flat_b),
+                                exit_unknown_reason=execution_unknown_reason(res_a, res_b, flat_a, flat_b),
                             )
                             combos.append(aborted)
                             abort_tracked = True
@@ -1900,6 +1938,8 @@ async def strategy_loop(
             for combo in combos:
                 if combo.flipped_a and combo.flipped_b:
                     continue
+                if combo.exit_execution_unknown:
+                    continue
                 combo_qty_a = max(combo.qty_a, combo.qty)
                 combo_qty_b = max(combo.qty_b, combo.qty)
                 remaining_flip_a = max(0.0, combo_qty_a - combo.flip_qty_a)
@@ -1910,15 +1950,20 @@ async def strategy_loop(
                 fav_bp_b = leg_fav_bp(legs_by_asset, combo.leg_b)
                 if exec_a is None or exec_b is None:
                     continue
-                if fav_bp_a is None or fav_bp_b is None:
-                    continue
                 opp_a_label, opp_a_book, opp_a_px, opp_a_sz, exec_mark_a = exec_a
                 opp_b_label, opp_b_book, opp_b_px, opp_b_sz, exec_mark_b = exec_b
                 exec_fpnl_a = exec_mark_a - combo.price_a
                 exec_fpnl_b = exec_mark_b - combo.price_b
                 loss_a = -exec_fpnl_a
                 loss_b = -exec_fpnl_b
-                reason = fourth_quadrant_kill_reason(
+                if combo.is_hedge:
+                    # An aborted entry is not a strategy position. Any residual
+                    # above tolerance must be flattened regardless of Q4 state.
+                    fav_bp_a = fav_bp_a if fav_bp_a is not None else 0.0
+                    fav_bp_b = fav_bp_b if fav_bp_b is not None else 0.0
+                elif fav_bp_a is None or fav_bp_b is None:
+                    continue
+                reason = combo_exit_reason(
                     combo, loss_a, loss_b, fav_bp_a, fav_bp_b, gates,
                 )
                 if reason is None:
@@ -1945,7 +1990,11 @@ async def strategy_loop(
                             "fav_worse_b": fav_bp_b <= combo.entry_fav_bp_b - gates.q4_fav_worsen_bp,
                         })
                     continue
-                if live_executor is None and (opp_a_sz < remaining_flip_a or opp_b_sz < remaining_flip_b):
+                tolerance = max(0.0, gates.leg_mismatch_tolerance_shares)
+                if live_executor is None and (
+                    (remaining_flip_a > tolerance and opp_a_sz < remaining_flip_a)
+                    or (remaining_flip_b > tolerance and opp_b_sz < remaining_flip_b)
+                ):
                     _log(jsonl, {
                         "kind": "combo_kill_no_liquidity", "ts": now, "tte": tte,
                         "combo_id": combo.combo_id,
@@ -1964,14 +2013,19 @@ async def strategy_loop(
                         "reason": reason,
                     })
                     continue
-                if remaining_flip_a <= 0 and remaining_flip_b <= 0:
+                if remaining_flip_a <= tolerance and remaining_flip_b <= tolerance:
                     combo.flipped_a = True
                     combo.flipped_b = True
                     continue
                 if now - combo.kill_last_attempt_at < gates.exec_kill_retry_cooldown_s:
                     continue
                 combo.kill_last_attempt_at = now
-                if remaining_flip_a > 0 and remaining_flip_b > 0:
+                defensive_slip = (
+                    gates.exec_flatten_slippage_ticks
+                    if combo.is_hedge
+                    else gates.exec_chase_slippage_ticks
+                )
+                if remaining_flip_a > tolerance and remaining_flip_b > tolerance:
                     res_flip_a, res_flip_b = await execute_buy_pair_once(
                         legs_by_asset=legs_by_asset,
                         leg_a=opp_a_label,
@@ -1979,18 +2033,18 @@ async def strategy_loop(
                         qty_a=remaining_flip_a,
                         qty_b=remaining_flip_b,
                         live_executor=live_executor,
-                        slippage_ticks=gates.exec_chase_slippage_ticks,
+                        slippage_ticks=defensive_slip,
                         gates=gates,
                         order_feed=order_feed,
                         allow_partial_submit=True,
                     )
-                elif remaining_flip_a > 0:
+                elif remaining_flip_a > tolerance:
                     res_flip_a = await execute_buy_leg(
                         legs_by_asset=legs_by_asset,
                         label=opp_a_label,
                         qty=remaining_flip_a,
                         live_executor=live_executor,
-                        slippage_ticks=gates.exec_chase_slippage_ticks,
+                        slippage_ticks=defensive_slip,
                         gates=gates,
                         order_feed=order_feed,
                     )
@@ -2002,7 +2056,7 @@ async def strategy_loop(
                         label=opp_b_label,
                         qty=remaining_flip_b,
                         live_executor=live_executor,
-                        slippage_ticks=gates.exec_chase_slippage_ticks,
+                        slippage_ticks=defensive_slip,
                         gates=gates,
                         order_feed=order_feed,
                     )
@@ -2010,12 +2064,11 @@ async def strategy_loop(
                              "phase": "kill", "leg": opp_a_label, **res_flip_a.__dict__})
                 _log(jsonl, {"kind": "kill_order_fill", "ts": now, "tte": tte, "combo_id": combo.combo_id,
                              "phase": "kill", "leg": opp_b_label, **res_flip_b.__dict__})
-                unknown_after_submit = any(
-                    res.order_id and (res.error or "") == "user_ws_timeout"
-                    for res in (res_flip_a, res_flip_b)
-                )
+                unknown_after_submit = execution_unknown(res_flip_a, res_flip_b)
                 if unknown_after_submit:
                     combo.kill_last_attempt_at = stop_at + gates.exec_kill_retry_cooldown_s
+                    combo.exit_execution_unknown = True
+                    combo.exit_unknown_reason = execution_unknown_reason(res_flip_a, res_flip_b)
                     _log(jsonl, {
                         "kind": "combo_kill_unknown", "ts": now, "tte": tte,
                         "combo_id": combo.combo_id,
@@ -2027,14 +2080,14 @@ async def strategy_loop(
                         "order_id_b": res_flip_b.order_id,
                         "error_a": res_flip_a.error,
                         "error_b": res_flip_b.error,
-                        "reason": "user_ws_unknown_after_submit",
+                        "reason": combo.exit_unknown_reason,
                     })
                     if notify:
                         notify("alert", {
                             "round": round_idx,
                             "combo_id": combo.combo_id,
                             "tte": tte,
-                            "reason": "user_ws_unknown_after_kill_submit",
+                            "reason": "execution_unknown_after_kill_submit",
                             "flat_ok": False,
                             "leg_a": combo.leg_a,
                             "qty_a": combo_qty_a,
@@ -2422,7 +2475,24 @@ async def resolve_and_record(
     ledger: RunLedger,
     notify=None,
 ) -> dict:
-    summary = await resolve_round(pending, gates, notify=None)
+    retry_count = 0
+    while True:
+        summary = await resolve_round(pending, gates, notify=None)
+        if summary.get("status") == "OK":
+            break
+        retry_count += 1
+        retry_s = max(1.0, gates.pm_resolution_retry_s)
+        _log(Path(pending["jsonl"]), {
+            "kind": "resolution_retry",
+            "round": pending.get("round"),
+            "retry_count": retry_count,
+            "retry_in_s": retry_s,
+        })
+        print(
+            f"[RESOLVE R{pending.get('round')}] PM outcome still unavailable; "
+            f"retrying in {retry_s:.0f}s"
+        )
+        await asyncio.sleep(retry_s)
     totals = ledger.record(summary)
     summary.update(totals)
     if summary.get("status") == "OK":
@@ -2464,6 +2534,7 @@ async def main_async(rounds: int, start_mode: str, gates: GateConfig) -> None:
         print(f"[BOOT] LIVE CLOB enabled host={cfg.host} chain={cfg.chain_id} "
               f"sig={cfg.signature_type} funder={cfg.funder[:6]}... "
               f"order_type={cfg.order_type} builder={'yes' if cfg.builder_code else 'no'} "
+              f"reconcile={cfg.reconcile_timeout_s:.1f}s "
               f"user_ws={'on' if gates.exec_user_ws_enabled else 'off'}")
     if notifier is not None and not notifications_paused(gates):
         try:
@@ -2477,6 +2548,8 @@ async def main_async(rounds: int, start_mode: str, gates: GateConfig) -> None:
                           f"EV>={gates.min_model_edge:+.3f} bad<={gates.max_bad_quad_prob:.2f}\n"
                           f"Q4 asym dead={gates.q4_dead_loss_gap_mult:.1f}x gap "
                           f"fav_worse={gates.q4_fav_worsen_bp:.1f}bp\n"
+                          f"chase={gates.exec_chase_slippage_ticks}x{gates.exec_max_chase_attempts} "
+                          f"flatten={gates.exec_flatten_slippage_ticks}x{gates.exec_flatten_max_attempts}\n"
                           f"execution={execution_note}")
         except Exception as exc:
             print(f"[BOOT] tg boot ping failed: {exc}")
@@ -2599,6 +2672,7 @@ def main() -> None:
         combo_cooldown_s=_envf("CORR_COMBO_COOLDOWN_S", 15.0),
         pm_resolution_wait_s=_envf("CORR_PM_RESOLUTION_WAIT_S", 1200.0),
         pm_resolution_poll_s=_envf("CORR_PM_RESOLUTION_POLL_S", 15.0),
+        pm_resolution_retry_s=_envf("CORR_PM_RESOLUTION_RETRY_S", 60.0),
         min_vol_bp_60s=_envf("CORR_MIN_VOL_BP_60S", 0.0),
         weekend_rest_enabled=_envb("CORR_WEEKEND_REST_ENABLED", True),
         us_stock_hours_filter_enabled=_envb("CORR_US_STOCK_HOURS_FILTER_ENABLED", True),
@@ -2616,7 +2690,7 @@ def main() -> None:
         exec_slippage_ticks=_envi("CORR_EXEC_SLIPPAGE_TICKS", 2),
         exec_chase_slippage_ticks=_envi("CORR_EXEC_CHASE_SLIPPAGE_TICKS", 1),
         exec_max_chase_attempts=_envi("CORR_EXEC_MAX_CHASE_ATTEMPTS", 2),
-        exec_flatten_slippage_ticks=_envi("CORR_EXEC_FLATTEN_SLIPPAGE_TICKS", 8),
+        exec_flatten_slippage_ticks=_envi("CORR_EXEC_FLATTEN_SLIPPAGE_TICKS", 24),
         exec_flatten_max_attempts=_envi("CORR_EXEC_FLATTEN_MAX_ATTEMPTS", 3),
         exec_kill_retry_cooldown_s=_envf("CORR_EXEC_KILL_RETRY_COOLDOWN_S", 1.0),
         exec_user_ws_enabled=_envb("CORR_USER_WS_ENABLED", False),
