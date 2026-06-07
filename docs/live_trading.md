@@ -8,6 +8,7 @@ It is based on the Polymarket docs reviewed on 2026-05-29:
 - CLOB create order: https://docs.polymarket.com/developers/CLOB/orders/create-order
 - CLOB cancel/query order: https://docs.polymarket.com/trading/orders/cancel
 - CLOB Python client: https://docs.polymarket.com/developers/CLOB/clients/python-client
+- Fees: https://docs.polymarket.com/polymarket-learn/trading/fees
 
 ## Polymarket changes that matter
 
@@ -30,6 +31,9 @@ It is based on the Polymarket docs reviewed on 2026-05-29:
   code. The bot attaches it to every live order.
 - The CLOB order docs classify `FOK` and `FAK` as immediate execution order
   types, but for BUY orders they use dollar amount, not share count.
+- Crypto taker fees use `shares * 0.07 * price * (1 - price)`. The
+  `CORR_TAKER_REBATE_RATE` setting represents expected account-level cashback;
+  it is intentionally configurable and is not the official maker rebate.
 - SDK market BUY orders and `FOK`/`FAK` BUY types take dollar amount, not shares.
   Because this strategy needs "send 5 shares", the bot forces live BUYs through
   marketable GTC limit orders with `OrderArgs(size=5)` and immediately cancels
@@ -55,6 +59,11 @@ CORR_TTE_MAX_S=210
 CORR_WEEKEND_REST_ENABLED=true
 CORR_US_STOCK_HOURS_FILTER_ENABLED=true
 CORR_US_STOCK_HOURS_MIN_LEG_PRICE=0.70
+CORR_MIN_MODEL_EDGE=0.05
+CORR_TAKER_FEE_RATE=0.07
+CORR_TAKER_REBATE_RATE=0.30
+CORR_ENTRY_EDGE_RESERVE=0.01
+CORR_MIN_NET_MODEL_EDGE=0.02
 CORR_EXEC_ORDER_TYPE=GTC
 CORR_EXEC_SLIPPAGE_TICKS=2
 CORR_EXEC_CHASE_SLIPPAGE_TICKS=1
@@ -70,32 +79,35 @@ CORR_PM_RESOLUTION_RETRY_S=60.0
 
 Entry execution:
 
-1. Buy leg A and leg B with `size = 5` shares each, using aggressive GTC limits
+1. Before sending orders, require raw model edge `>= 0.05` and fee-adjusted
+   net model edge `>= 0.02`. Net edge subtracts the expected two-leg crypto
+   taker fee after configured account rebate and a per-share execution reserve.
+2. Buy leg A and leg B with `size = 5` shares each, using aggressive GTC limits
    that are cancelled immediately after submission.
-2. Limit price is `best_ask + slippage_ticks * tick_size`, capped at `0.99`.
-3. If the two fills differ by at most 1 share, accept the residual and do not
+3. Limit price is `best_ask + slippage_ticks * tick_size`, capped at `0.99`.
+4. If the two fills differ by at most 1 share, accept the residual and do not
    retry. This prevents the old 4.89 vs 5.00 infinite-retry failure.
-4. Fill reconciliation treats CLOB submit/cancel/get_order as the execution
+5. Fill reconciliation treats CLOB submit/cancel/get_order as the execution
    source of truth. The authenticated user websocket is optional telemetry: it
    can add faster fill/price updates, but it cannot block order submission,
    downgrade a CLOB-confirmed fill, or turn a CLOB-confirmed fill into no-fill.
    Default live mode keeps `CORR_USER_WS_ENABLED=false` to avoid websocket
    latency/noise in the critical order path.
-5. If the difference is more than 1 share, chase the underfilled leg by the
+6. If the difference is more than 1 share, chase the underfilled leg by the
    real shortfall with 1 additional tick per chase attempt.
-6. A confirmed zero-fill consumes one attempt but does not terminate the
+7. A confirmed zero-fill consumes one attempt but does not terminate the
    remaining finite chase attempts.
-7. A replacement order is allowed only after CLOB proves the preceding order
+8. A replacement order is allowed only after CLOB proves the preceding order
    matched or its remainder was canceled. Unknown submission/cancel state
    blocks resubmission to prevent duplicate fills.
-8. If the imbalance still remains after all chase attempts, the entry is
+9. If the imbalance still remains after all chase attempts, the entry is
    aborted and the filled exposure is flattened by buying the opposite side.
    Emergency flatten starts immediately with the full 24-tick worst-price
    ceiling; retries refresh the current ask instead of widening 8/16/24.
-9. Entry-abort residual exposure above the 1-share tolerance is retried every
+10. Entry-abort residual exposure above the 1-share tolerance is retried every
    strategy cycle until flat or the market window ends. It does not wait for a
    fourth-quadrant signal.
-10. `CORR_MAX_COMBOS_PER_ROUND` and `CORR_MAX_COST_PER_ROUND_USD` apply only to
+11. `CORR_MAX_COMBOS_PER_ROUND` and `CORR_MAX_COST_PER_ROUND_USD` apply only to
    new entries. Entry-imbalance hedges and Q4 kill orders bypass those caps.
 
 Time gates:

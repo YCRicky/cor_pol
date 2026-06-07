@@ -26,7 +26,8 @@ configured by `CLOB_SIGNATURE_TYPE` and `CLOB_FUNDER_ADDRESS`.
 |---|---|---|
 | Entry: asymmetric mid | `max(mid_a, mid_b) >= 0.60` AND `min(mid_a, mid_b) <= 0.40` | Skip coin-flip entries that historically blow up in Q4 |
 | Entry: min favorable bp | `min(fav_bp_a, fav_bp_b) >= -4.0 bp` | Skip entries where either leg is already underwater vs its strike |
-| Entry: quadrant EV | `fair_a + fair_b - cost >= 0.01`, `P(lose,lose) <= 0.22` | Gap alone only proves same-direction breakeven; the bad diagonal must be bounded |
+| Entry: fee-adjusted EV | raw model edge `>= 0.05` and net edge after expected fee/rebate/reserve `>= 0.02` | Reject low-margin trades likely to be consumed by taker fees and execution noise |
+| Entry: quadrant tail diagnostic | `P(lose,lose) <= 0.22`, bad/normal `<= 0.38` | Retain the original broad tail guard without trusting the uncalibrated quadrant model too aggressively |
 | Sizing: round cap | `max_combos_per_round = 3`, `max_cost_per_round_usd = 15` | Entry-only cap. Defensive Q4/imbalance reverse buys bypass it so stops cannot be blocked |
 | Execution | marketable GTC share-limit then immediate cancel, 5 shares per leg, 1-share mismatch tolerance | Targets shares exactly and avoids infinite retries on tiny residual fills |
 | Defense: asymmetric Q4 kill | If one executable leg loss exceeds `2 * entry_gap`, the other leg is also below entry, and both legs' `fav_bp` worsened vs entry, buy both opposite asks | Cut the true `(lose, lose)` path while leaving `(win, win)`, `(win, lose)`, and `(lose, win)` alive |

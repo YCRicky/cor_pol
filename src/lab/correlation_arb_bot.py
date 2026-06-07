@@ -657,7 +657,6 @@ class GateConfig:
     max_combos_per_round: int = 3
     max_cost_per_round_usd: float = 15.0
     combo_cooldown_s: float = 15.0
-    taker_fee: float = 0.0
     fair_block_margin: float = 0.05
     pm_resolution_wait_s: float = 1200.0
     pm_resolution_poll_s: float = 15.0
@@ -668,7 +667,11 @@ class GateConfig:
     us_stock_hours_min_leg_price: float = 0.70
     # Four-quadrant EV/tail diagnostic. The entry is still a cheap diagonal, but
     # it must also have model edge and a bounded lose/lose quadrant.
-    min_model_edge: float = 0.01
+    min_model_edge: float = 0.05
+    taker_fee_rate: float = 0.07
+    taker_rebate_rate: float = 0.30
+    entry_edge_reserve: float = 0.01
+    min_net_model_edge: float = 0.02
     max_bad_quad_prob: float = 0.22
     max_bad_to_normal_ratio: float = 0.38
     # --- Finalized entry filter (OOS-validated on Run #2 -> Run #84) ---
@@ -1452,6 +1455,60 @@ def combo_exit_reason(
     )
 
 
+def crypto_taker_fee_per_share(price: float, fee_rate: float) -> float:
+    """Polymarket crypto taker fee in USDC per filled share."""
+    if not math.isfinite(float(price)) or not math.isfinite(float(fee_rate)):
+        return float("inf")
+    p = max(0.0, min(1.0, float(price)))
+    return max(0.0, float(fee_rate)) * p * (1.0 - p)
+
+
+def fee_adjusted_model_edge(
+    model_edge: float,
+    price_a: float,
+    price_b: float,
+    gates: GateConfig,
+) -> tuple[float, float, float]:
+    """Return net edge, gross entry fee, and expected fee after rebate.
+
+    Values are per one-share combo. The execution reserve covers ordinary
+    slippage/model error; emergency exit costs remain a separate tail risk.
+    """
+    inputs = (
+        model_edge,
+        price_a,
+        price_b,
+        gates.taker_fee_rate,
+        gates.taker_rebate_rate,
+        gates.entry_edge_reserve,
+    )
+    if not all(math.isfinite(float(value)) for value in inputs):
+        invalid = float("nan")
+        return invalid, invalid, invalid
+    gross_fee = (
+        crypto_taker_fee_per_share(price_a, gates.taker_fee_rate)
+        + crypto_taker_fee_per_share(price_b, gates.taker_fee_rate)
+    )
+    rebate_rate = max(0.0, min(1.0, gates.taker_rebate_rate))
+    expected_fee = gross_fee * (1.0 - rebate_rate)
+    net_edge = float(model_edge) - expected_fee - max(0.0, gates.entry_edge_reserve)
+    return net_edge, gross_fee, expected_fee
+
+
+def entry_edge_gate_reason(
+    model_edge: float,
+    net_model_edge: float,
+    gates: GateConfig,
+) -> Optional[str]:
+    if not math.isfinite(model_edge) or not math.isfinite(net_model_edge):
+        return "model_edge_invalid"
+    if model_edge < gates.min_model_edge:
+        return f"model_edge_low:{model_edge:+.4f}<{gates.min_model_edge:+.4f}"
+    if net_model_edge < gates.min_net_model_edge:
+        return f"net_model_edge_low:{net_model_edge:+.4f}<{gates.min_net_model_edge:+.4f}"
+    return None
+
+
 def try_entry(
     legs_by_asset: dict[str, MarketLeg],
     stats: RollingStats,
@@ -1545,6 +1602,9 @@ def try_entry(
     quad = estimate_combo_quadrants(fair_a, fair_b, cost, rho)
     normal_prob = quad.win_lose + quad.lose_win
     bad_to_normal = quad.lose_lose / max(normal_prob, 1e-9)
+    net_model_edge, entry_fee_per_share, expected_fee_per_share = fee_adjusted_model_edge(
+        quad.model_edge, sig.price_a, sig.price_b, gates,
+    )
     diag.update({
         "fair_a": fair_a,
         "fair_b": fair_b,
@@ -1555,9 +1615,16 @@ def try_entry(
         "quad_model_edge": quad.model_edge,
         "quad_event_corr": quad.event_corr,
         "bad_to_normal": bad_to_normal,
+        "entry_fee_per_share": entry_fee_per_share,
+        "expected_fee_per_share": expected_fee_per_share,
+        "entry_fee_per_combo": entry_fee_per_share * gates.combo_qty,
+        "expected_fee_per_combo": expected_fee_per_share * gates.combo_qty,
+        "entry_edge_reserve": gates.entry_edge_reserve,
+        "net_model_edge": net_model_edge,
     })
-    if quad.model_edge < gates.min_model_edge:
-        diag["reason"] = f"model_edge_low:{quad.model_edge:+.4f}<{gates.min_model_edge:+.4f}"
+    edge_reject_reason = entry_edge_gate_reason(quad.model_edge, net_model_edge, gates)
+    if edge_reject_reason is not None:
+        diag["reason"] = edge_reject_reason
         return None, diag
     if quad.lose_lose > gates.max_bad_quad_prob:
         diag["reason"] = f"bad_quad_high:{quad.lose_lose:.3f}>{gates.max_bad_quad_prob:.3f}"
@@ -1873,6 +1940,12 @@ async def strategy_loop(
                             "quad_lose_lose": diag.get("quad_lose_lose"),
                             "quad_model_edge": diag.get("quad_model_edge"),
                             "bad_to_normal": diag.get("bad_to_normal"),
+                            "entry_fee_per_share": diag.get("entry_fee_per_share"),
+                            "expected_fee_per_share": diag.get("expected_fee_per_share"),
+                            "entry_fee_per_combo": diag.get("entry_fee_per_combo"),
+                            "expected_fee_per_combo": diag.get("expected_fee_per_combo"),
+                            "entry_edge_reserve": diag.get("entry_edge_reserve"),
+                            "net_model_edge": diag.get("net_model_edge"),
                             "is_hedge": False,
                             "combos_open": len(combos), "total_cost": round(total_cost, 4),
                         })
@@ -1886,6 +1959,9 @@ async def strategy_loop(
                                 "imbalance": imbalance,
                                 "execution": "live" if live_executor else "shadow",
                                 "gap": sig.gap, "rho": sig.correlation,
+                                "model_edge": diag.get("quad_model_edge"),
+                                "net_model_edge": diag.get("net_model_edge"),
+                                "expected_fee_per_combo": diag.get("expected_fee_per_combo"),
                             })
                         if gates.enable_tail_hedge:
                             rev = evaluate_reverse_box(ba, na, eya, ena, sig.direction)
@@ -2378,17 +2454,23 @@ def _format_event(kind: str, data: dict) -> str:
                 f"imb={data.get('imbalance', 0.0):.2f}"
             )
         exec_line = f"  exec={data.get('execution', 'shadow')}"
+        edge_line = ""
+        if data.get("model_edge") is not None and data.get("net_model_edge") is not None:
+            edge_line = (
+                f"\n  edge raw={data['model_edge']:+.3f} net={data['net_model_edge']:+.3f} "
+                f"fee~${data.get('expected_fee_per_combo', 0.0):.3f}"
+            )
         return (f"ENTRY R{data['round']} c{data['combo_id']} tte={data['tte']}s\n"
                 f"  {data['leg_a']} @ {data['price_a']:.3f}\n"
                 f"  {data['leg_b']} @ {data['price_b']:.3f}\n"
                 f"{qty_line}  gap={data['gap']:+.4f}  rho={data['correlation']:.2f}\n"
-                f"{exec_line}"
+                f"{exec_line}{edge_line}"
                 if 'correlation' in data else
                 f"ENTRY R{data['round']} c{data['combo_id']} tte={data['tte']}s\n"
                 f"  {data['leg_a']} @ {data['price_a']:.3f}\n"
                 f"  {data['leg_b']} @ {data['price_b']:.3f}\n"
                 f"{qty_line}  gap={data['gap']:+.4f}  rho={data['rho']:.2f}\n"
-                f"{exec_line}")
+                f"{exec_line}{edge_line}")
     if kind == "flip":
         return (f"FLIP R{data['round']} c{data['combo_id']} tte={data['tte']}s\n"
                 f"  reason: {data['reason']}\n"
@@ -2523,6 +2605,11 @@ async def main_async(rounds: int, start_mode: str, gates: GateConfig) -> None:
     live_executor: Optional[PolymarketLiveExecutor] = None
     execution_note = "shadow"
     print(f"[BOOT] DRY_RUN={dry_run}  rounds={rounds}  start_mode={start_mode}")
+    print(
+        f"[BOOT] entry_edge raw>={gates.min_model_edge:.3f} "
+        f"net>={gates.min_net_model_edge:.3f} fee={gates.taker_fee_rate:.3f} "
+        f"rebate={gates.taker_rebate_rate:.0%} reserve={gates.entry_edge_reserve:.3f}"
+    )
     if not dry_run:
         cfg = LiveExecutionConfig.from_env()
         live_executor = PolymarketLiveExecutor(cfg)
@@ -2545,7 +2632,12 @@ async def main_async(rounds: int, start_mode: str, gates: GateConfig) -> None:
                           f"tol={gates.leg_mismatch_tolerance_shares:.2f}\n"
                           f"time=UTC+8 weekend_rest={'on' if gates.weekend_rest_enabled else 'off'} "
                           f"us_hours_min_leg={gates.us_stock_hours_min_leg_price:.2f}\n"
-                          f"EV>={gates.min_model_edge:+.3f} bad<={gates.max_bad_quad_prob:.2f}\n"
+                          f"raw_EV>={gates.min_model_edge:+.3f} "
+                          f"net_EV>={gates.min_net_model_edge:+.3f} "
+                          f"fee={gates.taker_fee_rate:.3f} rebate={gates.taker_rebate_rate:.0%} "
+                          f"reserve={gates.entry_edge_reserve:.3f}\n"
+                          f"bad<={gates.max_bad_quad_prob:.2f} "
+                          f"bad/norm<={gates.max_bad_to_normal_ratio:.2f}\n"
                           f"Q4 asym dead={gates.q4_dead_loss_gap_mult:.1f}x gap "
                           f"fav_worse={gates.q4_fav_worsen_bp:.1f}bp\n"
                           f"chase={gates.exec_chase_slippage_ticks}x{gates.exec_max_chase_attempts} "
@@ -2677,7 +2769,11 @@ def main() -> None:
         weekend_rest_enabled=_envb("CORR_WEEKEND_REST_ENABLED", True),
         us_stock_hours_filter_enabled=_envb("CORR_US_STOCK_HOURS_FILTER_ENABLED", True),
         us_stock_hours_min_leg_price=_envf("CORR_US_STOCK_HOURS_MIN_LEG_PRICE", 0.70),
-        min_model_edge=_envf("CORR_MIN_MODEL_EDGE", 0.01),
+        min_model_edge=_envf("CORR_MIN_MODEL_EDGE", 0.05),
+        taker_fee_rate=_envf("CORR_TAKER_FEE_RATE", 0.07),
+        taker_rebate_rate=_envf("CORR_TAKER_REBATE_RATE", 0.30),
+        entry_edge_reserve=_envf("CORR_ENTRY_EDGE_RESERVE", 0.01),
+        min_net_model_edge=_envf("CORR_MIN_NET_MODEL_EDGE", 0.02),
         max_bad_quad_prob=_envf("CORR_MAX_BAD_QUAD_PROB", 0.22),
         max_bad_to_normal_ratio=_envf("CORR_MAX_BAD_TO_NORMAL_RATIO", 0.38),
         entry_asym_mid_hi=_envf("CORR_ENTRY_ASYM_MID_HI", 0.60),

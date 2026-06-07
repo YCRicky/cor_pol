@@ -38,9 +38,13 @@ and returns its `gap = 1.0 - (price_a + price_b)`. We enter when:
 - `tte` between 60s and 270s -- excludes the noisy first minute and the
   oracle-manipulation prone final ~30s.
 - `min_book_size (5)` on both legs -- avoids dead books.
-- `fair_a + fair_b - cost >= min_model_edge (0.01)` -- gap alone only says
-  the same-direction quadrants can break even; entry also needs positive
+- `fair_a + fair_b - cost >= min_model_edge (0.05)` -- gap alone only says
+  the same-direction quadrants can break even; entry also needs meaningful
   spot-model edge.
+- `net_model_edge >= 0.02`, where net edge subtracts the expected two-leg
+  Polymarket crypto taker fee after configured account rebate plus a `0.01`
+  per-share execution reserve. This rejects low-margin entries whose apparent
+  edge is likely to be consumed by fees and ordinary execution noise.
 - `P(lose, lose) <= max_bad_quad_prob (0.22)` and
   `P(lose, lose) / P(one-win-one-lose) <= 0.38` -- bounds the bad diagonal.
 - `max_combos_per_round = 3` and `max_cost_per_round_usd = 15` -- cap

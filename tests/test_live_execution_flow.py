@@ -13,10 +13,14 @@ from src.lab.correlation_arb_bot import (
     MarketLeg,
     RunLedger,
     UserOrderFeed,
+    _format_event,
     combo_exit_reason,
     confirm_live_result,
+    crypto_taker_fee_per_share,
+    entry_edge_gate_reason,
     execute_buy_pair,
     execution_unknown,
+    fee_adjusted_model_edge,
     flatten_entry_exposure,
     is_us_stock_hours_utc8,
     is_weekend_rest_utc8,
@@ -201,14 +205,80 @@ def _ts_utc8(year: int, month: int, day: int, hour: int, minute: int = 0) -> flo
 
 
 class LiveExecutionFlowTests(unittest.TestCase):
-    def test_restored_strategy_defaults_remain_unchanged(self):
+    def test_live_strategy_defaults_use_fee_adjusted_edge_gate(self):
         gates = GateConfig()
         self.assertEqual(gates.max_combos_per_round, 3)
         self.assertTrue(gates.weekend_rest_enabled)
         self.assertTrue(gates.us_stock_hours_filter_enabled)
-        self.assertEqual(gates.min_model_edge, 0.01)
+        self.assertEqual(gates.min_model_edge, 0.05)
+        self.assertEqual(gates.taker_fee_rate, 0.07)
+        self.assertEqual(gates.taker_rebate_rate, 0.30)
+        self.assertEqual(gates.entry_edge_reserve, 0.01)
+        self.assertEqual(gates.min_net_model_edge, 0.02)
         self.assertEqual(gates.max_bad_quad_prob, 0.22)
         self.assertEqual(gates.max_bad_to_normal_ratio, 0.38)
+
+    def test_crypto_taker_fee_matches_polymarket_formula(self):
+        self.assertAlmostEqual(crypto_taker_fee_per_share(0.50, 0.07), 0.0175)
+        self.assertAlmostEqual(crypto_taker_fee_per_share(0.30, 0.07), 0.0147)
+        self.assertAlmostEqual(crypto_taker_fee_per_share(0.70, 0.07), 0.0147)
+
+    def test_fee_adjusted_model_edge_subtracts_rebate_and_reserve(self):
+        gates = GateConfig(
+            taker_fee_rate=0.07,
+            taker_rebate_rate=0.30,
+            entry_edge_reserve=0.01,
+        )
+        net_edge, gross_fee, expected_fee = fee_adjusted_model_edge(
+            0.06, 0.70, 0.20, gates,
+        )
+        self.assertAlmostEqual(gross_fee, 0.0259)
+        self.assertAlmostEqual(expected_fee, 0.01813)
+        self.assertAlmostEqual(net_edge, 0.03187)
+
+    def test_fee_adjusted_model_edge_clamps_invalid_rebate(self):
+        net_edge, gross_fee, expected_fee = fee_adjusted_model_edge(
+            0.06,
+            0.50,
+            0.50,
+            GateConfig(taker_rebate_rate=5.0, entry_edge_reserve=0.01),
+        )
+        self.assertAlmostEqual(gross_fee, 0.035)
+        self.assertEqual(expected_fee, 0.0)
+        self.assertAlmostEqual(net_edge, 0.05)
+
+    def test_entry_edge_gate_requires_both_raw_and_net_edge(self):
+        gates = GateConfig(min_model_edge=0.05, min_net_model_edge=0.02)
+        self.assertTrue(entry_edge_gate_reason(0.049, 0.03, gates).startswith("model_edge_low"))
+        self.assertTrue(entry_edge_gate_reason(0.06, 0.019, gates).startswith("net_model_edge_low"))
+        self.assertEqual(entry_edge_gate_reason(float("nan"), 0.03, gates), "model_edge_invalid")
+        self.assertIsNone(entry_edge_gate_reason(0.06, 0.03, gates))
+
+    def test_invalid_fee_config_hard_rejects_entry_edge(self):
+        gates = GateConfig(taker_fee_rate=float("nan"))
+        net_edge, _, _ = fee_adjusted_model_edge(0.10, 0.70, 0.20, gates)
+        self.assertEqual(entry_edge_gate_reason(0.10, net_edge, gates), "model_edge_invalid")
+
+    def test_entry_notification_includes_raw_net_edge_and_fee(self):
+        message = _format_event("entry", {
+            "round": 1,
+            "combo_id": 1,
+            "tte": 120,
+            "leg_a": "BTC_YES",
+            "price_a": 0.70,
+            "leg_b": "ETH_NO",
+            "price_b": 0.20,
+            "qty_a": 5.0,
+            "qty_b": 5.0,
+            "imbalance": 0.0,
+            "gap": 0.10,
+            "rho": 0.80,
+            "execution": "live",
+            "model_edge": 0.06,
+            "net_model_edge": 0.03187,
+            "expected_fee_per_combo": 0.09065,
+        })
+        self.assertIn("edge raw=+0.060 net=+0.032 fee~$0.091", message)
 
     def test_post_ack_no_fill_is_not_unknown(self):
         result = ExecutionLegResult(
