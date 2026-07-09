@@ -61,6 +61,14 @@ data/empjp_e75_n30_c1_l1_calibration.json
 
 The runtime does **not** need pandas or the research panel.
 
+Dedicated strategy note:
+
+```text
+docs/empjp_strategy_brief.md
+```
+
+It covers the strategy origin, why we moved away from BTC/ETH correlation arb, alpha definition, calibration, replay performance, and live-readiness caveats.
+
 ## Run locally
 
 ```bash
