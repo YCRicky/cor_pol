@@ -1,91 +1,105 @@
 # cor_pol
 
-BTC/ETH 5-minute Polymarket correlation-arbitrage bot.
+BTC 5-minute Polymarket EMPJP live/shadow bot.
 
-The bot discovers each new pair of `btc-updown-5m-<ts>` / `eth-updown-5m-<ts>`
-markets, subscribes to the Polymarket CLOB books over websocket, and on each
-tick re-evaluates the four-leg "box":
+This build replaces the previous BTC/ETH correlation-arb strategy with the
+current production candidate:
 
+```text
+empjp_e75_n30_c1_l1
 ```
-BTC_YES + ETH_NO     vs     BTC_NO + ETH_YES
+
+Meaning:
+
+- `empjp`: empirical joint probability surface
+- `e75`: fee-adjusted edge threshold `7.5%`
+- `n30`: calibration cell needs at least 30 historical samples
+- `c1`: confirm for 1 second after signal
+- `l1`: wait 1 additional second before entry
+
+The strategy trades only the BTC 5-minute up/down market. It estimates:
+
+```text
+P(final_up | tte, z_resid, path_dir)
 ```
 
-When the two-leg cost gap exceeds a calibrated threshold and the rolling
-BTC/ETH correlation is strong, the bot opens the cheaper opposite diagonal and
-tracks each leg with the live order book. PnL is settled against the PM/UMA
-outcome reported by the Gamma API.
+and buys either YES or NO when empirical probability minus current executable ask
+and expected taker fee exceeds the configured edge threshold. It buys a fixed
+share quantity and holds to PM/UMA settlement.
 
-Default mode is `DRY_RUN=true`, which logs intent and computes simulated fills
-against the live book. `DRY_RUN=false` enables live CLOB execution through
-`py-clob-client-v2` using pUSD CLOB credentials. The funding wallet mode is
-configured by `CLOB_SIGNATURE_TYPE` and `CLOB_FUNDER_ADDRESS`.
+Default mode is still safe:
 
-## Strategy (four-quadrant PM kill + asym 0.60 + fav_bp >= -4.0)
+```text
+DRY_RUN=true
+```
 
-| Component | Setting | Purpose |
-|---|---|---|
-| Entry: asymmetric mid | `max(mid_a, mid_b) >= 0.60` AND `min(mid_a, mid_b) <= 0.40` | Skip coin-flip entries that historically blow up in Q4 |
-| Entry: min favorable bp | `min(fav_bp_a, fav_bp_b) >= -4.0 bp` | Skip entries where either leg is already underwater vs its strike |
-| Entry: fee-adjusted EV | raw model edge `>= 0.05` and net edge after expected fee/rebate/reserve `>= 0.02` | Reject low-margin trades likely to be consumed by taker fees and execution noise |
-| Entry: quadrant tail diagnostic | `P(lose,lose) <= 0.22`, bad/normal `<= 0.38` | Retain the original broad tail guard without trusting the uncalibrated quadrant model too aggressively |
-| Sizing: round cap | `max_combos_per_round = 3`, `max_cost_per_round_usd = 15` | Entry-only cap. Defensive Q4/imbalance reverse buys bypass it so stops cannot be blocked |
-| Execution | marketable GTC share-limit then immediate cancel, 5 shares per leg, 1-share mismatch tolerance | Targets shares exactly and avoids infinite retries on tiny residual fills |
-| Defense: asymmetric Q4 kill | If one executable leg loss exceeds `2 * entry_gap`, the other leg is also below entry, and both legs' `fav_bp` worsened vs entry, buy both opposite asks | Cut the true `(lose, lose)` path while leaving `(win, win)`, `(win, lose)`, and `(lose, win)` alive |
-| PnL settlement | PM/UMA outcome via Gamma API | No Binance fallback -- avoids divergence rounds |
+`DRY_RUN=false` enables live CLOB execution through the existing
+`py-clob-client-v2` wrapper. The live order path is preserved from the old system:
+marketable GTC share-limit order, immediate cancel of the remainder, raw response
+logging, optional user websocket telemetry, and Gamma/UMA settlement accounting.
 
-See [docs/strategy.md](docs/strategy.md) for the full math, the backtest
-record, and the OOS validation that locked these parameters in.
-See [docs/live_trading.md](docs/live_trading.md) for the live execution runbook.
+## Strategy defaults
+
+| Component | Default |
+|---|---:|
+| Market | BTC 5m only |
+| Quantity | `EMPJP_QTY=5` shares |
+| Edge | `EMPJP_EDGE_MIN=0.075` |
+| Min cell count | `EMPJP_MIN_CELL_N=30` |
+| Confirm / latency | `EMPJP_CONFIRM_S=1`, `EMPJP_LATENCY_S=1` |
+| Entry window | `45s <= elapsed <= 255s`, `45s <= tte <= 240s` |
+| Price band | `0.18 <= ask <= 0.82` |
+| Max spread | `0.05` |
+| Min depth | `5` shares |
+| Weekend rest | `EMPJP_WEEKEND_REST_ENABLED=false` by default |
+
+Calibration is frozen in:
+
+```text
+data/empjp_e75_n30_c1_l1_calibration.json
+```
+
+The runtime does **not** need pandas or the research panel.
 
 ## Run locally
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env  # then edit TG_BOT_TOKEN / TG_CHAT_ID if you want TG
-python main.py
+cp .env.example .env
+python main.py --rounds 1 --start-mode current
 ```
 
-The bot will wait for the next 5-minute boundary and start round 1.
-Per-round JSONL is written to `out/lab_corr_arb_round<N>_<ts>.jsonl`.
+For live execution, fill the CLOB credentials in `.env` and set:
 
-## Deploy on EC2
-
-Use systemd on an Ubuntu EC2 instance. The service reads `/etc/cor-pol.env`,
-runs from `/opt/cor_pol`, restarts on failure, and writes stdout/stderr to
-journald. See [docs/ec2_deploy.md](docs/ec2_deploy.md).
+```text
+DRY_RUN=false
+```
 
 ## Telegram notifications
 
-When `TG_BOT_TOKEN` and `TG_CHAT_ID` are set, the bot pings on:
+When `TG_BOT_TOKEN` and `TG_CHAT_ID` are set, the bot sends:
 
-- **Boot** -- run-level config summary.
-- **ENTRY** -- every combo fill (round, leg prices, leg quantities, gap, rho).
-- **FLIP** -- every fourth-quadrant PM kill (reason, entry/flip prices).
-- **SETTLE** -- every round resolution after the PM/UMA outcome is read
-  (combos, cost, gross, flip PnL, cumulative PnL, divergence flag).
-- **Run done** -- final summary when the rounds loop exits.
+- boot summary,
+- ENTRY fill result,
+- SETTLE result after Gamma/UMA resolution,
+- skip/no-trade diagnostics.
 
 ## Directory layout
 
-```
-main.py                          # entrypoint, adds src/ to sys.path and calls the bot
-requirements.txt                 # runtime deps, including py_clob_client_v2 for live CLOB
-deploy/                          # systemd and logrotate examples for EC2
-.env.example                     # all CORR_* / TG_* settings, documented
-src/
-  common.py                      # Gamma API + 5m market discovery helpers
-  execution.py                   # live CLOB execution wrapper and fill parsing
-  notifier.py                    # TelegramNotifier (HTTP)
-  lab/
-    correlation_arb_bot.py       # main bot: WS consumer, strategy loop, resolver
-    correlation_arb_core.py      # math: fair_up, quadrant estimates, signals, gap stats
-docs/
-  strategy.md                    # strategy spec, backtest table, parameter rationale
+```text
+main.py                         # entrypoint; now calls lab.empjp_live_bot
+requirements.txt                # runtime deps; no pandas required
+src/common.py                   # Gamma/Binance helpers and market discovery
+src/execution.py                # preserved live CLOB execution wrapper
+src/notifier.py                 # Telegram notifier
+src/lab/empjp_core.py           # pure EMPJP probability/signal logic
+src/lab/empjp_live_bot.py       # BTC 5m live/shadow runtime
+data/empjp_e75_n30_c1_l1_calibration.json
 ```
 
-## What is *not* in this build
+## What changed from the old system
 
-- No maker quoting. Live mode uses aggressive share-sized GTC orders and
-  immediately cancels unfilled remainders.
-- No tail-hedge, no Layer-4 spot kill -- fourth-quadrant control is handled by PM marks.
-- No research scripts. Backtest tooling lives in the prior `taker_pol` repo.
+- Removed BTC/ETH pair-box entry as the active runtime path.
+- Preserved execution, fill parsing, order-cancel/reconcile, and notification infrastructure.
+- Replaced strategy with BTC-only EMPJP probability surface and hold-to-settlement accounting.
+- Live BUYs remain aggressive share-sized GTC IOC-style orders, not dollar-sized market orders.

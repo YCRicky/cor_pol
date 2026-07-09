@@ -1,176 +1,129 @@
-# Strategy spec: four-quadrant PM kill + asym 0.60 + fav_bp >= -4.0
+# Strategy spec: `empjp_e75_n30_c1_l1`
 
-This is the cleaned-up correlation-arb strategy. The bot treats each opened
-combo as a four-quadrant option package and focuses risk control on the only
-path that matters: both legs losing at the same time.
+This repository now runs the BTC-only empirical joint probability strategy that
+was selected from the PM5M replay research.
 
-## 1. What we trade
+## 1. What it trades
 
-Polymarket exposes back-to-back 5-minute markets on whether BTC or ETH will
-end the window above its opening price:
+The bot trades the BTC 5-minute Polymarket up/down market:
 
-```
-btc-updown-5m-<unix_ts>   -> YES = "BTC up", NO = "BTC down"
-eth-updown-5m-<unix_ts>   -> YES = "ETH up", NO = "ETH down"
+```text
+btc-updown-5m-<unix_ts>
 ```
 
-Combined, the four binary outcomes form four directional "boxes":
+It buys exactly one side per round at most:
 
-| Direction | Leg A | Leg B |
-|---|---|---|
-| `BTC_YES_ETH_YES` | BTC_YES | ETH_YES |
-| `BTC_YES_ETH_NO`  | BTC_YES | ETH_NO  |
-| `BTC_NO_ETH_YES`  | BTC_NO  | ETH_YES |
-| `BTC_NO_ETH_NO`   | BTC_NO  | ETH_NO  |
-
-Each combo costs `price_a + price_b` and pays `payoff_a + payoff_b` where
-each `payoff_x in {0, 1}` from the PM/UMA outcome.
-
-## 2. Entry signal: cheap diagonal
-
-`evaluate_arb_box` selects the **cheapest** of the four directional combos
-and returns its `gap = 1.0 - (price_a + price_b)`. We enter when:
-
-- `rolling_corr(btc_returns, eth_returns) >= 0.65` -- the BTC/ETH co-movement
-  hypothesis is alive.
-- `min_gap (0.04) <= gap <= max_gap (0.22)` -- enough edge to cover fees but
-  not so much that the book is obviously broken.
-- `tte` between 60s and 270s -- excludes the noisy first minute and the
-  oracle-manipulation prone final ~30s.
-- `min_book_size (5)` on both legs -- avoids dead books.
-- `fair_a + fair_b - cost >= min_model_edge (0.05)` -- gap alone only says
-  the same-direction quadrants can break even; entry also needs meaningful
-  spot-model edge.
-- `net_model_edge >= 0.02`, where net edge subtracts the expected two-leg
-  Polymarket crypto taker fee after configured account rebate plus a `0.01`
-  per-share execution reserve. This rejects low-margin entries whose apparent
-  edge is likely to be consumed by fees and ordinary execution noise.
-- `P(lose, lose) <= max_bad_quad_prob (0.22)` and
-  `P(lose, lose) / P(one-win-one-lose) <= 0.38` -- bounds the bad diagonal.
-- `max_combos_per_round = 3` and `max_cost_per_round_usd = 15` -- cap
-  repeated entries in the same 5-minute window only. Defensive reverse buys
-  for entry imbalance and Q4 stop-loss bypass these caps, so stops cannot be
-  blocked by entry sizing limits. The 95-round live dry-run
-  showed combo #2/#3 carried the marginal alpha while combo #4/#5 were
-  negative expectancy.
-
-## 3. Finalized entry filter
-
-Forensic on Run #2/#84 showed that ~30% of entries were "Q4 coin-flips"
-(both legs near 0.50, no directional bias) and accounted for nearly all
-catastrophic combo losses. Two additional gates were added:
-
-### 3.1 Asymmetric mid
-
-Let `mid_x = 1.0 - opp_x_ask`, i.e. the PM-implied probability of the leg
-we're long. Require:
-
-```
-max(mid_a, mid_b) >= 0.60   AND   min(mid_a, mid_b) <= 0.40
+```text
+YES = BTC settles above round open
+NO  = BTC settles below round open
 ```
 
-Rejected with reason `entry_coinflip:mid=A/B need hi>=0.60 lo<=0.40`.
+Default size is `5` shares and the position is held until PM/UMA settlement.
 
-### 3.2 Minimum favorable bp
+## 2. Alpha
 
-For each leg, compute the basis-point move of the underlying *in the
-direction the leg wants*:
+The strategy estimates the empirical conditional probability:
 
-```
-bp_x   = (last_spot_x / open_px_x - 1) * 1e4
-fav_bp_x = +bp_x if side_x == "YES" else -bp_x
+```text
+P(final_up | tte, z_resid, path_dir)
 ```
 
-Require `min(fav_bp_a, fav_bp_b) >= -4.0`. Rejected with reason
-`leg_underwater:fav_bp=A/B need>=-4.0`.
+where:
 
-## 4. Defense: asymmetric fourth-quadrant kill
+- `tte`: seconds to expiry,
+- `z_resid`: current BTC basis-point move normalized by rolling BTC sigma and
+  remaining time,
+- `path_dir`: whether the path so far is `up_dominant`, `down_dominant`, or
+  `balanced`.
 
-Once a combo is open, on every tick we recompute:
+It compares the empirical probability to the executable PM ask:
 
-- `exec_mark_x = 1 - opp_x_ask` -- executable mark for the long leg. If we hold
-  YES, buying NO at the ask locks $1 at settlement, so YES is worth
-  `1 - NO_ask` for stop-loss purposes.
-- `loss_x = entry_x - exec_mark_x` -- per-share executable loss.
-- `entry_gap = 1 - entry_a - entry_b` -- the original edge/safety cushion.
-- `fav_bp_x` from spot vs strike in the direction the leg wants, both at entry
-  and at the current tick.
-
-We kill **both** legs immediately when a true asymmetric fourth quadrant forms:
-
-```
-max(loss_a, loss_b) >= 2.0 * entry_gap
-min(loss_a, loss_b) > 0
-current_fav_bp_a < 0
-current_fav_bp_b < 0
-current_fav_bp_a <= entry_fav_bp_a - 1.0
-current_fav_bp_b <= entry_fav_bp_b - 1.0
+```text
+YES edge = emp_up - yes_ask - fee(yes_ask)
+NO  edge = (1 - emp_up) - no_ask - fee(no_ask)
 ```
 
-The rule is deliberately asymmetric: one leg can be clearly dead while the
-other has only just crossed below entry. Requiring both `fav_bp` values to
-worsen relative to entry prevents cutting a normal one-win-one-lose path just
-because the PM book briefly widens. In dry-run the exits are simulated at the
-opposite-side asks; in live mode they are sent through the same aggressive FAK
-execution wrapper as entries.
+The bot takes the side with the larger edge if all gates pass.
 
-## 5. PnL accounting
+## 3. Production policy
 
-Resolution uses the PM/UMA outcome **only** -- the Gamma API is polled per
-slug for up to `CORR_PM_RESOLUTION_WAIT_S` (default 1200s). For each combo:
-
-```
-gross   = payoff_a * qty_a + payoff_b * qty_b
-cost    = price_a * qty_a + price_b * qty_b
-flip_a  = (payoff(opp_a) - flip_price_a) * flip_qty_a
-flip_b  = (payoff(opp_b) - flip_price_b) * flip_qty_b
-pnl     = gross - cost + flip_a + flip_b
+```text
+empjp_e75_n30_c1_l1
 ```
 
-Binance close-prices are still recorded as `binance_btc_up` /
-`binance_eth_up` for divergence tracking, but they do **not** drive PnL.
-Rounds where PM and Binance disagree are flagged `divergence: true` in the
-`round_end` event and in the SETTLE Telegram notification.
+| Part | Meaning |
+|---|---|
+| `empjp` | empirical joint probability |
+| `e75` | minimum edge `0.075` |
+| `n30` | cell must contain at least 30 samples |
+| `c1` | 1 second confirmation |
+| `l1` | 1 second additional latency before entry |
 
-## 6. Live dry-run sizing check
+Default filters:
 
-The 95-round PM-settled dry-run showed total PnL of `+$9.60` across 117
-combos, but the marginal combo count was uneven:
+```text
+45s <= elapsed <= 255s
+45s <= tte <= 240s
+0.18 <= entry ask <= 0.82
+spread <= 0.05
+book depth >= 5 shares
+```
 
-| Cap | Combos | PnL | ROI on Cost | Q4 Combos |
-|---:|---:|---:|---:|---:|
-| 1 | 48 | +$4.55 | +2.05% | 5 |
-| 2 | 75 | +$12.75 | +3.67% | 7 |
-| 3 | 95 | **+$16.35** | **+3.72%** | 9 |
-| 4 | 108 | +$10.75 | +2.15% | 11 |
-| 5 | 117 | +$9.60 | +1.78% | 12 |
+## 4. Calibration
 
-By combo index, #1/#2/#3 were positive while #4/#5 were negative. The default
-round cap is therefore fixed at 3 combos.
+The frozen calibration is committed as:
 
-## 7. Backtest summary (2-run OOS)
+```text
+data/empjp_e75_n30_c1_l1_calibration.json
+```
 
-Source: `taker_pol/scripts/oos_validate.py` against Run #2 + Run #84.
+It maps:
 
-| Metric | Run #2 | Run #84 | Combined |
-|---|---:|---:|---:|
-| Rounds with entries | 23 | 58 | 81 |
-| Simulated combos | 16 | 59 | 75 |
-| Total PnL | +$6.40 | +$8.55 | **+$14.95** |
-| Per-round PnL | +$0.28 | +$0.15 | +$0.18 |
-| Per-combo PnL | +$0.40 | +$0.14 | +$0.20 |
+```text
+(tte_bin, z_bin, path_dir) -> {cell_n, emp_up}
+```
 
-vs. the un-filtered baseline (which lost ~$95 across the same 110 rounds),
-the old filter stack improved expected per-round PnL by ~$1.04, but this
-build should be revalidated because the defense has been replaced with the
-asymmetric fourth-quadrant kill.
+Runtime loads this JSON directly. It does not need the research dataframe or
+pandas.
 
-Caveats:
-- 81 rounds is a small sample; absolute monthly EV needs live validation.
-- ~30% of legacy entries are filtered out, so trade frequency is roughly
-  one-third of the baseline.
-- Rounds with PM/Binance divergence (the R53-type DIV cases) remain
-  unhedged and cost ~$20 per occurrence when they hit.
+## 5. Live execution
 
-This EC2 deployment is the long dry-run that will give us the real
-per-day, per-week, per-month numbers.
+Live execution reuses the previous system's order layer:
+
+1. Build a BUY order with share size `EMPJP_QTY`.
+2. Use a marketable GTC limit: `best_ask + slippage_ticks * tick_size`.
+3. Submit through `py-clob-client-v2`.
+4. Immediately cancel unfilled remainder.
+5. Reconcile with CLOB `get_order`.
+6. Optional user websocket is telemetry only and does not block execution.
+
+This avoids Polymarket's dollar-sized BUY market-order semantics while keeping
+share sizing exact.
+
+## 6. Settlement accounting
+
+Realized PnL is computed from PM/UMA outcome via Gamma only:
+
+```text
+win = (pm_up >= 0.5) for YES, else (pm_up < 0.5)
+pnl = qty * win - qty * entry_price - entry_fee
+```
+
+Binance spot is used only for live state features and not for realized PnL.
+
+## 7. Weekend behavior
+
+Backtest split showed weekends were still profitable but lower quality:
+
+```text
+weekday: stress PnL +1035.6, PF 1.76, avg/trade +0.550
+weekend: stress PnL  +410.2, PF 1.36, avg/trade +0.310
+```
+
+Default therefore keeps weekends enabled:
+
+```text
+EMPJP_WEEKEND_REST_ENABLED=false
+```
+
+Set it to `true` only if you want weekday-only risk exposure.

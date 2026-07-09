@@ -28,7 +28,7 @@ for p in (str(ROOT), str(SRC)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from lab.correlation_arb_bot import main  # noqa: E402
+from lab.empjp_live_bot import main  # noqa: E402
 
 
 if __name__ == "__main__":
