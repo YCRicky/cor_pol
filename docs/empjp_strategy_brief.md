@@ -150,7 +150,14 @@ The live order path is intentionally conservative and reused from the hardened p
 8. If edge still passes, send a share-sized marketable GTC BUY.
 9. Immediately cancel any unfilled remainder.
 10. Reconcile fill from CLOB submit/cancel/get_order.
-11. Hold filled position to PM/UMA settlement.
+11. If confirmed fill is below target, chase the remaining quantity up to
+    `EMPJP_EXEC_MAX_CHASE_ATTEMPTS` times, rechecking live edge before each
+    chase order.
+12. Track any positive confirmed fill as an open position, even if the target
+    quantity was not fully reached.
+13. Never blindly retry an order with unknown CLOB state; emit an alert and
+    track only confirmed filled quantity.
+14. Hold filled position to PM/UMA settlement.
 
 The bot does not use Polymarket dollar-sized market BUY semantics. It uses a marketable limit to preserve share sizing.
 

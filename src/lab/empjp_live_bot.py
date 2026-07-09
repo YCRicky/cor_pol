@@ -16,7 +16,12 @@ for p in (str(ROOT), str(SRC)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from execution import LiveExecutionConfig, PolymarketLiveExecutor, ExecutionLegResult  # noqa: E402
+from execution import (  # noqa: E402
+    ExecutionLegResult,
+    LiveExecutionConfig,
+    PolymarketLiveExecutor,
+    merge_execution_results,
+)
 from lab.correlation_arb_bot import (  # noqa: E402
     GateConfig,
     MarketLeg,
@@ -28,6 +33,8 @@ from lab.correlation_arb_bot import (  # noqa: E402
     _log,
     discover_leg,
     execute_buy_leg,
+    execution_unknown,
+    execution_unknown_reason,
     fetch_pm_payoff,
     is_weekend_rest_utc8,
     utc8_now,
@@ -78,6 +85,16 @@ class EmpJPTrade:
     order_id: str = ""
     execution_status: str = ""
     execution_error: str = ""
+
+
+@dataclass
+class EmpJPEntryExecution:
+    result: ExecutionLegResult
+    events: list[dict]
+    target_ok: bool
+    trackable: bool
+    reason: str
+    unknown_reason: str = ""
 
 
 @dataclass
@@ -134,8 +151,17 @@ def _format_event(kind: str, data: dict) -> str:
             f"R{data['round']} {data['side']} qty={data['qty']:.2f} @ {data['entry_price']:.4f}\n"
             f"t+{data['entry_elapsed_s']}s tte={data['tte']:.0f}s bp={data['current_bp']:+.2f}\n"
             f"p_side={data['side_prob']:.3f} edge={data['edge']:+.4f} cell_n={data['cell_n']}\n"
-            f"fill={data['filled_qty']:.2f} avg={data['avg_price']:.4f} exec={data['execution']} err={data.get('error','')}\n"
+            f"fill={data['filled_qty']:.2f} target_ok={data.get('target_ok', True)} "
+            f"avg={data['avg_price']:.4f} exec={data['execution']} err={data.get('error','')}\n"
             f"slug={data['slug']}"
+        )
+    if kind == "alert":
+        return (
+            "[EMPJP e75 n30 c1 l1] ALERT\n"
+            f"R{data.get('round')} reason={data.get('reason')}\n"
+            f"side={data.get('side','')} filled={data.get('filled_qty', 0.0):.2f} "
+            f"target={data.get('target_qty', 0.0):.2f} order_id={data.get('order_id','')}\n"
+            f"err={data.get('error','')}"
         )
     if kind == "settle":
         return (
@@ -180,6 +206,110 @@ async def poll_btc_spot(leg: MarketLeg, stop_at: float) -> None:
 
 def _entry_result_ok(res: ExecutionLegResult, min_qty: float) -> bool:
     return res.filled_qty >= max(0.0, min_qty) and res.avg_price > 0.0 and not (res.error or "").startswith("user_ws_")
+
+
+def _entry_result_trackable(res: ExecutionLegResult) -> bool:
+    return res.filled_qty > 0.0 and res.avg_price > 0.0
+
+
+def _entry_target_ok(res: ExecutionLegResult, target_qty: float, tolerance: float) -> bool:
+    min_qty = max(0.0, float(target_qty) - max(0.0, float(tolerance)))
+    return res.filled_qty >= min_qty and res.avg_price > 0.0
+
+
+def _entry_edge_from_ask(side_prob: float, ask_price: float, cfg: EmpJPConfig) -> float:
+    return float(side_prob) - float(ask_price) - cfg.effective_fee_rate * float(ask_price) * (1.0 - float(ask_price))
+
+
+async def execute_empjp_entry(
+    *,
+    leg: MarketLeg,
+    side: str,
+    target_qty: float,
+    side_prob: float,
+    cfg: EmpJPConfig,
+    exec_gates: GateConfig,
+    live_executor: Optional[PolymarketLiveExecutor],
+    order_feed: Optional[UserOrderFeed],
+) -> EmpJPEntryExecution:
+    label = f"BTC_{side}"
+    events: list[dict] = []
+
+    async def submit(phase: str, qty: float, slippage_ticks: int) -> ExecutionLegResult:
+        result = await execute_buy_leg(
+            legs_by_asset={"BTC": leg},
+            label=label,
+            qty=qty,
+            live_executor=live_executor,
+            slippage_ticks=slippage_ticks,
+            gates=exec_gates,
+            order_feed=order_feed,
+        )
+        events.append({
+            "phase": phase,
+            "side": side,
+            "target_qty": qty,
+            "slippage_ticks": slippage_ticks,
+            **asdict(result),
+        })
+        return result
+
+    result = await submit("initial", target_qty, exec_gates.exec_slippage_ticks)
+    unknown = execution_unknown(result)
+    if unknown:
+        reason = execution_unknown_reason(result) or "execution_unknown"
+        return EmpJPEntryExecution(
+            result=result,
+            events=events,
+            target_ok=False,
+            trackable=_entry_result_trackable(result),
+            reason=reason,
+            unknown_reason=reason,
+        )
+
+    tolerance = max(0.0, exec_gates.leg_mismatch_tolerance_shares)
+    if _entry_target_ok(result, target_qty, tolerance):
+        return EmpJPEntryExecution(result, events, True, True, "target_filled")
+
+    for attempt in range(1, max(0, exec_gates.exec_max_chase_attempts) + 1):
+        remaining = max(0.0, float(target_qty) - result.filled_qty)
+        if remaining <= tolerance:
+            break
+        ask = _book_for_side(leg, side).best_ask()
+        if ask is None:
+            events.append({"phase": f"chase_{attempt}_skip", "reason": "no_best_ask", "remaining_qty": remaining})
+            break
+        chase_edge = _entry_edge_from_ask(side_prob, float(ask[0]), cfg)
+        if chase_edge < cfg.edge_min:
+            events.append({
+                "phase": f"chase_{attempt}_skip",
+                "reason": "edge_decayed",
+                "remaining_qty": remaining,
+                "edge": chase_edge,
+                "ask": float(ask[0]),
+            })
+            break
+        slippage_ticks = max(0, exec_gates.exec_chase_slippage_ticks) * attempt
+        extra = await submit(f"chase_{attempt}", remaining, slippage_ticks)
+        if execution_unknown(extra):
+            if _entry_result_trackable(extra):
+                result = merge_execution_results(result, extra)
+            reason = execution_unknown_reason(extra) or "execution_unknown"
+            return EmpJPEntryExecution(
+                result=result,
+                events=events,
+                target_ok=_entry_target_ok(result, target_qty, tolerance),
+                trackable=_entry_result_trackable(result),
+                reason=reason,
+                unknown_reason=reason,
+            )
+        result = merge_execution_results(result, extra)
+        if _entry_target_ok(result, target_qty, tolerance):
+            return EmpJPEntryExecution(result, events, True, True, "target_filled_after_chase")
+
+    if _entry_result_trackable(result):
+        return EmpJPEntryExecution(result, events, False, True, "partial_tracked")
+    return EmpJPEntryExecution(result, events, False, False, result.error or "no_fill")
 
 
 async def strategy_loop(
@@ -266,20 +396,41 @@ async def strategy_loop(
                     _log(jsonl, {"kind": "entry_skip", "round": round_idx, "reason": "edge_decayed", "edge": entry_edge, "pending": asdict(pending), "live_reason": spr_reason})
                     pending = None
                     continue
-                label = f"BTC_{pending.side}"
-                res = await execute_buy_leg(
-                    legs_by_asset={"BTC": leg},
-                    label=label,
-                    qty=cfg.quantity,
+                execution = await execute_empjp_entry(
+                    leg=leg,
+                    side=pending.side,
+                    target_qty=cfg.quantity,
+                    side_prob=pending.side_prob,
+                    cfg=cfg,
+                    exec_gates=exec_gates,
                     live_executor=live_executor,
-                    slippage_ticks=exec_gates.exec_slippage_ticks,
-                    gates=exec_gates,
                     order_feed=order_feed,
                 )
-                min_qty = max(0.0, cfg.quantity - exec_gates.leg_mismatch_tolerance_shares)
-                ok = _entry_result_ok(res, min_qty)
-                _log(jsonl, {"kind": "entry_execution", "round": round_idx, "ok": ok, "result": asdict(res), "pending": asdict(pending), "entry_edge": entry_edge})
-                if not ok:
+                res = execution.result
+                for ev in execution.events:
+                    _log(jsonl, {"kind": "entry_order", "round": round_idx, **ev})
+                _log(jsonl, {
+                    "kind": "entry_execution",
+                    "round": round_idx,
+                    "target_ok": execution.target_ok,
+                    "trackable": execution.trackable,
+                    "reason": execution.reason,
+                    "unknown_reason": execution.unknown_reason,
+                    "result": asdict(res),
+                    "pending": asdict(pending),
+                    "entry_edge": entry_edge,
+                })
+                if execution.unknown_reason:
+                    notify("alert", {
+                        "round": round_idx,
+                        "reason": execution.unknown_reason,
+                        "side": pending.side,
+                        "filled_qty": res.filled_qty,
+                        "target_qty": cfg.quantity,
+                        "order_id": res.order_id,
+                        "error": res.error,
+                    })
+                if not execution.trackable:
                     pending = None
                     continue
                 trade = EmpJPTrade(
@@ -313,11 +464,12 @@ async def strategy_loop(
                     "side_prob": pending.side_prob,
                     "edge": entry_edge,
                     "cell_n": pending.cell_n,
+                    "target_ok": execution.target_ok,
                     "entry_elapsed_s": elapsed_s,
                     "tte": tte,
                     "current_bp": pending.signal_bp,
                     "execution": "live" if live_executor else "shadow",
-                    "error": res.error,
+                    "error": execution.reason if not execution.target_ok else res.error,
                 })
                 pending = None
         await asyncio.sleep(0.25 if tte <= 30 else 0.75)
@@ -513,7 +665,7 @@ def main() -> None:
         leg_mismatch_tolerance_shares=_envf("EMPJP_LEG_MISMATCH_TOLERANCE_SHARES", 0.5),
         exec_slippage_ticks=_envi("EMPJP_EXEC_SLIPPAGE_TICKS", _envi("CORR_EXEC_SLIPPAGE_TICKS", 2)),
         exec_chase_slippage_ticks=_envi("EMPJP_EXEC_CHASE_SLIPPAGE_TICKS", _envi("CORR_EXEC_CHASE_SLIPPAGE_TICKS", 1)),
-        exec_max_chase_attempts=_envi("EMPJP_EXEC_MAX_CHASE_ATTEMPTS", 0),
+        exec_max_chase_attempts=_envi("EMPJP_EXEC_MAX_CHASE_ATTEMPTS", 2),
         exec_user_ws_enabled=_envb("EMPJP_USER_WS_ENABLED", _envb("CORR_USER_WS_ENABLED", False)),
         exec_user_ws_confirm_timeout_s=_envf("EMPJP_USER_WS_CONFIRM_TIMEOUT_S", _envf("CORR_USER_WS_CONFIRM_TIMEOUT_S", 8.0)),
     )

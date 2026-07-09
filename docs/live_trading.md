@@ -90,8 +90,14 @@ EMPJP_WEEKEND_REST_ENABLED=false
    remainder.
 6. CLOB submit/cancel/get_order is the execution source of truth.
 7. Authenticated user websocket is optional telemetry only.
-8. Zero-fill or edge decay means no trade for that round.
-9. Filled positions are held to PM/UMA settlement.
+8. If the first order partially fills below the target, the bot can chase the
+   remaining quantity with `EMPJP_EXEC_MAX_CHASE_ATTEMPTS` additional
+   marketable share-limit orders, rechecking the live edge before each chase.
+9. Any positive fill is tracked as an open trade and settled from PM/UMA,
+   even if the target quantity was not fully reached.
+10. Unknown CLOB state is never blindly retried; it triggers an alert and only
+   the confirmed filled quantity, if any, is tracked.
+11. Filled positions are held to PM/UMA settlement.
 
 ## Notifications and accounting
 

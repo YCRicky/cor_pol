@@ -34,8 +34,8 @@ DRY_RUN=true
 ```
 
 `DRY_RUN=false` enables live CLOB execution through the existing
-`py-clob-client-v2` wrapper. The live order path is preserved from the old system:
-marketable GTC share-limit order, immediate cancel of the remainder, raw response
+`py-clob-client-v2` wrapper. The live order path is share-sized marketable GTC,
+immediate cancel/reconcile, optional chase for confirmed underfills, raw response
 logging, optional user websocket telemetry, and Gamma/UMA settlement accounting.
 
 ## Strategy defaults
@@ -108,6 +108,6 @@ data/empjp_e75_n30_c1_l1_calibration.json
 ## What changed from the old system
 
 - Removed BTC/ETH pair-box entry as the active runtime path.
-- Preserved execution, fill parsing, order-cancel/reconcile, and notification infrastructure.
+- Preserved and simplified execution, fill parsing, order-cancel/reconcile, and notification infrastructure for a single-leg strategy.
 - Replaced strategy with BTC-only EMPJP probability surface and hold-to-settlement accounting.
 - Live BUYs remain aggressive share-sized GTC IOC-style orders, not dollar-sized market orders.
