@@ -351,6 +351,7 @@ async def strategy_loop(
             spot_history=spot_history,
             yes_book=leg.yes_book,
             no_book=leg.no_book,
+            now_ts=now,
         )
 
         if pending is None:
@@ -385,6 +386,7 @@ async def strategy_loop(
                     spot_history=spot_history,
                     yes_book=leg.yes_book,
                     no_book=leg.no_book,
+                    now_ts=now,
                 )
                 if ask is None:
                     _log(jsonl, {"kind": "entry_skip", "round": round_idx, "reason": "no_best_ask_at_latency", "pending": asdict(pending)})
@@ -655,6 +657,16 @@ def main() -> None:
         max_ask=_envf("EMPJP_MAX_ASK", 0.82),
         max_spread=_envf("EMPJP_MAX_SPREAD", 0.05),
         min_depth=_envf("EMPJP_MIN_DEPTH", 5.0),
+        tpe_regime_enabled=_envb("EMPJP_TPE_REGIME_ENABLED", True),
+        tpe_overnight_start_hour=_envi("EMPJP_TPE_OVERNIGHT_START_HOUR", 0),
+        tpe_overnight_end_hour=_envi("EMPJP_TPE_OVERNIGHT_END_HOUR", 6),
+        tpe_overnight_min_elapsed_s=_envf("EMPJP_TPE_OVERNIGHT_MIN_ELAPSED_S", 90.0),
+        tpe_day_start_hour=_envi("EMPJP_TPE_DAY_START_HOUR", 11),
+        tpe_day_end_hour=_envi("EMPJP_TPE_DAY_END_HOUR", 16),
+        tpe_day_min_elapsed_s=_envf("EMPJP_TPE_DAY_MIN_ELAPSED_S", 45.0),
+        block_mid_price_enabled=_envb("EMPJP_BLOCK_MID_PRICE_ENABLED", True),
+        block_mid_price_min=_envf("EMPJP_BLOCK_MID_PRICE_MIN", 0.50),
+        block_mid_price_max=_envf("EMPJP_BLOCK_MID_PRICE_MAX", 0.60),
     )
     exec_gates = GateConfig(
         combo_qty=cfg.quantity,

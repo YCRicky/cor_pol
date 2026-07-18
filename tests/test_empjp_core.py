@@ -78,6 +78,74 @@ class EmpJPCoreTests(unittest.TestCase):
         self.assertEqual(cand.side, "YES")
         self.assertGreater(cand.edge, 0.20)
 
+    def test_empjp_v2_blocks_mid_price_bucket_when_enabled(self):
+        cal = EmpJPCalibration.load(DEFAULT_CALIBRATION_PATH)
+        cal.cells[(120, "(0.0, 0.5]", "balanced")] = EmpJPCell(cell_n=100, emp_up=0.80)
+        cfg = EmpJPConfig(
+            edge_min=0.075,
+            min_cell_n=30,
+            min_entry_elapsed_s=45,
+            max_entry_elapsed_s=255,
+            block_mid_price_enabled=True,
+            block_mid_price_min=0.50,
+            block_mid_price_max=0.60,
+        )
+        spot_history = [(0.0, 100.0), (1.0, 100.0), (2.0, 100.0), (3.0, 100.0)]
+        cand, reason = evaluate_empjp(
+            calibration=cal,
+            cfg=cfg,
+            elapsed_s=120,
+            tte=120,
+            open_px=100.0,
+            last_px=100.0,
+            spot_history=spot_history,
+            yes_book=Book(bid=0.54, ask=0.55),
+            no_book=Book(bid=0.44, ask=0.45),
+        )
+        self.assertIsNone(cand)
+        self.assertEqual(reason, "mid_price_bucket_block")
+
+    def test_empjp_v2_tpe_regime_blocks_disallowed_hours_and_early_overnight(self):
+        cal = EmpJPCalibration.load(DEFAULT_CALIBRATION_PATH)
+        cal.cells[(210, "(0.0, 0.5]", "balanced")] = EmpJPCell(cell_n=100, emp_up=0.80)
+        cfg = EmpJPConfig(
+            edge_min=0.075,
+            min_cell_n=30,
+            min_entry_elapsed_s=45,
+            max_entry_elapsed_s=255,
+            tpe_regime_enabled=True,
+        )
+        spot_history = [(0.0, 100.0), (1.0, 100.0), (2.0, 100.0), (3.0, 100.0)]
+        cand, reason = evaluate_empjp(
+            calibration=cal,
+            cfg=cfg,
+            elapsed_s=80,
+            tte=210,
+            open_px=100.0,
+            last_px=100.0,
+            spot_history=spot_history,
+            yes_book=Book(bid=0.39, ask=0.40),
+            no_book=Book(bid=0.59, ask=0.60),
+            now_ts=1783620960,  # 2026-07-10 02:16 UTC+8, overnight needs 90s+
+        )
+        self.assertIsNone(cand)
+        self.assertEqual(reason, "tpe_regime_warming_up")
+
+        cand, reason = evaluate_empjp(
+            calibration=cal,
+            cfg=cfg,
+            elapsed_s=120,
+            tte=210,
+            open_px=100.0,
+            last_px=100.0,
+            spot_history=spot_history,
+            yes_book=Book(bid=0.39, ask=0.40),
+            no_book=Book(bid=0.59, ask=0.60),
+            now_ts=1783642560,  # 2026-07-10 08:16 UTC+8, blocked hour
+        )
+        self.assertIsNone(cand)
+        self.assertEqual(reason, "tpe_regime_block")
+
     def test_entry_target_ok_uses_single_leg_tolerance(self):
         res = ExecutionLegResult("BTC_YES", "tok", 5.0, 4.5, 0.40, 1.80)
         self.assertTrue(_entry_target_ok(res, 5.0, 0.5))

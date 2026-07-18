@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -112,10 +113,32 @@ class EmpJPConfig:
     max_spread: float = 0.05
     min_depth: float = 5.0
     effective_fee_rate: float = EFFECTIVE_TAKER_FEE_RATE
+    tpe_regime_enabled: bool = False
+    tpe_overnight_start_hour: int = 0
+    tpe_overnight_end_hour: int = 6
+    tpe_overnight_min_elapsed_s: float = 90.0
+    tpe_day_start_hour: int = 11
+    tpe_day_end_hour: int = 16
+    tpe_day_min_elapsed_s: float = 45.0
+    block_mid_price_enabled: bool = False
+    block_mid_price_min: float = 0.50
+    block_mid_price_max: float = 0.60
 
     @property
     def horizon_s(self) -> int:
         return max(0, int(self.confirm_s) + int(self.latency_s))
+
+
+def tpe_hour_from_ts(ts: float) -> int:
+    return int((datetime.fromtimestamp(float(ts), timezone.utc) + timedelta(hours=8)).hour)
+
+
+def tpe_regime_min_elapsed(cfg: EmpJPConfig, hour: int) -> Optional[float]:
+    if cfg.tpe_overnight_start_hour <= hour <= cfg.tpe_overnight_end_hour:
+        return float(cfg.tpe_overnight_min_elapsed_s)
+    if cfg.tpe_day_start_hour <= hour <= cfg.tpe_day_end_hour:
+        return float(cfg.tpe_day_min_elapsed_s)
+    return None
 
 
 def best_price_size(book: Any, side: str) -> tuple[Optional[float], float]:
@@ -170,6 +193,7 @@ def evaluate_empjp(
     spot_history: list[tuple[float, float]],
     yes_book: Any,
     no_book: Any,
+    now_ts: Optional[float] = None,
 ) -> tuple[Optional[EmpJPCandidate], str]:
     bp = current_bp(open_px, last_px)
     if bp is None:
@@ -180,6 +204,14 @@ def evaluate_empjp(
         return None, "entry_window_closed"
     if tte < cfg.min_tte_s or tte > cfg.max_tte_s:
         return None, "tte_out_of_band"
+    if cfg.tpe_regime_enabled:
+        if now_ts is None:
+            return None, "missing_regime_timestamp"
+        regime_min_elapsed = tpe_regime_min_elapsed(cfg, tpe_hour_from_ts(float(now_ts)))
+        if regime_min_elapsed is None:
+            return None, "tpe_regime_block"
+        if elapsed_s < regime_min_elapsed:
+            return None, "tpe_regime_warming_up"
 
     bps: list[float] = []
     for _ts, px in spot_history:
@@ -214,6 +246,8 @@ def evaluate_empjp(
     edge, side, prob, entry_price, lead_spread, lead_depth = max(candidates, key=lambda x: x[0])
     if not (cfg.min_ask <= entry_price <= cfg.max_ask):
         return None, "entry_price_out_of_band"
+    if cfg.block_mid_price_enabled and cfg.block_mid_price_min <= entry_price < cfg.block_mid_price_max:
+        return None, "mid_price_bucket_block"
     if lead_spread is None or lead_spread > cfg.max_spread:
         return None, "spread_too_wide"
     if lead_depth < cfg.min_depth:
