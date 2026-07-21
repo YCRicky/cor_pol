@@ -27,6 +27,15 @@ def _clear_env(monkeypatch):
         "MISPRICE_MAX_OPEN_POSITIONS",
         "MISPRICE_MAX_CONSECUTIVE_LOSSES",
         "MISPRICE_MIN_SECONDS_BETWEEN_ENTRIES",
+        "CLOB_API_URL",
+        "CHAIN_ID",
+        "POLYMARKET_PRIVATE_KEY",
+        "POLYMARKET_API_KEY",
+        "POLYMARKET_API_SECRET",
+        "POLYMARKET_PASSPHRASE",
+        "FUNDER_ADDRESS",
+        "SIGNATURE_TYPE",
+        "POLY_BUILDER_CODE",
         "PRIVATE_KEY",
         "CLOB_API_KEY",
         "CLOB_SECRET",
@@ -66,42 +75,67 @@ def test_live_requires_canonical_account_identity(monkeypatch):
     _clear_env(monkeypatch)
     monkeypatch.setenv("MISPRICE_DRY_RUN", "false")
 
-    with pytest.raises(ValueError, match="PRIVATE_KEY"):
+    with pytest.raises(ValueError, match="POLYMARKET_PRIVATE_KEY"):
         Settings.from_env()
 
 
-def test_cor_pol_proxy_account_environment_is_accepted(monkeypatch):
+def test_requested_polymarket_account_environment_is_accepted(monkeypatch):
     _clear_env(monkeypatch)
     monkeypatch.setenv("MISPRICE_DRY_RUN", "false")
-    monkeypatch.setenv("PRIVATE_KEY", "0x" + "a" * 64)
-    monkeypatch.setenv("CLOB_FUNDER_ADDRESS", "0x" + "b" * 40)
-    monkeypatch.setenv("CLOB_SIGNATURE_TYPE", "POLY_PROXY")
-    monkeypatch.setenv("CLOB_API_KEY", "old-key")
-    monkeypatch.setenv("CLOB_SECRET", "old-secret")
-    monkeypatch.setenv("CLOB_PASS_PHRASE", "old-passphrase")
+    monkeypatch.setenv("CLOB_API_URL", "https://clob.polymarket.com")
+    monkeypatch.setenv("CHAIN_ID", "137")
+    monkeypatch.setenv("POLYMARKET_PRIVATE_KEY", "0x" + "a" * 64)
+    monkeypatch.setenv("FUNDER_ADDRESS", "0x" + "b" * 40)
+    monkeypatch.setenv("SIGNATURE_TYPE", '"2"')
+    monkeypatch.setenv("POLYMARKET_API_KEY", "existing-key")
+    monkeypatch.setenv("POLYMARKET_API_SECRET", "existing-secret")
+    monkeypatch.setenv("POLYMARKET_PASSPHRASE", "existing-passphrase")
+    monkeypatch.setenv("POLY_BUILDER_CODE", "0x" + "1" * 64)
 
     settings = Settings.from_env()
 
     assert settings.is_live is True
-    assert settings.polymarket_signature_type == 1
+    assert settings.clob_host == "https://clob.polymarket.com"
+    assert settings.polymarket_chain_id == 137
+    assert settings.polymarket_signature_type == 2
+    assert settings.builder_code == "0x" + "1" * 64
     assert settings.has_static_api_creds is True
-    assert settings.clob_api_key == "old-key"
+    assert settings.clob_api_key == "existing-key"
 
 
 def test_live_requires_the_established_cor_pol_l2_credential_set(monkeypatch):
     _clear_env(monkeypatch)
     monkeypatch.setenv("MISPRICE_DRY_RUN", "false")
-    monkeypatch.setenv("PRIVATE_KEY", "0x" + "a" * 64)
-    monkeypatch.setenv("CLOB_FUNDER_ADDRESS", "0x" + "b" * 40)
-    monkeypatch.setenv("CLOB_SIGNATURE_TYPE", "POLY_PROXY")
+    monkeypatch.setenv("POLYMARKET_PRIVATE_KEY", "0x" + "a" * 64)
+    monkeypatch.setenv("FUNDER_ADDRESS", "0x" + "b" * 40)
+    monkeypatch.setenv("SIGNATURE_TYPE", "2")
 
-    with pytest.raises(ValueError, match="CLOB_API_KEY, CLOB_SECRET, CLOB_PASS_PHRASE"):
+    with pytest.raises(
+        ValueError,
+        match="POLYMARKET_API_KEY, POLYMARKET_API_SECRET, POLYMARKET_PASSPHRASE",
+    ):
         Settings.from_env()
 
 
 def test_partial_l2_credentials_are_rejected_even_in_dry_mode(monkeypatch):
     _clear_env(monkeypatch)
-    monkeypatch.setenv("CLOB_API_KEY", "key-only")
+    monkeypatch.setenv("POLYMARKET_API_KEY", "key-only")
 
     with pytest.raises(ValueError, match="credentials"):
         Settings.from_env()
+
+
+def test_legacy_account_environment_names_are_ignored(monkeypatch):
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("PRIVATE_KEY", "0x" + "a" * 64)
+    monkeypatch.setenv("CLOB_API_KEY", "legacy-key")
+    monkeypatch.setenv("CLOB_SECRET", "legacy-secret")
+    monkeypatch.setenv("CLOB_PASS_PHRASE", "legacy-passphrase")
+    monkeypatch.setenv("CLOB_SIGNATURE_TYPE", "1")
+    monkeypatch.setenv("CLOB_FUNDER_ADDRESS", "0x" + "b" * 40)
+
+    settings = Settings.from_env()
+
+    assert settings.polymarket_private_key == ""
+    assert settings.clob_api_key == ""
+    assert settings.polymarket_signature_type is None

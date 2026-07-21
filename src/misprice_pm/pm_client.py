@@ -250,7 +250,7 @@ class V2ClobGateway:
         # because callers can construct Settings directly in code.
         if not settings.has_static_api_creds:
             raise RuntimeError(
-                "live V2 CLOB gateway requires CLOB_API_KEY, CLOB_SECRET, and CLOB_PASS_PHRASE"
+                "live V2 CLOB gateway requires POLYMARKET_API_KEY, POLYMARKET_API_SECRET, and POLYMARKET_PASSPHRASE"
             )
         creds = ApiCreds(
             api_key=settings.clob_api_key,

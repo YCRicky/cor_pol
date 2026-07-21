@@ -58,7 +58,7 @@ def _int(name: str, default: int) -> int:
 
 
 def _signature_type_from_env() -> Optional[int]:
-    raw = os.getenv("CLOB_SIGNATURE_TYPE", "").strip()
+    raw = os.getenv("SIGNATURE_TYPE", "").strip().strip('"').strip("'")
     if not raw:
         return None
     aliases = {
@@ -73,7 +73,7 @@ def _signature_type_from_env() -> Optional[int]:
     try:
         return int(normalized)
     except ValueError as exc:
-        raise ValueError("CLOB_SIGNATURE_TYPE is invalid") from exc
+        raise ValueError("SIGNATURE_TYPE is invalid") from exc
 
 
 @dataclass(frozen=True)
@@ -111,8 +111,7 @@ class Settings:
     heartbeat_interval_s: float = 5.0
     builder_code: str = ""
 
-    # Official CLOB V2 values are pinned in code; the account fields below are
-    # intentionally named exactly like cor_pol's live account configuration.
+    # Official CLOB V2 account values, loaded from the deployment contract.
     gamma_host: str = DEFAULT_GAMMA_HOST
     clob_host: str = DEFAULT_CLOB_HOST
     geo_endpoint: str = DEFAULT_GEO_ENDPOINT
@@ -178,15 +177,15 @@ class Settings:
 
         missing = []
         if not _PRIVATE_KEY_RE.match(self.polymarket_private_key):
-            missing.append("PRIVATE_KEY")
+            missing.append("POLYMARKET_PRIVATE_KEY")
         if not _ADDRESS_RE.match(self.polymarket_funder):
-            missing.append("CLOB_FUNDER_ADDRESS")
+            missing.append("FUNDER_ADDRESS")
         if self.polymarket_signature_type not in {0, 1, 2, 3}:
-            missing.append("CLOB_SIGNATURE_TYPE")
-        # This deployment uses the established cor_pol L2 credentials.  Do
-        # not derive or create a different key set during a live startup.
+            missing.append("SIGNATURE_TYPE")
         if not self.has_static_api_creds:
-            missing.extend(("CLOB_API_KEY", "CLOB_SECRET", "CLOB_PASS_PHRASE"))
+            missing.extend(
+                ("POLYMARKET_API_KEY", "POLYMARKET_API_SECRET", "POLYMARKET_PASSPHRASE")
+            )
         if missing:
             raise ValueError("Live trading disabled until configured: " + ", ".join(missing))
 
@@ -217,12 +216,15 @@ class Settings:
             max_open_positions=_int("MISPRICE_MAX_OPEN_POSITIONS", 1),
             max_consecutive_losses=_int("MISPRICE_MAX_CONSECUTIVE_LOSSES", 5),
             min_seconds_between_entries=_int("MISPRICE_MIN_SECONDS_BETWEEN_ENTRIES", 60),
-            polymarket_private_key=os.getenv("PRIVATE_KEY", "").strip(),
-            polymarket_funder=os.getenv("CLOB_FUNDER_ADDRESS", "").strip(),
+            builder_code=os.getenv("POLY_BUILDER_CODE", "").strip(),
+            clob_host=os.getenv("CLOB_API_URL", DEFAULT_CLOB_HOST).strip().rstrip("/"),
+            polymarket_private_key=os.getenv("POLYMARKET_PRIVATE_KEY", "").strip(),
+            polymarket_funder=os.getenv("FUNDER_ADDRESS", "").strip(),
             polymarket_signature_type=_signature_type_from_env(),
-            clob_api_key=os.getenv("CLOB_API_KEY", "").strip(),
-            clob_api_secret=os.getenv("CLOB_SECRET", "").strip(),
-            clob_api_passphrase=os.getenv("CLOB_PASS_PHRASE", "").strip(),
+            polymarket_chain_id=_int("CHAIN_ID", POLYGON_CHAIN_ID),
+            clob_api_key=os.getenv("POLYMARKET_API_KEY", "").strip(),
+            clob_api_secret=os.getenv("POLYMARKET_API_SECRET", "").strip(),
+            clob_api_passphrase=os.getenv("POLYMARKET_PASSPHRASE", "").strip(),
             telegram_token=os.getenv("TG_BOT_TOKEN", "").strip(),
             telegram_chat_id=os.getenv("TG_CHAT_ID", "").strip(),
         )

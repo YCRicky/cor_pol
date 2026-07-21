@@ -33,13 +33,14 @@ misprice-pm --rounds 0 --dry-run
 
 Confirm the message arrives before enabling live mode. During operation, the audit trail records
 `notification_sent` or a sanitized `notification_failed`; Telegram failure never changes order
-state. SIGNAL and repeated ENTRY_BLOCKED reasons are deduplicated within each five-minute market.
+state. There are no pre-entry SIGNAL notifications; repeated ENTRY_BLOCKED reasons are deduplicated
+within each five-minute market.
 
 ## 3. Wallet bootstrap outside this process
 
-For the existing `cor_pol` API/proxy account, reuse its `PRIVATE_KEY`, the matching
-`CLOB_API_KEY/CLOB_SECRET/CLOB_PASS_PHRASE`, `CLOB_SIGNATURE_TYPE=POLY_PROXY`, and the actual proxy
-wallet as `CLOB_FUNDER_ADDRESS`. This preserves the account identity while still using CLOB V2.
+Use the deployment account fields exactly as named in `.env.example`: `POLYMARKET_PRIVATE_KEY`,
+`POLYMARKET_API_KEY`, `POLYMARKET_API_SECRET`, `POLYMARKET_PASSPHRASE`, `FUNDER_ADDRESS`, and
+`SIGNATURE_TYPE`. Set `CLOB_API_URL`, `CHAIN_ID`, and (when applicable) `POLY_BUILDER_CODE` there too.
 
 Use the three existing CLOB L2 values together. After onchain approval is confirmed, explicitly
 refresh the CLOB cache:
@@ -60,14 +61,14 @@ misprice-pm --preflight
 
 Passing means:
 
-- dry-run is disabled, the acknowledgement is present, and the account identity is valid
+- dry-run is disabled and the account identity is valid
 - the official geo endpoint permits new orders for the current egress
 - the CLOB is not in close-only mode
 - pUSD balance and allowance are readable through the authenticated account
 - persisted submitted orders reconcile to a terminal CLOB state
 
 It does not prove legal eligibility, account standing, strategy profitability, or future
-availability. It submits no trade, but may create/derive L2 API credentials when none were supplied.
+availability. It submits no trade and requires the supplied static L2 API credentials.
 
 ## 5. Start service
 
