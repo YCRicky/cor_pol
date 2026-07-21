@@ -492,6 +492,55 @@ def _live_runtime(
     return gateway, executor
 
 
+def deployment_check(
+    *,
+    settings: Settings,
+    public: PolymarketPublicClient,
+    gateway: Optional[V2ClobGateway],
+    notifier: Notifier,
+    clock: Callable[[], float] = time.time,
+) -> Dict[str, Any]:
+    """Probe every live data and notification dependency without reserving or posting an order."""
+
+    now = int(clock())
+    slug, _, _ = current_btc_5m_slug(now)
+    spot = binance_price(settings.binance_symbol, clock=clock)
+    market = public.market_by_slug(slug)
+    if not market.condition_id:
+        raise LivePreflightError("Gamma market has no condition ID")
+    yes_token = market.token_for_side("YES")
+    no_token = market.token_for_side("NO")
+    book = book_pair_snapshot(public, yes_token, no_token, clock=clock)
+    if book.age_s > settings.max_book_age_s:
+        raise LivePreflightError("CLOB book is stale during deployment check")
+
+    metadata: Optional[MarketMetadata] = None
+    if settings.is_live:
+        if gateway is None:
+            raise RuntimeError("live deployment check requires a V2 CLOB gateway")
+        metadata = gateway.market_metadata(market.condition_id)
+        _metadata_token_matches(market, metadata, "YES")
+        _metadata_token_matches(market, metadata, "NO")
+        if not notifier.enabled:
+            raise LivePreflightError("live deployment requires TG_BOT_TOKEN and TG_CHAT_ID")
+
+    telegram_verified = False
+    if notifier.enabled:
+        notifier.send(format_event("preflight", {"dry_run": settings.dry_run, "qty": settings.qty, "slug": slug}))
+        telegram_verified = True
+
+    return {
+        "mode": "live_deployment_check_passed" if settings.is_live else "dry_run_deployment_check_passed",
+        "slug": slug,
+        "binance_symbol": settings.binance_symbol,
+        "spot": spot.price,
+        "book_age_s": book.age_s,
+        "gamma_condition_id": market.condition_id,
+        "metadata_verified": metadata is not None,
+        "telegram_verified": telegram_verified,
+    }
+
+
 def settle_slug(
     *,
     settings: Settings,
@@ -659,6 +708,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ledger", action="store_true", help="rebuild the PM-only JSONL audit ledger")
     parser.add_argument("--preflight", action="store_true", help="run documented live checks without submitting an order")
     parser.add_argument(
+        "--deployment-check",
+        action="store_true",
+        help="verify Binance, Gamma, CLOB, Telegram, and live account without submitting an order",
+    )
+    parser.add_argument(
         "--sync-allowance",
         action="store_true",
         help="refresh the CLOB pUSD allowance cache; never submits an order",
@@ -815,6 +869,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                 )
                 return 0
             gateway, executor = _live_runtime(settings, store, public, notifier)
+            if args.deployment_check:
+                print(
+                    json.dumps(
+                        deployment_check(
+                            settings=settings,
+                            public=public,
+                            gateway=gateway,
+                            notifier=notifier,
+                        ),
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+                return 0
             if args.preflight:
                 print(
                     json.dumps(

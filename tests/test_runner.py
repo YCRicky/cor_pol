@@ -2,8 +2,15 @@ import pytest
 
 from misprice_pm.config import Settings
 from misprice_pm.execution import OrderExecutor
-from misprice_pm.pm_client import GammaMarket, GeoStatus, MarketMetadata
-from misprice_pm.runner import SpotObservation, run_round, settle_open_positions, settle_slug
+from misprice_pm.notifier import Notifier
+from misprice_pm.pm_client import GammaMarket, GeoStatus, LivePreflightError, MarketMetadata
+from misprice_pm.runner import (
+    SpotObservation,
+    deployment_check,
+    run_round,
+    settle_open_positions,
+    settle_slug,
+)
 from misprice_pm.state import StateStore
 from misprice_pm.strategy import BookSnapshot
 
@@ -91,6 +98,65 @@ class CaptureNotifier:
     def send(self, text):
         self.messages.append(text)
         return True
+
+
+def test_live_deployment_check_probes_sources_metadata_and_telegram(monkeypatch):
+    monkeypatch.setattr(
+        "misprice_pm.runner.binance_price", lambda *args, **kwargs: SpotObservation(100_000.0, 1_000.0)
+    )
+    monkeypatch.setattr(
+        "misprice_pm.runner.book_pair_snapshot",
+        lambda *args, **kwargs: BookSnapshot(
+            yes_bid=0.58,
+            yes_ask=0.59,
+            yes_ask_size=20.0,
+            no_bid=0.39,
+            no_ask=0.40,
+            no_ask_size=20.0,
+            age_s=0.1,
+        ),
+    )
+    notifier = CaptureNotifier()
+
+    result = deployment_check(
+        settings=Settings(dry_run=False),
+        public=FakePublic(),
+        gateway=PreflightGateway(),
+        notifier=notifier,
+        clock=lambda: 1_000.0,
+    )
+
+    assert result["mode"] == "live_deployment_check_passed"
+    assert result["metadata_verified"] is True
+    assert result["telegram_verified"] is True
+    assert notifier.messages[0].startswith("[Misprice PM] DEPLOYMENT_CHECK_OK")
+
+
+def test_live_deployment_check_requires_telegram(monkeypatch):
+    monkeypatch.setattr(
+        "misprice_pm.runner.binance_price", lambda *args, **kwargs: SpotObservation(100_000.0, 1_000.0)
+    )
+    monkeypatch.setattr(
+        "misprice_pm.runner.book_pair_snapshot",
+        lambda *args, **kwargs: BookSnapshot(
+            yes_bid=0.58,
+            yes_ask=0.59,
+            yes_ask_size=20.0,
+            no_bid=0.39,
+            no_ask=0.40,
+            no_ask_size=20.0,
+            age_s=0.1,
+        ),
+    )
+
+    with pytest.raises(LivePreflightError, match="TG_BOT_TOKEN and TG_CHAT_ID"):
+        deployment_check(
+            settings=Settings(dry_run=False),
+            public=FakePublic(),
+            gateway=PreflightGateway(),
+            notifier=Notifier(),
+            clock=lambda: 1_000.0,
+        )
 
 
 def test_fresh_round_records_one_shadow_entry_at_most(monkeypatch, tmp_path):

@@ -12,6 +12,11 @@ client is constructed.
 
 ## Protocol checks
 
+The EC2 systemd unit runs a no-order deployment check before it starts the
+live loop. It refuses to start if Binance, Gamma, the CLOB book or
+authenticated CLOB account check fails, or if the configured Telegram bot does
+not acknowledge its `DEPLOYMENT_CHECK_OK` message.
+
 Every real entry rechecks:
 
 - official geo response and CLOB close-only mode

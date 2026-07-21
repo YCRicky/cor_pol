@@ -23,6 +23,13 @@ def format_event(kind: str, payload: Dict[str, Any], slug: str = "") -> str:
             f"qty={_number(payload['qty'])}\n"
             "one-entry-per-market + SQLite recovery + CLOB V2 preflight"
         )
+    if kind == "preflight":
+        return (
+            "[Misprice PM] DEPLOYMENT_CHECK_OK\n"
+            f"mode={'SHADOW' if payload['dry_run'] else 'LIVE'} "
+            f"qty={_number(payload['qty'])}\n"
+            f"slug={payload['slug']} Binance + Gamma + CLOB book + authenticated CLOB ready"
+        )
     if kind == "submitted":
         return (
             "[Misprice PM] ORDER_SUBMITTED\n"

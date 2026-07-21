@@ -90,6 +90,25 @@ then performs authenticated checks and startup reconciliation. If an earlier
 execution remains unknown, new risk stays frozen until the CLOB evidence is
 reconciled.
 
+The EC2 `cor-pol.service` performs the stricter `--deployment-check` before
+every live loop. It sends no order, but requires successful Binance BTC spot,
+Gamma current-market discovery, YES/NO CLOB books, authenticated CLOB account
+and market metadata, writable SQLite state, and a successful Telegram reply.
+The Telegram `DEPLOYMENT_CHECK_OK` message must arrive before the normal live
+`BOOT` message and before any strategy round can run.
+
+On the EC2 host, use the checked-in deploy command after updating the checkout:
+
+```bash
+cd /opt/cor_pol
+git pull --ff-only
+bash deploy/ec2/deploy_cor_pol.sh
+```
+
+It installs the pinned live dependency, replaces the old systemd unit, reloads
+systemd, and restarts `cor-pol`. It refuses to start if required existing live
+or Telegram fields are blank; it never prints their values.
+
 ## Telegram lifecycle
 
 Set the same variables used by `cor_pol`:

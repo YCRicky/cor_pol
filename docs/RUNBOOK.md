@@ -89,6 +89,27 @@ It reads the existing `/opt/cor_pol/.env` directly and starts the installed
 `python -m misprice_pm.runner --forever` module from `/opt/cor_pol/src`; it
 never references the removed legacy `main.py` entrypoint.
 
+That unit runs `--deployment-check` before every strategy process. The check
+submits no order. In live mode it requires a current Binance BTC observation,
+the active Gamma BTC 5m market and both CLOB books, authenticated CLOB wallet
+and market metadata, writable state, and a successful Telegram API response.
+It emits `DEPLOYMENT_CHECK_OK` before the normal `BOOT` message. A failed
+check prevents `--forever` from starting; systemd retries at most six times in
+one minute rather than looping indefinitely.
+
+To apply an update without forgetting the virtualenv or the systemd unit:
+
+```bash
+cd /opt/cor_pol
+git pull --ff-only
+bash deploy/ec2/deploy_cor_pol.sh
+```
+
+The script checks the existing account and Telegram field names without
+printing their values, installs `.[live]`, replaces `cor-pol.service`, reloads
+systemd, and restarts the service. It exits nonzero instead of starting a
+partial live deployment.
+
 Only one process may own the SQLite runtime lock. The scheduler waits for the next boundary rather
 than joining a market mid-round.
 

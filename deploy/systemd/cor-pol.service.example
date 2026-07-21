@@ -2,6 +2,8 @@
 Description=cor_pol Misprice PM BTC 5m service
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=6
 
 [Service]
 Type=simple
@@ -16,6 +18,7 @@ EnvironmentFile=/opt/cor_pol/.env
 # Use the package module directly so this service does not depend on a legacy
 # top-level main.py or on a console-script wrapper being present in the venv.
 Environment=PYTHONPATH=/opt/cor_pol/src
+ExecStartPre=/opt/cor_pol/.venv/bin/python -m misprice_pm.runner --deployment-check
 ExecStart=/opt/cor_pol/.venv/bin/python -m misprice_pm.runner --forever
 Restart=on-failure
 RestartSec=10

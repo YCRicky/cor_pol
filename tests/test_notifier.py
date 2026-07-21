@@ -94,3 +94,13 @@ def test_operator_lifecycle_messages_are_stable(kind, payload, headline):
     assert text.startswith(f"[Misprice PM] {headline}")
     assert "btc-updown-5m-0" in text
     assert "token" not in text.lower()
+
+
+def test_deployment_check_notification_is_not_a_strategy_signal():
+    text = format_event(
+        "preflight",
+        {"dry_run": False, "qty": 5, "slug": "btc-updown-5m-0"},
+    )
+
+    assert "DEPLOYMENT_CHECK_OK" in text
+    assert "SIGNAL" not in text
