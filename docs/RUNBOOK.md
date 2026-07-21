@@ -76,6 +76,13 @@ availability. It submits no trade and requires the supplied static L2 API creden
 misprice-pm --forever
 ```
 
+For `deploy/systemd/misprice-pm.service.example`, copy the same completed
+environment file to `/etc/misprice-pm.env`.  The unit uses
+`StateDirectory=misprice-pm` and a `/var/lib/misprice-pm` working directory,
+so the existing `MISPRICE_OUT_DIR=out` writes durable SQLite, lock, and JSONL
+files to `/var/lib/misprice-pm/out` even with `ProtectSystem=strict`.  Do not
+point the unit's working directory back to `/opt/misprice_pm`.
+
 Only one process may own the SQLite runtime lock. The scheduler waits for the next boundary rather
 than joining a market mid-round.
 

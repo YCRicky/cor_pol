@@ -74,9 +74,15 @@ misprice-pm --preflight
 misprice-pm --forever
 ```
 
-`--preflight` sends no order. It may derive L2 API credentials when none are supplied, then performs
-authenticated checks and startup reconciliation. If an earlier execution remains unknown, new risk
-stays frozen until the CLOB evidence is reconciled.
+When using the included systemd unit, keep `MISPRICE_OUT_DIR=out` in
+`/etc/misprice-pm.env`. The unit's managed state directory makes that path
+`/var/lib/misprice-pm/out`; do not run the protected service with
+`WorkingDirectory=/opt/misprice_pm`.
+
+`--preflight` sends no order. It uses the supplied static L2 API credentials,
+then performs authenticated checks and startup reconciliation. If an earlier
+execution remains unknown, new risk stays frozen until the CLOB evidence is
+reconciled.
 
 ## Telegram lifecycle
 

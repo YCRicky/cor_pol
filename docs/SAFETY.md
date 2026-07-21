@@ -6,8 +6,9 @@
 MISPRICE_DRY_RUN=true
 ```
 
-Changing `MISPRICE_DRY_RUN` to `false` still requires the exact live acknowledgement and valid V2
-wallet identity before an authenticated client is constructed.
+Changing `MISPRICE_DRY_RUN` to `false` requires a valid CLOB V2 wallet
+identity and its complete static L2 API credential set before an authenticated
+client is constructed.
 
 ## Protocol checks
 
