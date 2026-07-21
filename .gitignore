@@ -1,20 +1,10 @@
-# Python
+.venv/
 __pycache__/
 *.py[cod]
-*.pyo
-*.egg-info/
 .pytest_cache/
-
-# Local env / runtime artifacts
+.ruff_cache/
 .env
 out/
-*.log
-*.jsonl
-
-# Editor
-.idea/
-.vscode/
-
-# OS
 .DS_Store
-Thumbs.db
+
+*.egg-info/

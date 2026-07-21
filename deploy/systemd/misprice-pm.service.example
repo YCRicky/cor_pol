@@ -1,0 +1,24 @@
+[Unit]
+Description=Misprice PM BTC 5m service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=misprice
+Group=misprice
+WorkingDirectory=/opt/misprice_pm
+EnvironmentFile=/etc/misprice-pm.env
+ExecStart=/opt/misprice_pm/.venv/bin/misprice-pm --forever
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/misprice-pm /var/log/misprice-pm
+
+[Install]
+WantedBy=multi-user.target

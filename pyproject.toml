@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "misprice-pm"
+version = "0.1.0"
+description = "Standalone Polymarket BTC 5m path-transition underreaction strategy"
+readme = "README.md"
+# py-clob-client-v2 1.1.0 itself requires Python >=3.9.10.
+requires-python = ">=3.9.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7,<9", "ruff>=0.8"]
+# CLOB V1 is retired in production.  Pin the reviewed V2 client so a deploy is
+# reproducible; upgrade it deliberately with the integration tests.
+live = ["py-clob-client-v2==1.1.0"]
+
+[project.scripts]
+misprice-pm = "misprice_pm.runner:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# Keep percent-format diagnostics readable and Python 3.9 typing aliases valid;
+# these are compatibility choices, not lint bypasses for correctness.
+ignore = ["E501", "UP006", "UP007", "UP031", "UP035", "UP045"]

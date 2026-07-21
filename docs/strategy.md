@@ -1,129 +1,220 @@
-# Strategy spec: `empjp_e75_n30_c1_l1`
+# Misprice PM Strategy Document
 
-This repository now runs the BTC-only empirical joint probability strategy that
-was selected from the PM5M replay research.
+## Separation from cor_pol and historical dataset names
 
-## 1. What it trades
+Misprice PM is an independent project. It is not EMPJP, not gamma_underreaction, not pullback_fear, and not a renamed `cor_pol` variant.
 
-The bot trades the BTC 5-minute Polymarket up/down market:
-
-```text
-btc-updown-5m-<unix_ts>
-```
-
-It buys exactly one side per round at most:
+Historical names such as `four_quadrant_v3` are **telemetry dataset names only**. They are not the Misprice strategy identity. The canonical strategy name in this repository is:
 
 ```text
-YES = BTC settles above round open
-NO  = BTC settles below round open
+Misprice v3 repricing-lag detector
 ```
 
-Default size is `5` shares and the position is held until PM/UMA settlement.
-
-## 2. Alpha
-
-The strategy estimates the empirical conditional probability:
+The earlier `cor_pol` codebase may be used as infrastructure or raw-data reference only:
 
 ```text
-P(final_up | tte, z_resid, path_dir)
+Allowed to borrow ideas:
+- PM Gamma/CLOB public API access patterns
+- dry-run/shadow execution boundary
+- Telegram notification shape
+- launchd deployment style
+- official PM settlement discipline
+
+Not allowed to import as thesis:
+- EMPJP fair-bucket logic
+- time-LCB gates
+- residual gates
+- Binance/open-close settlement
+- generic gamma_underreaction thesis
 ```
 
-where:
-
-- `tte`: seconds to expiry,
-- `z_resid`: current BTC basis-point move normalized by rolling BTC sigma and
-  remaining time,
-- `path_dir`: whether the path so far is `up_dominant`, `down_dominant`, or
-  `balanced`.
-
-It compares the empirical probability to the executable PM ask:
+## Canonical v3 thesis
 
 ```text
-YES edge = emp_up - yes_ask - fee(yes_ask)
-NO  edge = (1 - emp_up) - no_ask - fee(no_ask)
+BTC path-state transition occurs.
+Polymarket executable ask should reprice in the matching direction.
+Actual PM ask lags that required repricing.
+The lag remains executable after confirmation/final book checks.
+Only then enter the lagged side.
 ```
 
-The bot takes the side with the larger edge if all gates pass.
-
-## 3. Production policy
+The strategy does **not** say:
 
 ```text
-empjp_e75_n30_c1_l1
+BTC moved, therefore buy the matching PM side.
 ```
 
-| Part | Meaning |
-|---|---|
-| `empjp` | empirical joint probability |
-| `e75` | minimum edge `0.075` |
-| `n30` | cell must contain at least 30 samples |
-| `c1` | 1 second confirmation |
-| `l1` | 1 second additional latency before entry |
-
-Default filters:
+It also does **not** say:
 
 ```text
-45s <= elapsed <= 255s
-45s <= tte <= 240s
-0.18 <= entry ask <= 0.82
-spread <= 0.05
-book depth >= 5 shares
+Only buy because ask < 0.60.
 ```
 
-## 4. Calibration
-
-The frozen calibration is committed as:
+It says:
 
 ```text
-data/empjp_e75_n30_c1_l1_calibration.json
+BTC path changed enough to imply higher settlement probability, but PM ask is still underreacted versus the required repricing.
 ```
 
-It maps:
+## v3 detector fields
+
+For each candidate tick, the strategy stores explicit thesis-model fields:
 
 ```text
-(tte_bin, z_bin, path_dir) -> {cell_n, emp_up}
+pre_bp
+signal_bp
+transition_bp
+pre_ask
+signal_ask
+required_reprice
+actual_reprice
+lag_depth
+spread
+depth
 ```
 
-Runtime loads this JSON directly. It does not need the research dataframe or
-pandas.
-
-## 5. Live execution
-
-Live execution reuses the previous system's order layer:
-
-1. Build a BUY order with share size `EMPJP_QTY`.
-2. Use a marketable GTC limit: `best_ask + slippage_ticks * tick_size`.
-3. Submit through `py-clob-client-v2`.
-4. Immediately cancel unfilled remainder.
-5. Reconcile with CLOB `get_order`.
-6. Optional user websocket is telemetry only and does not block execution.
-
-This avoids Polymarket's dollar-sized BUY market-order semantics while keeping
-share sizing exact.
-
-## 6. Settlement accounting
-
-Realized PnL is computed from PM/UMA outcome via Gamma only:
+The core model is:
 
 ```text
-win = (pm_up >= 0.5) for YES, else (pm_up < 0.5)
-pnl = qty * win - qty * entry_price - entry_fee
+required_reprice = min(0.40, reprice_per_bp * abs(transition_bp))
+actual_reprice = signal_ask - pre_ask
+lag_depth = required_reprice - actual_reprice
 ```
 
-Binance spot is used only for live state features and not for realized PnL.
-
-## 7. Weekend behavior
-
-Backtest split showed weekends were still profitable but lower quality:
+Entry requires:
 
 ```text
-weekday: stress PnL +1035.6, PF 1.76, avg/trade +0.550
-weekend: stress PnL  +410.2, PF 1.36, avg/trade +0.310
+abs(pre_bp) <= max_pre_abs_bp
+abs(signal_bp) >= min_abs_bp
+abs(transition_bp) >= min_transition_bp
+lag_depth >= min_lag_depth
+min_entry_ask <= executable_ask <= max_entry_ask
+spread <= max_spread
+depth >= min_depth
+book age <= max_book_age_s
 ```
 
-Default therefore keeps weekends enabled:
+The live runner repeats the executable-book check immediately before submission. If the final book has already repriced and `lag_depth < min_lag_depth`, the order is blocked with:
 
 ```text
-EMPJP_WEEKEND_REST_ENABLED=false
+repricing_lag_collapsed_before_submit
 ```
 
-Set it to `true` only if you want weekday-only risk exposure.
+## Current default v3 parameters
+
+```text
+lookback_s = 15
+min_transition_bp = 3.0
+max_pre_abs_bp = 2.5
+min_abs_bp = 3.5
+reprice_per_bp = 0.04
+min_lag_depth = 0.035
+min_elapsed_s = 20
+max_elapsed_s = 220
+min_entry_ask = 0.35
+max_entry_ask = 0.65
+max_spread = 0.05
+min_depth = 5
+```
+
+These defaults are the optimized live-candidate settings selected by replaying
+the v3 repricing-lag detector on historical raw telemetry. The old 60c cap and
+60-120s ban were stopgap risk controls; they are not the v3 thesis model.
+
+## Historical raw replay provenance
+
+Optimizer run:
+
+```text
+strategy = misprice_v3_repricing_lag_detector
+dataset = research_data/four_quadrant_v*/round_*/snapshots_1s.jsonl.gz
+files = 206
+usable_rounds = 185
+grid_configs = 37,800
+fee_rate = 0.07
+friction_per_share = 0.02
+qty = 5
+```
+
+Pushed-default v3 before optimization:
+
+```text
+trades = 128
+trade_rate = 69.19%
+net_pnl = +27.486335 U
+win_rate = 71.09%
+profit_factor = 1.2255
+max_drawdown = 21.106695 U
+chronological splits = -10.670470 / +8.782265 / +29.374540 U
+```
+
+Optimized live-candidate default:
+
+```text
+trades = 76
+trade_rate = 41.08%
+net_pnl = +71.140725 U
+win_rate = 78.95%
+profit_factor = 2.5130
+max_drawdown = 6.515725 U
+chronological splits = +21.716855 / +26.768345 / +22.655525 U
+worst_consecutive_losses = 2
+```
+
+Dataset split:
+
+```text
+four_quadrant_v2: trades=26 pnl=+21.716855 U PF=2.2462
+four_quadrant_v3: trades=50 pnl=+49.423870 U PF=2.6701
+```
+
+Execution-stress replay subtracting extra adverse fill cost from every trade:
+
+```text
++1c/share: pnl=+67.340725 U PF=2.4082 DD=6.615725 U
++2c/share: pnl=+63.540725 U PF=2.3069 DD=6.715725 U
++3c/share: pnl=+59.740725 U PF=2.2089 DD=6.818780 U
++4c/share: pnl=+55.940725 U PF=2.1139 DD=7.018780 U
+```
+
+The historical replay is strong enough for a small-size live candidate only
+after operator-controlled dry-run/live preflight. It is not a guarantee that a
+larger live wallet will obtain the same queue position, latency, or fill quality.
+
+## Settlement
+
+Only official PM/Gamma outcome data can settle trades:
+
+```text
+Gamma outcomePrices: Up=1,Down=0 => YES wins
+Gamma outcomePrices: Up=0,Down=1 => NO wins
+```
+
+Forbidden for settlement:
+
+```text
+- Binance close/open/final spot
+- Jina Reader
+- frontend probabilities
+- local directional inference
+```
+
+If PM/Gamma is not resolved, the trade remains pending.
+
+## What clean alpha capture means
+
+Do not declare success from small positive PnL alone. Clean capture means:
+
+```text
+- normal-frequency forward dry-run, not a tiny hand-picked set
+- every entry has required_reprice / actual_reprice / lag_depth evidence
+- lag survives final executable-book check
+- net PnL positive after fee/friction assumptions in replay
+- official PM settlement coverage matches confirmed trade coverage
+- PnL not dominated by one or two lucky trades
+- YES/NO, entry bucket, and lag-depth buckets remain auditable
+```
+
+## Current status
+
+This repository implements the standalone production boundary. Default mode is dry-run. Real trading requires explicit environment acknowledgement and local credentials.
