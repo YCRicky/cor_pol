@@ -83,6 +83,12 @@ so the existing `MISPRICE_OUT_DIR=out` writes durable SQLite, lock, and JSONL
 files to `/var/lib/misprice-pm/out` even with `ProtectSystem=strict`.  Do not
 point the unit's working directory back to `/opt/misprice_pm`.
 
+For this repository deployed at `/opt/cor_pol` as the `ubuntu` user, install
+`deploy/systemd/cor-pol.service.example` as `/etc/systemd/system/cor-pol.service`.
+It reads the existing `/opt/cor_pol/.env` directly and starts the installed
+`python -m misprice_pm.runner --forever` module from `/opt/cor_pol/src`; it
+never references the removed legacy `main.py` entrypoint.
+
 Only one process may own the SQLite runtime lock. The scheduler waits for the next boundary rather
 than joining a market mid-round.
 

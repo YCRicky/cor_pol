@@ -79,6 +79,12 @@ When using the included systemd unit, keep `MISPRICE_OUT_DIR=out` in
 `/var/lib/misprice-pm/out`; do not run the protected service with
 `WorkingDirectory=/opt/misprice_pm`.
 
+For the current `cor_pol` checkout deployed at `/opt/cor_pol`, use
+`deploy/systemd/cor-pol.service.example` as `cor-pol.service`. It reads the
+existing `/opt/cor_pol/.env` and starts `python -m misprice_pm.runner
+--forever` from the repository source, rather than the removed legacy
+`main.py`.
+
 `--preflight` sends no order. It uses the supplied static L2 API credentials,
 then performs authenticated checks and startup reconciliation. If an earlier
 execution remains unknown, new risk stays frozen until the CLOB evidence is
