@@ -3,7 +3,7 @@ import urllib.parse
 
 import pytest
 
-from misprice_pm.notifier import Notifier, format_event
+from aftertake.notifier import Notifier, format_event
 
 
 class FakeResponse:
@@ -20,7 +20,7 @@ class FakeResponse:
         return json.dumps(self.payload).encode()
 
 
-def test_notifier_posts_cor_pol_environment_to_telegram_and_requires_ok(monkeypatch):
+def test_notifier_posts_aftertake_environment_to_telegram_and_requires_ok(monkeypatch):
     captured = {}
 
     def fake_urlopen(request, timeout):
@@ -29,7 +29,7 @@ def test_notifier_posts_cor_pol_environment_to_telegram_and_requires_ok(monkeypa
         captured["timeout"] = timeout
         return FakeResponse({"ok": True, "result": {"message_id": 1}})
 
-    monkeypatch.setattr("misprice_pm.notifier.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("aftertake.notifier.urllib.request.urlopen", fake_urlopen)
 
     assert Notifier(token="bot-token", chat_id="-100123").send("hello") is True
     assert captured["url"].endswith("/botbot-token/sendMessage")
@@ -39,7 +39,7 @@ def test_notifier_posts_cor_pol_environment_to_telegram_and_requires_ok(monkeypa
 
 def test_notifier_rejects_telegram_level_error_even_on_http_success(monkeypatch):
     monkeypatch.setattr(
-        "misprice_pm.notifier.urllib.request.urlopen",
+        "aftertake.notifier.urllib.request.urlopen",
         lambda *args, **kwargs: FakeResponse({"ok": False, "description": "chat not found"}),
     )
 
@@ -51,7 +51,7 @@ def test_notifier_sanitizes_transport_error_that_contains_token_url(monkeypatch)
     def fail(*args, **kwargs):
         raise OSError("https://api.telegram.org/botSUPER-SECRET/sendMessage")
 
-    monkeypatch.setattr("misprice_pm.notifier.urllib.request.urlopen", fail)
+    monkeypatch.setattr("aftertake.notifier.urllib.request.urlopen", fail)
 
     with pytest.raises(RuntimeError) as exc_info:
         Notifier(token="SUPER-SECRET", chat_id="chat").send("hello")
@@ -91,8 +91,34 @@ def test_notifier_sanitizes_transport_error_that_contains_token_url(monkeypatch)
 def test_operator_lifecycle_messages_are_stable(kind, payload, headline):
     text = format_event(kind, payload, "btc-updown-5m-0")
 
-    assert text.startswith(f"[Misprice PM] {headline}")
+    assert text.startswith(f"[Aftertake] {headline}")
     assert "btc-updown-5m-0" in text
+    assert "token" not in text.lower()
+
+
+def test_dry_run_entry_message_reports_simulated_take_price_and_available_size():
+    text = format_event(
+        "entry",
+        {
+            "side": "NO",
+            "filled_qty": 5,
+            "avg_price": 0.64,
+            "requested_price": 0.64,
+            "requested_qty": 5,
+            "available_size": 18,
+            "status": "shadow_fill",
+            "order_id": "shadow-abc",
+            "dry_run": True,
+            "simulated_take": True,
+        },
+        "btc-updown-5m-0",
+    )
+
+    assert text.startswith("[Aftertake] DRY_RUN_SIMULATED_TAKE")
+    assert "take_price=0.6400" in text
+    assert "available_size=18.0000" in text
+    assert "simulated_take=true" in text
+    assert "dry_run=true" in text
     assert "token" not in text.lower()
 
 

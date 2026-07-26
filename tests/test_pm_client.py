@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from misprice_pm.pm_client import (
+from aftertake.pm_client import (
     GammaMarket,
     GeoStatus,
     LivePreflightError,
@@ -78,6 +78,13 @@ def test_geoblock_status_parses_official_response_without_bypass():
 
     assert status.blocked is True
     assert status.country == "TW"
+
+
+def test_public_http_client_has_no_hard_coded_ip_or_curl_resolve_fallback():
+    client = PublicHttpClient()
+
+    assert not hasattr(client, "_resolve_ip")
+    assert not hasattr(client, "_curl_resolved_json")
 
 
 def test_v2_preflight_refuses_blocked_geography_before_balance_checks():
@@ -228,3 +235,42 @@ def test_http_425_retries_the_same_signed_order_object():
     assert result["orderID"] == "order-1"
     assert len(client.posted) == 2
     assert client.posted[0] is client.posted[1]
+
+
+def test_fast_post_close_submission_does_not_retry_a_matching_engine_restart():
+    class Args:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class Options:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class Client:
+        def __init__(self):
+            self.posted = []
+
+        def create_order(self, args, options=None):
+            return object()
+
+        def post_order(self, order, order_type):
+            self.posted.append(order)
+            raise RuntimeError("HTTP 425 Too Early")
+
+    client = Client()
+    gateway = V2ClobGateway(
+        client,
+        {
+            "OrderArgs": Args,
+            "PartialCreateOrderOptions": Options,
+            "BUY": "BUY",
+            "OrderType": type("OrderType", (), {"GTC": "GTC"}),
+        },
+        sleep=lambda _seconds: (_ for _ in ()).throw(AssertionError("fast path must not sleep")),
+    )
+    metadata = MarketMetadata("condition", "0.01", 1, False, 0.07, {}, {})
+
+    with pytest.raises(RuntimeError, match="425"):
+        gateway.submit_limit_buy_fast("token", 0.5, 5, metadata)
+
+    assert len(client.posted) == 1

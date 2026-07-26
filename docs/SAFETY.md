@@ -1,66 +1,22 @@
-# Safety Policy
+# Execution safety
 
-## Fail-closed defaults
-
-```text
-MISPRICE_DRY_RUN=true
-```
-
-Changing `MISPRICE_DRY_RUN` to `false` requires a valid CLOB V2 wallet
-identity and its complete static L2 API credential set before an authenticated
-client is constructed.
-
-## Protocol checks
-
-The EC2 systemd unit runs a no-order deployment check before it starts the
-live loop. It refuses to start if Binance, Gamma, the CLOB book or
-authenticated CLOB account check fails, or if the configured Telegram bot does
-not acknowledge its `DEPLOYMENT_CHECK_OK` message.
-
-Every real entry rechecks:
-
-- official geo response and CLOB close-only mode
-- pUSD balance and allowance, including the final executable order and platform fee
-- active Gamma market and condition ID
-- explicit outcome-to-token agreement between Gamma and CLOB
-- CLOB tick size, minimum order size, neg-risk, and fee parameters
-- orderbook source timestamps and displayed best-ask depth
-
-The live endpoint and geo endpoint cannot be replaced through environment variables.
-
-## Order lifecycle
-
-An entry intent is committed to SQLite before any network submission. A CLOB acknowledgement is not
-a fill. The runtime polls authenticated order/trade state, cancels the short-lived GTC remainder,
-and records only confirmed matched quantity.
-
-Timeout, missing order ID, non-terminal cancel, process interruption, or ambiguous SDK error becomes
-`execution_unknown`. New entries freeze. The process does not guess or create a new signed order.
-The only transport replay is a bounded HTTP 425 retry of the exact same signed order object.
-
-## Risk
-
-- one entry reservation per market
-- one process per state database
-- requested quantity cannot exceed displayed best-ask depth
-- the strategy's daily-loss, open-position, consecutive-loss, and entry-cooldown limits
-- notifications cannot change execution state
-
-Telegram reports the operator-visible lifecycle (signal, confirmed fill, no-fill/cancel, blocked or
-unknown execution, no-entry round, and settlement). A Telegram API response is successful only when
-its JSON body contains `ok=true`. Submission notification is dispatched off the reconciliation
-thread so Telegram latency cannot extend the order TTL. The managed worker is drained after terminal
-reconciliation and during shutdown; a bounded drain timeout is audited before SQLite closes.
-Notification failures never trigger order retries.
-
-## Secrets and geography
-
-Never commit `.env`, signer keys, CLOB L2 credentials, or Telegram tokens.
-Do not use a proxy, custom DNS/IP mapping, or alternate endpoint to evade geographic restrictions.
-If the official response blocks the current egress, the runtime refuses new orders.
-
-## Settlement
-
-Only official PM/Gamma resolution settles PnL. Actual fill quantity and average price are required.
-Actual recorded fee is preferred; otherwise the per-market fee parameters captured at entry are
-used. Settlement rows are immutable and conflicting duplicates are rejected.
+- The default is `AFTERTAKE_DRY_RUN=true`.
+- A live start requires valid CLOB V2 credentials, funder/signature identity,
+  official geoblock clearance, non-close-only account status, pUSD balance and
+  allowance, CLOB market metadata and matching Gamma outcome token IDs.
+- Live mode performs an official pre-close account/allowance check, then sizes
+  the post-close entry from the already observed websocket ask. Worst-case cost
+  including market and Builder taker fees is capped by
+  `AFTERTAKE_LIVE_MAX_ACCOUNT_RISK_FRACTION` of the CLOB collateral balance and
+  by available allowance.
+- The calculated final live quantity must pass the same five bid-support checks
+  as the candidate. A small shadow quantity never authorizes a larger order.
+- It submits one GTC limit order, has a five-second lifetime, and explicitly
+  reconciles/cancels it. It never auto-retries a possibly submitted order.
+- SQLite WAL persists one reservation per market. Unknown execution freezes
+  new risk until an operator reconciles it.
+- Dry-run keeps the configured `AFTERTAKE_QTY`. Live mode does not use a fixed
+  five-share quantity: it takes as much displayed ask depth as allowed by the
+  account risk budget, then floors size to `AFTERTAKE_LIVE_QTY_FLOOR_STEP`
+  before order submission. It never rounds size upward.
+- Telegram failures are recorded but never alter order state or trigger a retry.

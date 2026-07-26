@@ -1,32 +1,21 @@
 import pytest
 
-from misprice_pm.config import Settings
+from aftertake.config import Settings
 
 
 def _clear_env(monkeypatch):
-    monkeypatch.setattr("misprice_pm.config.load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr("aftertake.config.load_dotenv", lambda *args, **kwargs: None)
     for name in (
-        "MISPRICE_DRY_RUN",
-        "MISPRICE_ASSET",
-        "MISPRICE_BINANCE_SYMBOL",
-        "MISPRICE_QTY",
-        "MISPRICE_MIN_ENTRY_ASK",
-        "MISPRICE_MAX_ENTRY_ASK",
-        "MISPRICE_MIN_TRANSITION_BP",
-        "MISPRICE_MAX_PRE_ABS_BP",
-        "MISPRICE_MIN_ABS_BP",
-        "MISPRICE_REPRICE_PER_BP",
-        "MISPRICE_MIN_LAG_DEPTH",
-        "MISPRICE_MIN_ELAPSED_S",
-        "MISPRICE_MAX_ELAPSED_S",
-        "MISPRICE_BAN_ELAPSED_START_S",
-        "MISPRICE_BAN_ELAPSED_END_S",
-        "MISPRICE_LOOP_INTERVAL_S",
-        "MISPRICE_OUT_DIR",
-        "MISPRICE_MAX_DAILY_LOSS",
-        "MISPRICE_MAX_OPEN_POSITIONS",
-        "MISPRICE_MAX_CONSECUTIVE_LOSSES",
-        "MISPRICE_MIN_SECONDS_BETWEEN_ENTRIES",
+        "AFTERTAKE_DRY_RUN",
+        "AFTERTAKE_ASSET",
+        "AFTERTAKE_QTY",
+        "AFTERTAKE_OUT_DIR",
+        "AFTERTAKE_MAX_DAILY_LOSS",
+        "AFTERTAKE_MAX_OPEN_POSITIONS",
+        "AFTERTAKE_MAX_CONSECUTIVE_LOSSES",
+        "AFTERTAKE_MIN_SECONDS_BETWEEN_ENTRIES",
+        "AFTERTAKE_LIVE_MAX_ACCOUNT_RISK_FRACTION",
+        "AFTERTAKE_LIVE_QTY_FLOOR_STEP",
         "CLOB_API_URL",
         "CHAIN_ID",
         "POLYMARKET_PRIVATE_KEY",
@@ -36,106 +25,51 @@ def _clear_env(monkeypatch):
         "FUNDER_ADDRESS",
         "SIGNATURE_TYPE",
         "POLY_BUILDER_CODE",
-        "PRIVATE_KEY",
-        "CLOB_API_KEY",
-        "CLOB_SECRET",
-        "CLOB_PASS_PHRASE",
-        "CLOB_SIGNATURE_TYPE",
-        "CLOB_FUNDER_ADDRESS",
         "TG_BOT_TOKEN",
         "TG_CHAT_ID",
     ):
         monkeypatch.delenv(name, raising=False)
 
 
-def test_defaults_use_v3_repricing_lag_strategy_controls(monkeypatch):
+def test_defaults_are_aftertake_only(monkeypatch):
     _clear_env(monkeypatch)
-
     settings = Settings.from_env()
 
     assert settings.dry_run is True
-    assert settings.max_entry_ask == 0.65
-    assert settings.min_transition_bp == 3.0
-    assert settings.max_pre_abs_bp == 2.5
-    assert settings.min_abs_bp == 3.5
-    assert settings.reprice_per_bp == 0.04
-    assert settings.min_lag_depth == 0.035
-    assert settings.min_elapsed_s == 20
-    assert settings.max_elapsed_s == 220
-    assert settings.ban_elapsed_start_s == -1
-    assert settings.ban_elapsed_end_s == -1
-    assert settings.max_daily_loss == 25.0
-    assert settings.max_open_positions == 1
-    assert settings.max_consecutive_losses == 5
-    assert settings.min_seconds_between_entries == 60
-    assert settings.polymarket_signature_type is None
+    assert settings.asset == "BTC"
+    assert settings.qty == 5
+    assert settings.live_max_account_risk_fraction == 0.5
+    assert settings.live_quantity_floor_step == 1.0
+    assert settings.state_db.name == "aftertake.sqlite3"
 
 
-def test_live_requires_canonical_account_identity(monkeypatch):
+def test_live_requires_canonical_clob_identity(monkeypatch):
     _clear_env(monkeypatch)
-    monkeypatch.setenv("MISPRICE_DRY_RUN", "false")
-
+    monkeypatch.setenv("AFTERTAKE_DRY_RUN", "false")
     with pytest.raises(ValueError, match="POLYMARKET_PRIVATE_KEY"):
         Settings.from_env()
 
 
-def test_requested_polymarket_account_environment_is_accepted(monkeypatch):
+def test_live_accepts_requested_polymarket_account_environment(monkeypatch):
     _clear_env(monkeypatch)
-    monkeypatch.setenv("MISPRICE_DRY_RUN", "false")
+    monkeypatch.setenv("AFTERTAKE_DRY_RUN", "false")
     monkeypatch.setenv("CLOB_API_URL", "https://clob.polymarket.com")
     monkeypatch.setenv("CHAIN_ID", "137")
     monkeypatch.setenv("POLYMARKET_PRIVATE_KEY", "0x" + "a" * 64)
     monkeypatch.setenv("FUNDER_ADDRESS", "0x" + "b" * 40)
     monkeypatch.setenv("SIGNATURE_TYPE", '"2"')
-    monkeypatch.setenv("POLYMARKET_API_KEY", "existing-key")
-    monkeypatch.setenv("POLYMARKET_API_SECRET", "existing-secret")
-    monkeypatch.setenv("POLYMARKET_PASSPHRASE", "existing-passphrase")
-    monkeypatch.setenv("POLY_BUILDER_CODE", "0x" + "1" * 64)
+    monkeypatch.setenv("POLYMARKET_API_KEY", "key")
+    monkeypatch.setenv("POLYMARKET_API_SECRET", "secret")
+    monkeypatch.setenv("POLYMARKET_PASSPHRASE", "passphrase")
 
     settings = Settings.from_env()
-
     assert settings.is_live is True
-    assert settings.clob_host == "https://clob.polymarket.com"
-    assert settings.polymarket_chain_id == 137
     assert settings.polymarket_signature_type == 2
-    assert settings.builder_code == "0x" + "1" * 64
     assert settings.has_static_api_creds is True
-    assert settings.clob_api_key == "existing-key"
 
 
-def test_live_requires_the_established_cor_pol_l2_credential_set(monkeypatch):
-    _clear_env(monkeypatch)
-    monkeypatch.setenv("MISPRICE_DRY_RUN", "false")
-    monkeypatch.setenv("POLYMARKET_PRIVATE_KEY", "0x" + "a" * 64)
-    monkeypatch.setenv("FUNDER_ADDRESS", "0x" + "b" * 40)
-    monkeypatch.setenv("SIGNATURE_TYPE", "2")
-
-    with pytest.raises(
-        ValueError,
-        match="POLYMARKET_API_KEY, POLYMARKET_API_SECRET, POLYMARKET_PASSPHRASE",
-    ):
-        Settings.from_env()
-
-
-def test_partial_l2_credentials_are_rejected_even_in_dry_mode(monkeypatch):
+def test_partial_l2_credentials_are_rejected_in_shadow_mode(monkeypatch):
     _clear_env(monkeypatch)
     monkeypatch.setenv("POLYMARKET_API_KEY", "key-only")
-
     with pytest.raises(ValueError, match="credentials"):
         Settings.from_env()
-
-
-def test_legacy_account_environment_names_are_ignored(monkeypatch):
-    _clear_env(monkeypatch)
-    monkeypatch.setenv("PRIVATE_KEY", "0x" + "a" * 64)
-    monkeypatch.setenv("CLOB_API_KEY", "legacy-key")
-    monkeypatch.setenv("CLOB_SECRET", "legacy-secret")
-    monkeypatch.setenv("CLOB_PASS_PHRASE", "legacy-passphrase")
-    monkeypatch.setenv("CLOB_SIGNATURE_TYPE", "1")
-    monkeypatch.setenv("CLOB_FUNDER_ADDRESS", "0x" + "b" * 40)
-
-    settings = Settings.from_env()
-
-    assert settings.polymarket_private_key == ""
-    assert settings.clob_api_key == ""
-    assert settings.polymarket_signature_type is None

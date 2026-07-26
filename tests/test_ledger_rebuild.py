@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from misprice_pm.ledger import rebuild_ledger
+from aftertake.ledger import rebuild_ledger
 
 
 def append(path: Path, row: dict):
@@ -12,7 +12,7 @@ def append(path: Path, row: dict):
 def test_rebuild_ledger_counts_pm_settles_only(tmp_path):
     log = tmp_path / "run.jsonl"
     append(log, {"kind": "trade_open", "slug": "a", "side": "NO", "entry_price": 0.44, "qty": 5})
-    append(log, {"kind": "settle", "slug": "a", "settlement_source": "binance", "pnl": 99, "win": True})
+    append(log, {"kind": "settle", "slug": "a", "settlement_source": "other", "pnl": 99, "win": True})
     append(log, {"kind": "settle", "slug": "a", "settlement_source": "pm", "pnl": -2.38624, "win": False})
     append(log, {"kind": "settle", "slug": "b", "settlement_source": "jina", "pnl": 7, "win": True})
 

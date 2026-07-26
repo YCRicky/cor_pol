@@ -50,7 +50,7 @@ class RuntimeLock:
         except (OSError, BlockingIOError) as exc:
             self._handle.close()
             self._handle = None
-            raise RuntimeError("another misprice-pm process holds the runtime lock") from exc
+            raise RuntimeError("another aftertake process holds the runtime lock") from exc
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:

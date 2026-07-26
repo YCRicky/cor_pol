@@ -71,7 +71,7 @@ class HeartbeatLoop:
     def start(self) -> None:
         if self._thread is not None:
             return
-        self._thread = threading.Thread(target=self._run, daemon=True, name="misprice-pm-heartbeat")
+        self._thread = threading.Thread(target=self._run, daemon=True, name="aftertake-heartbeat")
         self._thread.start()
 
     def _run(self) -> None:
@@ -169,7 +169,7 @@ class OrderExecutor:
         thread = threading.Thread(
             target=dispatch,
             daemon=True,
-            name="misprice-pm-order-event",
+            name="aftertake-order-event",
         )
         with self._event_threads_lock:
             self._event_threads.append((thread, kind))
@@ -190,22 +190,35 @@ class OrderExecutor:
                     {"event": kind, "error": "delivery_timeout"},
                 )
 
-    def execute_reserved(self, record: OrderRecord, metadata: MarketMetadata) -> OrderResult:
+    def execute_reserved(
+        self, record: OrderRecord, metadata: MarketMetadata, *, fast: bool = False
+    ) -> OrderResult:
         if self.settings.dry_run:
-            raw = {"mode": "shadow", "reason": "MISPRICE_DRY_RUN=true"}
-            self.store.mark_terminal_execution(record.intent_id, 0.0, 0.0, raw, "shadow_no_order")
+            raw = {
+                "mode": "shadow",
+                "reason": "AFTERTAKE_DRY_RUN=true",
+                "simulated_take": True,
+                "no_live_order": True,
+            }
+            self.store.mark_terminal_execution(
+                record.intent_id,
+                record.requested_qty,
+                record.requested_price,
+                raw,
+                "shadow_fill",
+            )
             return OrderResult(
                 dry_run=True,
                 intent_id=record.intent_id,
                 order_id="shadow-" + uuid.uuid4().hex[:12],
-                status="shadow_no_order",
+                status="shadow_fill",
                 side=record.side,
                 token_id=record.token_id,
                 price=record.requested_price,
                 requested_qty=record.requested_qty,
-                filled_qty=0.0,
-                avg_price=0.0,
-                notional=0.0,
+                filled_qty=record.requested_qty,
+                avg_price=record.requested_price,
+                notional=record.requested_price * record.requested_qty,
                 terminal=True,
                 submission_state="not_submitted",
                 raw=raw,
@@ -217,9 +230,15 @@ class OrderExecutor:
         heartbeat.start()
         try:
             try:
-                submitted = self.gateway.submit_limit_buy(
-                    record.token_id, record.requested_price, record.requested_qty, metadata
-                )
+                fast_submit = getattr(self.gateway, "submit_limit_buy_fast", None) if fast else None
+                if fast_submit is not None:
+                    submitted = fast_submit(
+                        record.token_id, record.requested_price, record.requested_qty, metadata
+                    )
+                else:
+                    submitted = self.gateway.submit_limit_buy(
+                        record.token_id, record.requested_price, record.requested_qty, metadata
+                    )
             except Exception as exc:
                 # Once the gateway call starts, even a local-looking exception
                 # may have occurred while parsing a successful HTTP response.

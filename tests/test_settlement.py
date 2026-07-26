@@ -1,6 +1,6 @@
 import pytest
 
-from misprice_pm.settlement import fee_total, settle_trade
+from aftertake.settlement import fee_total, settle_trade
 
 
 def test_fee_total_uses_supplied_current_market_formula():

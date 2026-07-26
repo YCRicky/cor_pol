@@ -5,6 +5,12 @@ __pycache__/
 .ruff_cache/
 .env
 out/
+logs/
+pmdata_cache/
+*.parquet
+reports/*.json
+scripts/aftertake_launchd.sh
+uv.lock
 .DS_Store
 
 *.egg-info/

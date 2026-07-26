@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "misprice-pm"
+name = "aftertake"
 version = "0.1.0"
-description = "Standalone Polymarket BTC 5m path-transition underreaction strategy"
+description = "Standalone Polymarket BTC 5m post-close CLOB residual-ask strategy"
 readme = "README.md"
 # py-clob-client-v2 1.1.0 itself requires Python >=3.9.10.
 requires-python = ">=3.9.10"
@@ -15,10 +15,10 @@ dependencies = []
 dev = ["pytest>=7,<9", "ruff>=0.8"]
 # CLOB V1 is retired in production.  Pin the reviewed V2 client so a deploy is
 # reproducible; upgrade it deliberately with the integration tests.
-live = ["py-clob-client-v2==1.1.0"]
+live = ["py-clob-client-v2==1.1.0", "websocket-client==1.8.0"]
 
 [project.scripts]
-misprice-pm = "misprice_pm.runner:main"
+aftertake = "aftertake.runner:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

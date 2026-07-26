@@ -1,4 +1,4 @@
-"""Original strategy settings and the official CLOB V2 account identity."""
+"""Aftertake runtime settings and official CLOB V2 account identity."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ _PRIVATE_KEY_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
 
 
 def load_dotenv(path: Union[str, Path] = ".env") -> None:
-    """Load a local dotenv file without overwriting process-level secrets."""
+    """Load a local dotenv file without replacing process-level values."""
 
     dotenv_path = Path(path)
     if not dotenv_path.exists():
@@ -61,12 +61,7 @@ def _signature_type_from_env() -> Optional[int]:
     raw = os.getenv("SIGNATURE_TYPE", "").strip().strip('"').strip("'")
     if not raw:
         return None
-    aliases = {
-        "EOA": 0,
-        "POLY_PROXY": 1,
-        "GNOSIS_SAFE": 2,
-        "POLY_1271": 3,
-    }
+    aliases = {"EOA": 0, "POLY_PROXY": 1, "GNOSIS_SAFE": 2, "POLY_1271": 3}
     normalized = raw.upper()
     if normalized in aliases:
         return aliases[normalized]
@@ -78,40 +73,26 @@ def _signature_type_from_env() -> Optional[int]:
 
 @dataclass(frozen=True)
 class Settings:
-    # Existing strategy controls; these remain operator-owned environment values.
+    # Aftertake strategy controls.
     dry_run: bool = True
     asset: str = "BTC"
-    binance_symbol: str = "BTCUSDT"
     qty: float = 5.0
-    min_entry_ask: float = 0.35
-    max_entry_ask: float = 0.65
-    min_transition_bp: float = 3.0
-    max_pre_abs_bp: float = 2.5
-    min_abs_bp: float = 3.5
-    reprice_per_bp: float = 0.04
-    min_lag_depth: float = 0.035
-    min_elapsed_s: int = 20
-    max_elapsed_s: int = 220
-    ban_elapsed_start_s: int = -1
-    ban_elapsed_end_s: int = -1
-    loop_interval_s: float = 1.0
     out_dir: Path = Path("out")
     max_daily_loss: float = 25.0
     max_open_positions: int = 1
     max_consecutive_losses: int = 5
     min_seconds_between_entries: int = 60
+    live_max_account_risk_fraction: float = 0.50
+    live_quantity_floor_step: float = 1.0
 
-    # Fixed execution mechanics; they are not strategy or account settings.
-    state_db: Path = Path("out/misprice_pm.sqlite3")
-    max_book_age_s: float = 2.0
-    max_spot_age_s: float = 3.0
-    max_open_capture_delay_s: float = 3.0
+    # Fixed execution mechanics, not environment strategy settings.
+    state_db: Path = Path("out/aftertake.sqlite3")
     order_ttl_s: float = 5.0
     reconcile_timeout_s: float = 8.0
     heartbeat_interval_s: float = 5.0
     builder_code: str = ""
 
-    # Official CLOB V2 account values, loaded from the deployment contract.
+    # Official CLOB V2 account fields.
     gamma_host: str = DEFAULT_GAMMA_HOST
     clob_host: str = DEFAULT_CLOB_HOST
     geo_endpoint: str = DEFAULT_GEO_ENDPOINT
@@ -130,38 +111,30 @@ class Settings:
         return not self.dry_run
 
     @property
+    def runtime_lock(self) -> Path:
+        return self.out_dir / "aftertake.runtime.lock"
+
+    @property
     def has_static_api_creds(self) -> bool:
         return bool(self.clob_api_key and self.clob_api_secret and self.clob_api_passphrase)
 
     def validate(self) -> None:
         if self.asset.upper() != "BTC":
-            raise ValueError("MISPRICE_ASSET currently supports BTC only")
+            raise ValueError("AFTERTAKE_ASSET currently supports BTC only")
         if self.qty <= 0:
-            raise ValueError("MISPRICE_QTY must be > 0")
-        if not 0 < self.min_entry_ask < self.max_entry_ask < 1:
-            raise ValueError("entry ask bounds must satisfy 0 < min < max < 1")
-        if self.min_transition_bp <= 0:
-            raise ValueError("MISPRICE_MIN_TRANSITION_BP must be > 0")
-        if self.max_pre_abs_bp < 0:
-            raise ValueError("MISPRICE_MAX_PRE_ABS_BP must be >= 0")
-        if self.min_abs_bp <= 0:
-            raise ValueError("MISPRICE_MIN_ABS_BP must be > 0")
-        if self.reprice_per_bp <= 0:
-            raise ValueError("MISPRICE_REPRICE_PER_BP must be > 0")
-        if self.min_lag_depth < 0:
-            raise ValueError("MISPRICE_MIN_LAG_DEPTH must be >= 0")
-        if self.min_elapsed_s < 0 or self.max_elapsed_s <= self.min_elapsed_s:
-            raise ValueError("elapsed bounds must satisfy 0 <= min < max")
-        if self.loop_interval_s <= 0:
-            raise ValueError("MISPRICE_LOOP_INTERVAL_S must be > 0")
+            raise ValueError("AFTERTAKE_QTY must be > 0")
         if self.max_daily_loss <= 0:
-            raise ValueError("MISPRICE_MAX_DAILY_LOSS must be > 0")
+            raise ValueError("AFTERTAKE_MAX_DAILY_LOSS must be > 0")
         if self.max_open_positions <= 0:
-            raise ValueError("MISPRICE_MAX_OPEN_POSITIONS must be > 0")
+            raise ValueError("AFTERTAKE_MAX_OPEN_POSITIONS must be > 0")
         if self.max_consecutive_losses <= 0:
-            raise ValueError("MISPRICE_MAX_CONSECUTIVE_LOSSES must be > 0")
+            raise ValueError("AFTERTAKE_MAX_CONSECUTIVE_LOSSES must be > 0")
         if self.min_seconds_between_entries < 0:
-            raise ValueError("MISPRICE_MIN_SECONDS_BETWEEN_ENTRIES must be >= 0")
+            raise ValueError("AFTERTAKE_MIN_SECONDS_BETWEEN_ENTRIES must be >= 0")
+        if not 0 < self.live_max_account_risk_fraction <= 1:
+            raise ValueError("AFTERTAKE_LIVE_MAX_ACCOUNT_RISK_FRACTION must be in (0, 1]")
+        if self.live_quantity_floor_step <= 0:
+            raise ValueError("AFTERTAKE_LIVE_QTY_FLOOR_STEP must be > 0")
         if not 0 < self.order_ttl_s <= 10:
             raise ValueError("internal order TTL must be in (0, 10]")
         if not 0 < self.reconcile_timeout_s <= 30:
@@ -192,30 +165,19 @@ class Settings:
     @classmethod
     def from_env(cls) -> Settings:
         load_dotenv()
-        out_dir = Path(os.getenv("MISPRICE_OUT_DIR", "out"))
+        out_dir = Path(os.getenv("AFTERTAKE_OUT_DIR", "out"))
         settings = cls(
-            dry_run=_bool("MISPRICE_DRY_RUN", True),
-            asset=os.getenv("MISPRICE_ASSET", "BTC").strip().upper(),
-            binance_symbol=os.getenv("MISPRICE_BINANCE_SYMBOL", "BTCUSDT").strip().upper(),
-            qty=_float("MISPRICE_QTY", 5.0),
-            min_entry_ask=_float("MISPRICE_MIN_ENTRY_ASK", 0.35),
-            max_entry_ask=_float("MISPRICE_MAX_ENTRY_ASK", 0.65),
-            min_transition_bp=_float("MISPRICE_MIN_TRANSITION_BP", 3.0),
-            max_pre_abs_bp=_float("MISPRICE_MAX_PRE_ABS_BP", 2.5),
-            min_abs_bp=_float("MISPRICE_MIN_ABS_BP", 3.5),
-            reprice_per_bp=_float("MISPRICE_REPRICE_PER_BP", 0.04),
-            min_lag_depth=_float("MISPRICE_MIN_LAG_DEPTH", 0.035),
-            min_elapsed_s=_int("MISPRICE_MIN_ELAPSED_S", 20),
-            max_elapsed_s=_int("MISPRICE_MAX_ELAPSED_S", 220),
-            ban_elapsed_start_s=_int("MISPRICE_BAN_ELAPSED_START_S", -1),
-            ban_elapsed_end_s=_int("MISPRICE_BAN_ELAPSED_END_S", -1),
-            loop_interval_s=_float("MISPRICE_LOOP_INTERVAL_S", 1.0),
+            dry_run=_bool("AFTERTAKE_DRY_RUN", True),
+            asset=os.getenv("AFTERTAKE_ASSET", "BTC").strip().upper(),
+            qty=_float("AFTERTAKE_QTY", 5.0),
             out_dir=out_dir,
-            state_db=out_dir / "misprice_pm.sqlite3",
-            max_daily_loss=_float("MISPRICE_MAX_DAILY_LOSS", 25.0),
-            max_open_positions=_int("MISPRICE_MAX_OPEN_POSITIONS", 1),
-            max_consecutive_losses=_int("MISPRICE_MAX_CONSECUTIVE_LOSSES", 5),
-            min_seconds_between_entries=_int("MISPRICE_MIN_SECONDS_BETWEEN_ENTRIES", 60),
+            state_db=out_dir / "aftertake.sqlite3",
+            max_daily_loss=_float("AFTERTAKE_MAX_DAILY_LOSS", 25.0),
+            max_open_positions=_int("AFTERTAKE_MAX_OPEN_POSITIONS", 1),
+            max_consecutive_losses=_int("AFTERTAKE_MAX_CONSECUTIVE_LOSSES", 5),
+            min_seconds_between_entries=_int("AFTERTAKE_MIN_SECONDS_BETWEEN_ENTRIES", 60),
+            live_max_account_risk_fraction=_float("AFTERTAKE_LIVE_MAX_ACCOUNT_RISK_FRACTION", 0.50),
+            live_quantity_floor_step=_float("AFTERTAKE_LIVE_QTY_FLOOR_STEP", 1.0),
             builder_code=os.getenv("POLY_BUILDER_CODE", "").strip(),
             clob_host=os.getenv("CLOB_API_URL", DEFAULT_CLOB_HOST).strip().rstrip("/"),
             polymarket_private_key=os.getenv("POLYMARKET_PRIVATE_KEY", "").strip(),

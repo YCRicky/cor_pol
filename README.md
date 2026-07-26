@@ -1,127 +1,79 @@
-# Misprice PM
+# Aftertake
 
-Standalone BTC 5-minute Polymarket strategy with a fail-closed CLOB V2 execution layer.
+Aftertake is a standalone BTC 5-minute Polymarket CLOB strategy. It does not
+use a pre-close price-direction model or any outside price feed.
 
-The strategy thesis is now the Misprice v3 repricing-lag detector: enter only after a BTC
-path transition when the executable PM ask has measurably lagged its required repricing and
-that lag survives the final book check. Binance is signal-only. Official Polymarket/Gamma
-outcomes are the only settlement source.
+At the market frontend close, it watches the official public CLOB book for
+100--1000 ms. A side becomes a winner candidate only when its bid support stays
+persistent and the opposite side shows enough vacuum-score evidence. It may
+then take that same side only when a displayed residual ask is still executable.
+Dry-run keeps the configured quantity. Live mode sizes dynamically from the
+displayed ask depth and account collateral risk budget.
 
-## What is production-grade
+A cheap ask on the bid-vacuum side is always rejected. See
+[the strategy definition](docs/STRATEGY.md).
 
-- pinned `py-clob-client-v2`; no retired V1 client
-- explicit signer, signature type, deposit-wallet funder, pUSD balance and allowance checks
-- official geo and CLOB close-only checks before every real entry
-- fresh Gamma/CLOB metadata: outcome mapping, tick size, minimum size, neg-risk, platform fee,
-  and builder taker fee
-- SQLite WAL state written before submission, one entry per market, single-process lock
-- GTC limit order with worst-price protection, short TTL, explicit cancel, fill reconciliation,
-  and CLOB heartbeat
-- ambiguous submission/cancellation becomes `execution_unknown`; it is never blindly retried
-- confirmed fills, partial fills, PM-only settlement, and the strategy's original daily-loss,
-  open-position, loss-streak, and cooldown controls survive restarts
-
-Historical names such as `four_quadrant_v3` are dataset names only, not strategy names.
-The canonical strategy identity here is `Misprice v3 repricing-lag detector`.
-
-This is trading-capable software, not proof that an account, operator, or location is eligible.
-The process refuses new orders whenever the official geo endpoint blocks the current egress.
-
-## Install and verify
+## First deployment: dry run
 
 ```bash
+git clone https://github.com/YCRicky/aftertake.git
+cd aftertake
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -e '.[dev,live]'
 cp .env.example .env
-pytest -q
-misprice-pm --status
-misprice-pm --preflight --dry-run
+# Fill TG_BOT_TOKEN and TG_CHAT_ID, retain AFTERTAKE_DRY_RUN=true.
+aftertake --deployment-check
+aftertake --forever
 ```
 
-Run a continuous shadow service:
+`--deployment-check` sends no order. It requires an active Gamma market, a
+paired snapshot from the official CLOB WebSocket, and a successful Telegram
+message. In live mode it additionally checks official geo eligibility,
+close-only status, pUSD balance/allowance, market metadata and the Gamma/CLOB
+YES/NO token mapping.
 
-```bash
-misprice-pm --forever --dry-run
-```
+The continuous process waits for a fresh 5-minute boundary. It then keeps the
+WebSocket warm for the round, so it cannot backdate observations or act before
+the next real close.
 
-It waits for the next real 5-minute boundary. It never invents or backdates an opening BTC price.
+## Live mode
 
-## Live account settings
-
-Live mode requires all of the following locally:
+Only after the shadow results and operator logs are satisfactory, set:
 
 ```text
-MISPRICE_DRY_RUN=false
-CLOB_API_URL=https://clob.polymarket.com
-CHAIN_ID=137
+AFTERTAKE_DRY_RUN=false
 POLYMARKET_PRIVATE_KEY=0x...
 POLYMARKET_API_KEY=...
 POLYMARKET_API_SECRET=...
 POLYMARKET_PASSPHRASE=...
 FUNDER_ADDRESS=0x...
 SIGNATURE_TYPE="2"
-POLY_BUILDER_CODE=
+AFTERTAKE_LIVE_MAX_ACCOUNT_RISK_FRACTION=0.50
+AFTERTAKE_LIVE_QTY_FLOOR_STEP=1
 ```
 
-These are the exact current deployment names. `SIGNATURE_TYPE="2"` is passed to the CLOB V2 client,
-and `FUNDER_ADDRESS` must match that account form. Never commit `.env`, private keys, or L2 credentials.
+Then run `aftertake --deployment-check` again before `aftertake --forever`.
+Live execution is a single marketable GTC limit submission at the already
+observed winner-side ask. The submitted size is the largest floor-sized quantity
+that does not exceed displayed ask depth, collateral allowance, or
+`collateral_balance * AFTERTAKE_LIVE_MAX_ACCOUNT_RISK_FRACTION`. With the
+default integer floor step, a calculated 67.5 shares is submitted as 67, never
+68. That final quantity must also pass the same bid-support checks as the
+candidate; insufficient support blocks the order. It has a five-second order lifetime, explicit cancellation/reconciliation,
+no automatic submission retry, durable SQLite state, one entry attempt per
+market, and an `execution_unknown` freeze.
 
-Before a live service:
+Telegram reports `DEPLOYMENT_CHECK_OK`, `BOOT`, `ORDER_SUBMITTED`, actual
+`ENTRY_CONFIRMED` or `ORDER_RESULT`, `ENTRY_BLOCKED`, `ALERT`, round-level
+`NO_ENTRY`, and official Polymarket `SETTLE`. It does **not** send a separate
+signal notification.
 
-```bash
-misprice-pm --preflight
-misprice-pm --forever
-```
-
-When using the included systemd unit, keep `MISPRICE_OUT_DIR=out` in
-`/etc/misprice-pm.env`. The unit's managed state directory makes that path
-`/var/lib/misprice-pm/out`; do not run the protected service with
-`WorkingDirectory=/opt/misprice_pm`.
-
-For the current `cor_pol` checkout deployed at `/opt/cor_pol`, use
-`deploy/systemd/cor-pol.service.example` as `cor-pol.service`. It reads the
-existing `/opt/cor_pol/.env` and starts `python -m misprice_pm.runner
---forever` from the repository source, rather than the removed legacy
-`main.py`.
-
-`--preflight` sends no order. It uses the supplied static L2 API credentials,
-then performs authenticated checks and startup reconciliation. If an earlier
-execution remains unknown, new risk stays frozen until the CLOB evidence is
-reconciled.
-
-The EC2 `cor-pol.service` performs the stricter `--deployment-check` before
-every live loop. It sends no order, but requires successful Binance BTC spot,
-Gamma current-market discovery, YES/NO CLOB books, authenticated CLOB account
-and market metadata, writable SQLite state, and a successful Telegram reply.
-The Telegram `DEPLOYMENT_CHECK_OK` message must arrive before the normal live
-`BOOT` message and before any strategy round can run.
-
-On the EC2 host, use the checked-in deploy command after updating the checkout:
-
-```bash
-cd /opt/cor_pol
-git pull --ff-only
-bash deploy/ec2/deploy_cor_pol.sh
-```
-
-It installs the pinned live dependency, replaces the old systemd unit, reloads
-systemd, and restarts `cor-pol`. It refuses to start if required existing live
-or Telegram fields are blank; it never prints their values.
-
-## Telegram lifecycle
-
-Set the same variables used by `cor_pol`:
-
-```text
-TG_BOT_TOKEN=...
-TG_CHAT_ID=...
-```
-
-The runtime reports BOOT, strategy SIGNAL, confirmed ENTRY, zero-fill/cancel ORDER_RESULT,
-ENTRY_BLOCKED, execution ALERT, one NO_ENTRY summary per inactive round, and official PM SETTLE.
-Telegram must return `ok=true`; rejected or failed messages are written to the SQLite/JSONL audit
-trail and never change order state or cause an order retry.
+For EC2, use [deploy/ec2/deploy_aftertake.sh](deploy/ec2/deploy_aftertake.sh)
+and [deploy/systemd/aftertake.service.example](deploy/systemd/aftertake.service.example).
+The deployment script installs the checked-in systemd unit whose `ExecStartPre`
+runs `aftertake --deployment-check`; a service cannot start the strategy until
+that no-order check succeeds.
 
 See [RUNBOOK.md](docs/RUNBOOK.md), [SAFETY.md](docs/SAFETY.md), and
 [ARCHITECTURE.md](docs/ARCHITECTURE.md).

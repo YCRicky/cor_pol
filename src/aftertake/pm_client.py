@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import ssl
 import time
 import urllib.parse
 import urllib.request
@@ -124,16 +125,26 @@ class LivePreflight:
 
 
 class PublicHttpClient:
-    """Plain HTTPS client.  It intentionally has no IP/DNS bypass fallback."""
+    """Plain HTTPS client using the provider's official hostname and TLS path."""
 
-    def __init__(self, user_agent: str = "misprice-pm/0.2"):
+    def __init__(self, user_agent: str = "aftertake/0.2"):
         self.user_agent = user_agent
+        self._ssl_context = ssl.create_default_context(cafile=self._certifi_ca())
+
+    @staticmethod
+    def _certifi_ca() -> Optional[str]:
+        try:
+            import certifi  # type: ignore
+
+            return str(certifi.where())
+        except Exception:
+            return None
 
     def get_json(self, url: str, timeout: float = 20.0) -> Any:
         req = urllib.request.Request(
             url, headers={"User-Agent": self.user_agent, "Accept": "application/json"}
         )
-        with urllib.request.urlopen(req, timeout=timeout) as response:
+        with urllib.request.urlopen(req, timeout=timeout, context=self._ssl_context) as response:
             raw = response.read().decode("utf-8")
         return json.loads(raw)
 
@@ -245,9 +256,9 @@ class V2ClobGateway:
                 "Install the pinned live extra: pip install -e '.[live]'"
             ) from exc
 
-        # Settings.validate() requires this exact legacy L2 credential set for
-        # a live cor_pol-style account.  Keep the defensive check here too,
-        # because callers can construct Settings directly in code.
+        # Settings.validate() requires this exact L2 credential set for a live
+        # Aftertake account. Keep the defensive check here too because callers
+        # can construct Settings directly in code.
         if not settings.has_static_api_creds:
             raise RuntimeError(
                 "live V2 CLOB gateway requires POLYMARKET_API_KEY, POLYMARKET_API_SECRET, and POLYMARKET_PASSPHRASE"
@@ -389,6 +400,30 @@ class V2ClobGateway:
     def submit_limit_buy(
         self, token_id: str, price: float, qty: float, metadata: MarketMetadata
     ) -> Dict[str, Any]:
+        return self._submit_limit_buy(token_id, price, qty, metadata, retry_on_restart=True)
+
+    def submit_limit_buy_fast(
+        self, token_id: str, price: float, qty: float, metadata: MarketMetadata
+    ) -> Dict[str, Any]:
+        """Submit exactly once for a sub-second post-close opportunity.
+
+        The normal path deliberately retries a matching-engine restart.  That
+        delay is correct for ordinary entries but would turn a 100--1000ms
+        residual-ask attempt into a stale order.  The caller still treats an
+        ambiguous submission as ``execution_unknown`` and freezes new risk.
+        """
+
+        return self._submit_limit_buy(token_id, price, qty, metadata, retry_on_restart=False)
+
+    def _submit_limit_buy(
+        self,
+        token_id: str,
+        price: float,
+        qty: float,
+        metadata: MarketMetadata,
+        *,
+        retry_on_restart: bool,
+    ) -> Dict[str, Any]:
         if qty < metadata.min_order_size:
             raise LivePreflightError("requested quantity is below the CLOB minimum order size")
         order = self._client.create_order(
@@ -400,14 +435,15 @@ class V2ClobGateway:
             ),
         )
         raw = None
-        for attempt in range(3):
+        attempts = 3 if retry_on_restart else 1
+        for attempt in range(attempts):
             try:
                 # Reuse the exact same signed order across a short 425
                 # restart retry; never create a second salt/order intent.
                 raw = self._client.post_order(order, self._sdk["OrderType"].GTC)
                 break
             except Exception as exc:
-                if not is_matching_engine_restart_error(exc) or attempt == 2:
+                if not is_matching_engine_restart_error(exc) or attempt == attempts - 1:
                     raise
                 self._sleep(float(2**attempt))
         if not isinstance(raw, dict):

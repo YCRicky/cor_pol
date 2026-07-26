@@ -1,9 +1,9 @@
 import threading
 
-from misprice_pm.config import Settings
-from misprice_pm.execution import OrderExecutor
-from misprice_pm.pm_client import MarketMetadata
-from misprice_pm.state import StateStore
+from aftertake.config import Settings
+from aftertake.execution import OrderExecutor
+from aftertake.pm_client import MarketMetadata
+from aftertake.state import StateStore
 
 
 class FakeClock:
@@ -58,6 +58,27 @@ class ConfirmingGateway:
 class TimeoutGateway(ConfirmingGateway):
     def submit_limit_buy(self, token_id, price, qty, metadata):
         raise TimeoutError("request timed out after send")
+
+
+class FastGateway(ConfirmingGateway):
+    def __init__(self):
+        super().__init__()
+        self.fast_submits = 0
+
+    def submit_limit_buy_fast(self, token_id, price, qty, metadata):
+        self.fast_submits += 1
+        return {"orderID": "order-1", "status": "matched"}
+
+    def get_order(self, order_id):
+        return {
+            "id": order_id,
+            "status": "matched",
+            "size_matched": "5",
+            "average_price": "0.51",
+        }
+
+    def order_trades(self, token_id, order_id):
+        return [{"order_id": order_id, "size": "5", "price": "0.51"}]
 
 
 class RetryingCancelGateway(ConfirmingGateway):
@@ -172,16 +193,21 @@ def _reserve(store):
     )
 
 
-def test_dry_run_reservation_never_creates_a_real_fill(tmp_path):
+def test_dry_run_reservation_records_a_shadow_simulated_take_without_real_order(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     try:
         record = _reserve(store)
         result = OrderExecutor(Settings(dry_run=True), store).execute_reserved(record, _metadata())
 
         assert result.dry_run is True
-        assert result.status == "shadow_no_order"
-        assert result.filled_qty == 0
-        assert store.total_open_exposure() == 0
+        assert result.status == "shadow_fill"
+        assert result.submission_state == "not_submitted"
+        assert result.raw is not None
+        assert result.raw["no_live_order"] is True
+        assert result.raw["simulated_take"] is True
+        assert result.filled_qty == 5
+        assert result.avg_price == 0.51
+        assert store.total_open_exposure() == 2.55
     finally:
         store.close()
 
@@ -257,6 +283,28 @@ def test_unmatched_order_is_cancelled_and_cancel_425_is_retried(tmp_path):
         assert gateway.cancel_attempts == 2
         assert result.terminal is True
         assert result.status == "canceled"
+    finally:
+        store.close()
+
+
+def test_fast_execution_prefers_single_attempt_fast_gateway_method(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        record = _reserve(store)
+        gateway = FastGateway()
+        executor = OrderExecutor(
+            Settings(dry_run=False, order_ttl_s=1, reconcile_timeout_s=3, heartbeat_interval_s=1),
+            store,
+            gateway=gateway,
+            heartbeat_factory=NoopHeartbeat,
+        )
+
+        result = executor.execute_reserved(record, _metadata(), fast=True)
+
+        assert gateway.fast_submits == 1
+        assert gateway.submits == 0
+        assert result.terminal is True
+        assert result.filled_qty == 5
     finally:
         store.close()
 

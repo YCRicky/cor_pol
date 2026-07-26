@@ -2,9 +2,9 @@ import time
 
 import pytest
 
-from misprice_pm.config import Settings
-from misprice_pm.risk import RiskRejected, check_entry_risk
-from misprice_pm.state import RuntimeLock, StateStore
+from aftertake.config import Settings
+from aftertake.risk import RiskRejected, check_entry_risk
+from aftertake.state import RuntimeLock, StateStore
 
 
 def _reserve(store, slug="btc-updown-5m-0"):
