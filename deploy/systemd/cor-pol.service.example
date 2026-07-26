@@ -1,0 +1,29 @@
+[Unit]
+Description=cor_pol Aftertake Polymarket CLOB service
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=6
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+StateDirectory=cor-pol
+WorkingDirectory=/var/lib/cor-pol
+EnvironmentFile=/opt/cor_pol/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/cor_pol/src
+ExecStartPre=/opt/cor_pol/.venv/bin/python -m aftertake.runner --deployment-check
+ExecStart=/opt/cor_pol/.venv/bin/python -m aftertake.runner --forever
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=20
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

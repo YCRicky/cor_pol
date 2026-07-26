@@ -69,8 +69,9 @@ Telegram reports `DEPLOYMENT_CHECK_OK`, `BOOT`, `ORDER_SUBMITTED`, actual
 `NO_ENTRY`, and official Polymarket `SETTLE`. It does **not** send a separate
 signal notification.
 
-For EC2, use [deploy/ec2/deploy_aftertake.sh](deploy/ec2/deploy_aftertake.sh)
-and [deploy/systemd/aftertake.service.example](deploy/systemd/aftertake.service.example).
+For EC2, Aftertake deliberately keeps the existing cor_pol deployment identity:
+use [deploy/ec2/deploy_cor_pol.sh](deploy/ec2/deploy_cor_pol.sh) and
+[deploy/systemd/cor-pol.service.example](deploy/systemd/cor-pol.service.example).
 The deployment script installs the checked-in systemd unit whose `ExecStartPre`
 runs `aftertake --deployment-check`; a service cannot start the strategy until
 that no-order check succeeds.

@@ -16,14 +16,14 @@ JSONL audit trail. A qualifying candidate reserves the round and records a
 ## EC2
 
 ```bash
-cd /opt/aftertake
+cd /opt/cor_pol
 git pull --ff-only
-sudo bash deploy/ec2/deploy_aftertake.sh
-sudo journalctl -u aftertake -f
+sudo bash deploy/ec2/deploy_cor_pol.sh
+sudo journalctl -u cor-pol -f
 ```
 
-The script loads `/opt/aftertake/.env`, runs the checked-in preflight before
-systemd starts the loop, and keeps mutable state in `/var/lib/aftertake/out`.
+The script loads `/opt/cor_pol/.env`, runs the checked-in preflight before
+systemd starts the loop, and keeps mutable state in `/var/lib/cor-pol/out`.
 It does not print secret values.
 
 ## Live promotion
