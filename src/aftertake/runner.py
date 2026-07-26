@@ -356,6 +356,7 @@ def run_round(
                         round_end_ts=round_end,
                         now_ts=now,
                         qty=entry_qty,
+                        min_near_touch_qty_multiplier=1.0,
                     )
                     if sized_decision.action != "enter":
                         prefix = "live" if settings.is_live else "dry_run"

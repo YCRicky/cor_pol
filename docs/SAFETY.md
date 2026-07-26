@@ -9,8 +9,11 @@
   including market and Builder taker fees is capped by
   `AFTERTAKE_LIVE_MAX_ACCOUNT_RISK_FRACTION` of the CLOB collateral balance and
   by available allowance.
-- The calculated final live quantity must pass the same five bid-support checks
-  as the candidate. A small shadow quantity never authorizes a larger order.
+- The calculated final live quantity must pass final-size bid-support checks:
+  displayed best-bid size must cover the final quantity and near-touch depth
+  must be at least 1x final quantity. This prevents a small shadow baseline from
+  authorizing an unsupported larger order without rejecting executable small
+  residual asks solely because they lack a 2x depth buffer.
 - It submits one GTC limit order, has a five-second lifetime, and explicitly
   reconciles/cancels it. It never auto-retries a possibly submitted order.
 - SQLite WAL persists one reservation per market. Unknown execution freezes

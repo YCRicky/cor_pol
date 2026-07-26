@@ -64,6 +64,8 @@ class CaptureNotifier:
 class PairedStream:
     no_bid_size = 18
     no_near_depth = 18
+    yes_ask_size = 20
+    no_ask_size = 20
 
     def __init__(self, *, on_book, **_kwargs):
         self._on_book = on_book
@@ -75,8 +77,8 @@ class PairedStream:
             self._on_book(
                 PairedBook(
                     observed_at=ts,
-                    yes=SideBook(yes_bid, yes_size, yes_size, yes_ask, 20, yes_size if yes_near is None else yes_near),
-                    no=SideBook(no_bid, no_size, no_size, no_ask, 20, no_size if no_near is None else no_near),
+                    yes=SideBook(yes_bid, yes_size, yes_size, yes_ask, self.yes_ask_size, yes_size if yes_near is None else yes_near),
+                    no=SideBook(no_bid, no_size, no_size, no_ask, self.no_ask_size, no_size if no_near is None else no_near),
                 )
             )
 
@@ -95,6 +97,10 @@ class PairedStream:
 class DeepSupportPairedStream(PairedStream):
     no_bid_size = 40
     no_near_depth = 40
+
+
+class ResidualTenSupportPairedStream(PairedStream):
+    no_ask_size = 10
 
 
 class InstantGateway:
@@ -156,6 +162,29 @@ def test_shadow_round_uses_websocket_classifier_and_never_sends_an_order(tmp_pat
         assert len(open_positions) == 1
         assert open_positions[0].state == "filled"
         assert open_positions[0].filled_qty == 20
+    finally:
+        store.close()
+
+
+def test_residual_ten_ask_is_supported_when_near_touch_depth_covers_final_size(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        settings = Settings(dry_run=True, out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3")
+        decisions = run_round(
+            settings=settings,
+            store=store,
+            public=FakePublic(),
+            executor=OrderExecutor(settings, store),
+            live_gateway=None,
+            round_start=900,
+            clock=lambda: 1200.35,
+            sleep=lambda _: None,
+            stream_factory=ResidualTenSupportPairedStream,
+        )
+        assert any(item.action == "enter" and item.side == "NO" for item in decisions)
+        open_positions = store.open_positions()
+        assert len(open_positions) == 1
+        assert open_positions[0].filled_qty == 10
     finally:
         store.close()
 

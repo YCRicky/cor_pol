@@ -245,6 +245,7 @@ class PostCloseWinnerClassifier:
         now_ts: float,
         qty: float,
         max_entry_ask: Optional[float] = None,
+        min_near_touch_qty_multiplier: Optional[float] = None,
     ) -> PostCloseDecision:
         if qty <= 0:
             raise ValueError("qty must be > 0")
@@ -322,7 +323,12 @@ class PostCloseWinnerClassifier:
         loser_depths = [float(self._side(book, side)[1].near_touch_bid_depth) for book in confirmed]
         ask_series = [float(self._side(book, side)[0].best_ask or 0.0) for book in confirmed]
 
-        min_near_depth = qty * self.cfg.min_near_touch_qty_multiplier
+        near_touch_multiplier = (
+            float(min_near_touch_qty_multiplier)
+            if min_near_touch_qty_multiplier is not None
+            else self.cfg.min_near_touch_qty_multiplier
+        )
+        min_near_depth = qty * near_touch_multiplier
         winner_bid_floor = min(winner_bids) >= self.cfg.min_winner_bid
         winner_best_size_ok = min(winner_sizes) >= qty
         winner_near_depth_ok = min(winner_depths) >= min_near_depth
@@ -339,6 +345,8 @@ class PostCloseWinnerClassifier:
         audit["support_components"] = support_components
         audit["support_score"] = support_score
         audit["support_required"] = self.cfg.support_score_required
+        audit["min_near_touch_qty_multiplier"] = near_touch_multiplier
+        audit["min_near_touch_depth_required"] = min_near_depth
         if not winner_near_depth_ok:
             return self._hold("winner_near_touch_depth_too_thin", audit, side=side, confirmations=len(confirmed))
         for reason, ok in (

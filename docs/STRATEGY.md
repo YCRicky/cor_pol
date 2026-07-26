@@ -93,10 +93,13 @@ raw_qty     = min(displayed_ask_size, spend_cap / unit_cost)
 final_qty   = floor(raw_qty to AFTERTAKE_LIVE_QTY_FLOOR_STEP)
 ```
 
-Before a live order is reserved, that final quantity is rechecked against all
-five winner-support requirements using the same in-memory post-close
-observations. A small shadow quantity can therefore never authorize a larger
-live order; insufficient final-size support is blocked rather than downplayed.
+Before an order is reserved, the dynamically sized final quantity is rechecked
+against the same in-memory post-close observations. The recheck still requires
+best-bid size to cover the final quantity, but near-touch depth uses a 1x final
+size floor so small residual asks (for example 10 displayed shares) are not
+blocked by the initial 2x discovery buffer. A small shadow quantity can therefore
+never authorize a larger unsupported order, while executable residual depth is
+still allowed.
 
 Default live settings are:
 
