@@ -108,7 +108,7 @@ def test_deposit_wallet_allowance_calls_include_signature_type():
 
         def get_balance_allowance(self, params):
             self.seen.append(("get", params.signature_type))
-            return {"balance": "10", "allowance": "10"}
+            return {"balance": "10000000", "allowance": "10000000"}
 
         def update_balance_allowance(self, params):
             self.seen.append(("update", params.signature_type))
@@ -125,6 +125,38 @@ def test_deposit_wallet_allowance_calls_include_signature_type():
     gateway.preflight(GeoStatus(blocked=False, country="", region="", ip=""), 5)
 
     assert client.seen == [("update", 3), ("get", 3)]
+
+
+def test_collateral_balance_allowance_parses_v2_allowances_map_in_pusd_base_units():
+    class Params:
+        def __init__(self, asset_type=None, signature_type=None):
+            self.asset_type = asset_type
+            self.signature_type = signature_type
+
+    class Client:
+        def get_balance_allowance(self, _params):
+            # CLOB V2 returns pUSD values in 6-decimal base units and a
+            # separate allowance per exchange spender.
+            return {
+                "balance": "10000000",
+                "allowances": {
+                    "standard-exchange": "8000000",
+                    "neg-risk-exchange": "5000000",
+                },
+            }
+
+    gateway = V2ClobGateway(
+        Client(),
+        {"BalanceAllowanceParams": Params, "AssetType": type("Asset", (), {"COLLATERAL": "pUSD"})},
+        signature_type=2,
+    )
+
+    collateral = gateway.collateral_balance_allowance()
+
+    assert collateral.balance == 10.0
+    # The minimum across exchange approvals is the only safe generic limit
+    # before the exact market exchange is selected.
+    assert collateral.allowance == 5.0
 
 
 def test_v2_preflight_refuses_boolean_close_only_response():

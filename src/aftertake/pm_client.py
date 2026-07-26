@@ -13,6 +13,7 @@ import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
 from .config import Settings
@@ -154,6 +155,37 @@ def _as_float(value: Any, label: str) -> float:
         return float(value)
     except (TypeError, ValueError) as exc:
         raise LivePreflightError("invalid %s returned by Polymarket" % label) from exc
+
+
+PUSD_BASE_UNITS = Decimal("1000000")
+
+
+def _as_pusd(value: Any, label: str) -> float:
+    """Convert a CLOB V2 pUSD base-unit amount to USD safely.
+
+    CLOB's balance-allowance endpoint returns ERC-20 base units. pUSD has six
+    decimals, so treating an atomic response as USD would inflate live sizing
+    by 1,000,000x.
+    """
+
+    if isinstance(value, bool) or value is None or isinstance(value, (dict, list)):
+        raise LivePreflightError("invalid %s returned by Polymarket" % label)
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise LivePreflightError("invalid %s returned by Polymarket" % label) from exc
+    if not amount.is_finite() or amount < 0:
+        raise LivePreflightError("invalid %s returned by Polymarket" % label)
+    return float(amount / PUSD_BASE_UNITS)
+
+
+def _minimum_pusd_allowance(value: Any, label: str) -> float:
+    """Return a fail-closed allowance across the CLOB exchange-spender map."""
+
+    if not isinstance(value, dict) or not value:
+        raise LivePreflightError("invalid %s returned by Polymarket" % label)
+    amounts = [_as_pusd(amount, "%s entry" % label) for amount in value.values()]
+    return min(amounts)
 
 
 def parse_pm_up(market: GammaMarket) -> Optional[bool]:
@@ -334,14 +366,22 @@ class V2ClobGateway:
         raw = self._client.get_balance_allowance(params)
         if not isinstance(raw, dict):
             raise LivePreflightError("invalid CLOB collateral balance response")
-        balance = _as_float(raw.get("balance"), "collateral balance")
-        allowance_value = raw.get("allowance")
-        if isinstance(allowance_value, dict):
-            # The shape is contract-specific.  Do not guess that a single
-            # approval is enough for V2; require the SDK/API to provide a
-            # scalar aggregate before allowing a buy.
-            raise LivePreflightError("CLOB returned non-scalar allowance; sync/verify wallet approvals")
-        allowance = _as_float(allowance_value, "collateral allowance")
+        balance = _as_pusd(raw.get("balance"), "collateral balance")
+        # CLOB V2 returns ``allowances`` (plural): a pUSD base-unit allowance
+        # for each exchange spender. Before the exact market exchange is
+        # selected, the minimum is the only safe generic buying-power limit.
+        allowances = raw.get("allowances")
+        if allowances is not None:
+            allowance = _minimum_pusd_allowance(allowances, "collateral allowances")
+        else:
+            # Preserve support for a legacy scalar response while still
+            # treating it as six-decimal pUSD base units.
+            allowance_value = raw.get("allowance")
+            allowance = (
+                _minimum_pusd_allowance(allowance_value, "collateral allowance")
+                if isinstance(allowance_value, dict)
+                else _as_pusd(allowance_value, "collateral allowance")
+            )
         return BalanceAllowance(balance=balance, allowance=allowance, raw=raw)
 
     def sync_collateral_allowance(self) -> Dict[str, Any]:
