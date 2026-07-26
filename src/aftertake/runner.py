@@ -404,7 +404,6 @@ def run_round(
             except (RiskRejected, LivePreflightError) as exc:
                 _audit(settings, store, "entry_blocked", {"reason": str(exc)}, slug)
                 decisions.append(PostCloseDecision("hold", str(exc), side=decision.side))
-                _safe_notify(notifier, settings, store, "blocked", {"reason": str(exc)}, slug)
                 break
             except Exception as exc:
                 _audit(settings, store, "entry_runtime_error", {"error": str(exc)}, slug)
@@ -413,19 +412,6 @@ def run_round(
     finally:
         stream.close()
 
-    if not any(item.action == "enter" for item in decisions):
-        _safe_notify(
-            notifier,
-            settings,
-            store,
-            "round",
-            {
-                "ticks": len(decisions),
-                "decisions": len(decisions),
-                "last_reason": decisions[-1].reason if decisions else "no_valid_decision",
-            },
-            slug,
-        )
     return decisions
 
 
@@ -435,6 +421,31 @@ def _wait_for_next_boundary(
     current = int(clock())
     next_start = current - current % 300 + 300
     sleep(max(0.0, float(next_start) - clock()))
+    return next_start
+
+
+def _select_next_round_start(
+    *,
+    now: float,
+    processed_round_starts: set[int],
+    sleep: Callable[[float], None] = time.sleep,
+) -> int:
+    """Return the next runnable BTC 5m round without skipping active markets.
+
+    The strategy needs the close-adjacent scene, not the full 5-minute history.
+    After a round finishes at close+~1s, the next market is already active but
+    still has almost five minutes before its own close.  Joining that active
+    round prevents the old 10-minute cadence bug.
+    """
+
+    current = int(now)
+    active_start = current - current % 300
+    active_end = active_start + 300
+    minimum_lead_s = PostCloseConfig().pre_close_window_s + PostCloseConfig().pre_close_latest_max_age_s
+    if active_start not in processed_round_starts and active_end - float(now) >= minimum_lead_s:
+        return active_start
+    next_start = active_start + 300
+    sleep(max(0.0, float(next_start) - float(now)))
     return next_start
 
 
@@ -495,6 +506,7 @@ def _run_round_loop(
     executor = OrderExecutor(settings=settings, store=store)
     completed = 0
     last_runtime_error = ""
+    processed_round_starts: set[int] = set()
 
     while forever or completed < max(1, rounds):
         settle_open_positions(settings=settings, store=store, public=public, notifier=notifier)
@@ -518,7 +530,15 @@ def _run_round_loop(
                 _safe_notify(notifier, settings, store, "alert", {"reason": "PM runtime recovered"})
                 last_runtime_error = ""
 
-        start = wait_for_next_boundary()
+        if wait_for_next_boundary is not _wait_for_next_boundary:
+            start = wait_for_next_boundary()
+        else:
+            start = _select_next_round_start(
+                now=time.time(),
+                processed_round_starts=processed_round_starts,
+                sleep=time.sleep,
+            )
+        processed_round_starts.add(start)
         try:
             run_round(
                 settings=settings,

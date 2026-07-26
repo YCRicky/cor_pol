@@ -1,6 +1,5 @@
-from aftertake.config import Settings
 import aftertake.runner as runner_module
-
+from aftertake.config import Settings
 from aftertake.execution import OrderExecutor
 from aftertake.notifier import Notifier
 from aftertake.pm_client import (
@@ -11,7 +10,14 @@ from aftertake.pm_client import (
     MarketMetadata,
 )
 from aftertake.post_close import PairedBook, SideBook
-from aftertake.runner import _probe_stream, _run_round_loop, deployment_check, run_round, settle_open_positions
+from aftertake.runner import (
+    _probe_stream,
+    _run_round_loop,
+    _select_next_round_start,
+    deployment_check,
+    run_round,
+    settle_open_positions,
+)
 from aftertake.state import StateStore
 
 
@@ -206,10 +212,37 @@ def test_live_round_blocks_dynamic_quantity_that_the_observed_bid_support_cannot
         assert any(item.action == "enter" for item in decisions)
         assert gateway.submitted_qty == 0
         assert store.market_state("btc-updown-5m-900") == "observing"
-        assert [message.splitlines()[0] for message in notifier.messages] == ["[Aftertake] ENTRY_BLOCKED"]
-        assert "live_quantity_not_supported:winner_near_touch_depth_too_thin" in notifier.messages[0]
+        assert notifier.messages == []
     finally:
         store.close()
+
+
+def test_round_scheduler_joins_active_round_after_previous_close_instead_of_skipping():
+    slept = []
+    processed = {900}
+
+    selected = _select_next_round_start(
+        now=1201.0,
+        processed_round_starts=processed,
+        sleep=lambda seconds: slept.append(seconds),
+    )
+
+    assert selected == 1200
+    assert slept == []
+
+
+def test_round_scheduler_waits_when_active_round_is_too_close_to_close():
+    slept = []
+    processed = set()
+
+    selected = _select_next_round_start(
+        now=1494.0,
+        processed_round_starts=processed,
+        sleep=lambda seconds: slept.append(seconds),
+    )
+
+    assert selected == 1500
+    assert slept == [6.0]
 
 
 def test_deployment_check_requires_tg_and_verifies_paired_websocket():
