@@ -344,22 +344,23 @@ def run_round(
                     metadata=metadata,
                     preflight=live_preflight,
                 )
-                if settings.is_live:
-                    # Dynamic live sizing can be larger than AFTERTAKE_QTY,
-                    # which is deliberately kept as the stable shadow-run
-                    # quantity.  Do not let a small-quantity support proof
-                    # authorize a materially larger order: re-evaluate the
-                    # same in-memory post-close evidence at the final size.
-                    # This is CPU-only and performs no REST or notification
-                    # I/O inside the short take window.
+                if live_sizing is not None:
+                    # Dynamic sizing can be larger than AFTERTAKE_QTY, which is
+                    # deliberately kept as a stable baseline. Do not let a
+                    # small-quantity support proof authorize a materially larger
+                    # dry-run shadow fill or live order: re-evaluate the same
+                    # in-memory post-close evidence at the final size. This is
+                    # CPU-only and performs no REST or notification I/O inside
+                    # the short take window.
                     sized_decision = classifier.evaluate(
                         round_end_ts=round_end,
                         now_ts=now,
                         qty=entry_qty,
                     )
                     if sized_decision.action != "enter":
+                        prefix = "live" if settings.is_live else "dry_run"
                         raise RiskRejected(
-                            "live_quantity_not_supported:%s" % sized_decision.reason
+                            "%s_quantity_not_supported:%s" % (prefix, sized_decision.reason)
                         )
                     decision = sized_decision
                 check_entry_risk(

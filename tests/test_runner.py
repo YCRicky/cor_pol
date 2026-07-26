@@ -148,7 +148,7 @@ def test_shadow_round_uses_websocket_classifier_and_never_sends_an_order(tmp_pat
             round_start=900,
             clock=lambda: 1200.35,
             sleep=lambda _: None,
-            stream_factory=PairedStream,
+            stream_factory=DeepSupportPairedStream,
         )
         assert any(item.action == "enter" and item.side == "NO" for item in decisions)
         assert store.market_state("btc-updown-5m-900") == "open"
