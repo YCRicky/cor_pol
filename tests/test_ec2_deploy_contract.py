@@ -20,7 +20,7 @@ def test_cor_pol_ec2_deployment_replaces_the_legacy_main_py_service_contract():
 
     assert "EnvironmentFile=/opt/cor_pol/.env" in unit
     assert "Environment=PYTHONPATH=/opt/cor_pol/src" in unit
-    assert "ExecStartPre=/opt/cor_pol/.venv/bin/python -m aftertake.runner --deployment-check" in unit
+    assert "ExecStartPre" not in unit
     assert "ExecStart=/opt/cor_pol/.venv/bin/python -m aftertake.runner --forever" in unit
     assert "/opt/aftertake" not in unit
     assert "main.py" not in unit

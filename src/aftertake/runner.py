@@ -41,6 +41,8 @@ from .risk import RiskRejected, check_entry_risk
 from .settlement import builder_fee_total, fee_total, settle_trade
 from .state import RuntimeLock, StateStore
 
+RUNTIME_RETRY_S = 5.0
+
 
 def current_btc_5m_slug(now: Optional[int] = None) -> Tuple[str, int, int]:
     """Return the official current BTC 5m Gamma slug and its UTC boundaries."""
@@ -468,6 +470,76 @@ def _live_runtime(
     return gateway, executor
 
 
+def _run_round_loop(
+    *,
+    settings: Settings,
+    store: StateStore,
+    public: PolymarketPublicClient,
+    notifier: Notifier,
+    forever: bool,
+    rounds: int,
+    live_runtime_factory: Callable[
+        [Settings, StateStore, PolymarketPublicClient, Notifier], Tuple[Optional[V2ClobGateway], OrderExecutor]
+    ] = _live_runtime,
+    wait_for_next_boundary: Callable[[], int] = _wait_for_next_boundary,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Keep the daemon alive while PM transport/account checks recover.
+
+    A Polymarket outage must suppress entries, not turn into a failed systemd
+    unit.  The strategy waits for a fresh round after recovery, so it never
+    backdates observations into a round whose pre-close book it did not see.
+    """
+
+    gateway: Optional[V2ClobGateway] = None
+    executor = OrderExecutor(settings=settings, store=store)
+    completed = 0
+    last_runtime_error = ""
+
+    while forever or completed < max(1, rounds):
+        settle_open_positions(settings=settings, store=store, public=public, notifier=notifier)
+        if settings.is_live and gateway is None:
+            try:
+                gateway, executor = live_runtime_factory(settings, store, public, notifier)
+                if gateway is None:
+                    raise RuntimeError("live runtime did not provide a CLOB gateway")
+            except Exception as exc:
+                reason = "PM runtime unavailable; retrying: %s: %s" % (type(exc).__name__, str(exc))
+                _audit(settings, store, "runtime_connect_retry", {"reason": reason})
+                # Notify only when the failure state changes.  A multi-minute
+                # maintenance window must not flood Telegram every five seconds.
+                if reason != last_runtime_error:
+                    _safe_notify(notifier, settings, store, "alert", {"reason": reason})
+                last_runtime_error = reason
+                sleep(RUNTIME_RETRY_S)
+                continue
+            if last_runtime_error:
+                _audit(settings, store, "runtime_recovered", {"previous_error": last_runtime_error})
+                _safe_notify(notifier, settings, store, "alert", {"reason": "PM runtime recovered"})
+                last_runtime_error = ""
+
+        start = wait_for_next_boundary()
+        try:
+            run_round(
+                settings=settings,
+                store=store,
+                public=public,
+                executor=executor,
+                live_gateway=gateway,
+                round_start=start,
+                notifier=notifier,
+            )
+        except Exception as exc:
+            _audit(settings, store, "round_runtime_error", {"error": str(exc)})
+            _safe_notify(notifier, settings, store, "alert", {"reason": str(exc)})
+            # Rebuild the live gateway before the next fresh round. This covers
+            # CLOB/Gamma/auth transport failures without attempting an order retry.
+            if settings.is_live:
+                gateway = None
+                executor = OrderExecutor(settings=settings, store=store)
+        completed += 1
+
+
 def _probe_stream(
     market: GammaMarket,
     *,
@@ -680,7 +752,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(json.dumps(asdict(rebuild_ledger(sorted(settings.out_dir.glob("*.jsonl")))), default=list, indent=2, sort_keys=True))
             return 0
         with RuntimeLock(settings.runtime_lock):
-            gateway, executor = _live_runtime(settings, store, public, notifier)
+            manual_live_operation = args.sync_allowance or bool(args.attach_order_id) or args.deployment_check
+            if manual_live_operation:
+                gateway, executor = _live_runtime(settings, store, public, notifier)
+            else:
+                gateway, executor = None, OrderExecutor(settings=settings, store=store)
             if args.sync_allowance:
                 if gateway is None:
                     raise RuntimeError("--sync-allowance requires AFTERTAKE_DRY_RUN=false")
@@ -706,24 +782,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(json.dumps(result, indent=2, sort_keys=True))
                 return 0
             _safe_notify(notifier, settings, store, "boot", {"dry_run": settings.dry_run, "qty": settings.qty})
-            completed = 0
-            while args.forever or completed < max(1, args.rounds):
-                settle_open_positions(settings=settings, store=store, public=public, notifier=notifier)
-                start = _wait_for_next_boundary()
-                try:
-                    run_round(
-                        settings=settings,
-                        store=store,
-                        public=public,
-                        executor=executor,
-                        live_gateway=gateway,
-                        round_start=start,
-                        notifier=notifier,
-                    )
-                except Exception as exc:
-                    _audit(settings, store, "round_runtime_error", {"error": str(exc)})
-                    _safe_notify(notifier, settings, store, "alert", {"reason": str(exc)})
-                completed += 1
+            _run_round_loop(
+                settings=settings,
+                store=store,
+                public=public,
+                notifier=notifier,
+                forever=args.forever,
+                rounds=args.rounds,
+            )
     finally:
         store.close()
     return 0

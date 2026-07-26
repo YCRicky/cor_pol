@@ -14,7 +14,6 @@ WorkingDirectory=/var/lib/cor-pol
 EnvironmentFile=/opt/cor_pol/.env
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=/opt/cor_pol/src
-ExecStartPre=/opt/cor_pol/.venv/bin/python -m aftertake.runner --deployment-check
 ExecStart=/opt/cor_pol/.venv/bin/python -m aftertake.runner --forever
 Restart=on-failure
 RestartSec=10

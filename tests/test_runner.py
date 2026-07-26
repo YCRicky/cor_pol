@@ -1,4 +1,6 @@
 from aftertake.config import Settings
+import aftertake.runner as runner_module
+
 from aftertake.execution import OrderExecutor
 from aftertake.notifier import Notifier
 from aftertake.pm_client import (
@@ -9,7 +11,7 @@ from aftertake.pm_client import (
     MarketMetadata,
 )
 from aftertake.post_close import PairedBook, SideBook
-from aftertake.runner import _probe_stream, deployment_check, run_round, settle_open_positions
+from aftertake.runner import _probe_stream, _run_round_loop, deployment_check, run_round, settle_open_positions
 from aftertake.state import StateStore
 
 
@@ -261,6 +263,76 @@ def test_stream_probe_allows_a_transient_websocket_timeout_before_paired_books_a
     # wait through the bounded probe window instead of rejecting that first
     # retryable error immediately.
     _probe_stream(FakePublic().market_by_slug("btc-updown-5m-0"), stream_factory=TransientThenReadyStream)
+
+
+def test_forever_runner_retries_a_live_pm_bootstrap_failure_without_exiting(tmp_path):
+    class StopLoop(Exception):
+        pass
+
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        settings = Settings(dry_run=False, out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3")
+        notifier = CaptureNotifier()
+        attempts = []
+
+        def flaky_runtime(*_args):
+            attempts.append("attempt")
+            if len(attempts) == 1:
+                raise RuntimeError("temporary Polymarket transport outage")
+            return InstantGateway(), OrderExecutor(settings, store, gateway=InstantGateway())
+
+        def next_boundary():
+            raise StopLoop()
+
+        try:
+            _run_round_loop(
+                settings=settings,
+                store=store,
+                public=LivePublic(),
+                notifier=notifier,
+                forever=True,
+                rounds=1,
+                live_runtime_factory=flaky_runtime,
+                wait_for_next_boundary=next_boundary,
+                sleep=lambda _seconds: None,
+            )
+        except StopLoop:
+            pass
+        else:
+            raise AssertionError("test loop must stop after the recovered runtime reaches a boundary")
+
+        assert attempts == ["attempt", "attempt"]
+        assert any("temporary Polymarket transport outage" in message for message in notifier.messages)
+    finally:
+        store.close()
+
+
+def test_service_main_reports_boot_before_any_live_pm_connection(monkeypatch, tmp_path):
+    settings = Settings(dry_run=False, out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3")
+    notifier = CaptureNotifier()
+
+    class NoLock:
+        def __init__(self, _path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    def assert_boot_then_stop(**_kwargs):
+        assert notifier.messages == [
+            "[Aftertake] BOOT\nmode=LIVE qty=5.0000\none-entry-per-market + SQLite recovery + CLOB V2 preflight"
+        ]
+
+    monkeypatch.setattr(runner_module.Settings, "from_env", staticmethod(lambda: settings))
+    monkeypatch.setattr(runner_module, "RuntimeLock", NoLock)
+    monkeypatch.setattr(runner_module, "PolymarketPublicClient", lambda **_kwargs: object())
+    monkeypatch.setattr(runner_module, "Notifier", lambda **_kwargs: notifier)
+    monkeypatch.setattr(runner_module, "_run_round_loop", assert_boot_then_stop)
+
+    assert runner_module.main(["--forever"]) == 0
 
 
 def test_confirmed_open_fill_is_settled_from_pm_outcome(tmp_path):

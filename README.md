@@ -23,11 +23,10 @@ python3 -m venv .venv
 pip install -e '.[dev,live]'
 cp .env.example .env
 # Fill TG_BOT_TOKEN and TG_CHAT_ID, retain AFTERTAKE_DRY_RUN=true.
-aftertake --deployment-check
 aftertake --forever
 ```
 
-`--deployment-check` sends no order. It requires an active Gamma market, a
+`--deployment-check` is an optional manual diagnostic that sends no order. It requires an active Gamma market, a
 paired snapshot from the official CLOB WebSocket, and a successful Telegram
 message. In live mode it additionally checks official geo eligibility,
 close-only status, pUSD balance/allowance, market metadata and the Gamma/CLOB
@@ -53,7 +52,9 @@ AFTERTAKE_LIVE_MAX_ACCOUNT_RISK_FRACTION=0.50
 AFTERTAKE_LIVE_QTY_FLOOR_STEP=1
 ```
 
-Then run `aftertake --deployment-check` again before `aftertake --forever`.
+You may run `aftertake --deployment-check` manually for diagnostics, but it is
+not a daemon startup gate. `aftertake --forever` stays running and retries
+Polymarket transport/account availability failures without sending an order.
 Live execution is a single marketable GTC limit submission at the already
 observed winner-side ask. The submitted size is the largest floor-sized quantity
 that does not exceed displayed ask depth, collateral allowance, or
@@ -72,9 +73,10 @@ signal notification.
 For EC2, Aftertake deliberately keeps the existing cor_pol deployment identity:
 use [deploy/ec2/deploy_cor_pol.sh](deploy/ec2/deploy_cor_pol.sh) and
 [deploy/systemd/cor-pol.service.example](deploy/systemd/cor-pol.service.example).
-The deployment script installs the checked-in systemd unit whose `ExecStartPre`
-runs `aftertake --deployment-check`; a service cannot start the strategy until
-that no-order check succeeds.
+The deployment script installs the checked-in systemd unit directly into
+`aftertake --forever`; it has no `ExecStartPre` network gate. Polymarket
+WebSocket/Gamma/CLOB interruptions suppress the affected round and reconnect
+without marking the service failed.
 
 See [RUNBOOK.md](docs/RUNBOOK.md), [SAFETY.md](docs/SAFETY.md), and
 [ARCHITECTURE.md](docs/ARCHITECTURE.md).
