@@ -9,7 +9,7 @@ from aftertake.pm_client import (
     MarketMetadata,
 )
 from aftertake.post_close import PairedBook, SideBook
-from aftertake.runner import deployment_check, run_round, settle_open_positions
+from aftertake.runner import _probe_stream, deployment_check, run_round, settle_open_positions
 from aftertake.state import StateStore
 
 
@@ -237,6 +237,30 @@ def test_deployment_check_requires_tg_and_verifies_paired_websocket():
         assert "TG_BOT_TOKEN and TG_CHAT_ID" in str(exc)
     else:
         raise AssertionError("deployment check must reject missing Telegram")
+
+
+def test_stream_probe_allows_a_transient_websocket_timeout_before_paired_books_arrive():
+    class TransientThenReadyStream:
+        def __init__(self, **_kwargs):
+            self._ready_checks = 0
+            self.last_error = "WebSocketTimeoutException: Connection timed out"
+            self.closed = False
+
+        @property
+        def ready(self):
+            self._ready_checks += 1
+            return self._ready_checks >= 2
+
+        def start(self):
+            return None
+
+        def close(self):
+            self.closed = True
+
+    # The actual stream reconnects after a connect timeout.  Deployment must
+    # wait through the bounded probe window instead of rejecting that first
+    # retryable error immediately.
+    _probe_stream(FakePublic().market_by_slug("btc-updown-5m-0"), stream_factory=TransientThenReadyStream)
 
 
 def test_confirmed_open_fill_is_settled_from_pm_outcome(tmp_path):

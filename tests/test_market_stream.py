@@ -1,3 +1,6 @@
+import sys
+from types import SimpleNamespace
+
 from aftertake.market_stream import MarketBookStream
 
 
@@ -86,6 +89,44 @@ def test_market_stream_uses_the_official_hostname_without_a_hard_coded_ip_fallba
 
     assert stream._url == "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     assert not hasattr(stream, "_resolve_ip")
+
+
+def test_market_stream_allows_a_realistic_handshake_then_restores_fast_receive_timeout(monkeypatch):
+    stream = MarketBookStream(
+        yes_token_id="yes-token", no_token_id="no-token", on_book=lambda _snapshot: None
+    )
+    calls = {"connect_timeout": None, "receive_timeout": None}
+
+    class Timeout(Exception):
+        pass
+
+    class Socket:
+        def settimeout(self, timeout):
+            calls["receive_timeout"] = timeout
+
+        def send(self, _payload):
+            return None
+
+        def recv(self):
+            stream._stop.set()
+            raise Timeout("stop after checking timeouts")
+
+        def close(self):
+            return None
+
+    def create_connection(_url, timeout):
+        calls["connect_timeout"] = timeout
+        return Socket()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "websocket",
+        SimpleNamespace(create_connection=create_connection, WebSocketTimeoutException=Timeout),
+    )
+
+    stream._run()
+
+    assert calls == {"connect_timeout": 2.0, "receive_timeout": 0.25}
 
 
 def test_market_stream_counts_only_near_touch_bid_depth():

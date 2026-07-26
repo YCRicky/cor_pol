@@ -474,7 +474,12 @@ def _probe_stream(
     stream_factory: Callable[..., MarketBookStream] = MarketBookStream,
     timeout_s: float = 10.0,
 ) -> None:
-    """Prove the official public WebSocket can return a paired CLOB snapshot."""
+    """Prove the official public WebSocket can return paired books in time.
+
+    ``MarketBookStream`` deliberately reconnects after transient network and
+    provider errors.  The deployment probe must use the same bounded retry
+    behaviour instead of treating the first connection timeout as terminal.
+    """
 
     stream = stream_factory(
         yes_token_id=market.token_for_side("YES"),
@@ -484,13 +489,15 @@ def _probe_stream(
     stream.start()
     try:
         deadline = time.monotonic() + timeout_s
+        last_error = ""
         while time.monotonic() < deadline:
             if stream.ready:
                 return
             if stream.last_error:
-                raise LivePreflightError("CLOB market stream failed: %s" % stream.last_error)
+                last_error = stream.last_error
             time.sleep(0.05)
-        raise LivePreflightError("CLOB market stream did not produce paired books")
+        detail = ": %s" % last_error if last_error else ""
+        raise LivePreflightError("CLOB market stream did not produce paired books%s" % detail)
     finally:
         stream.close()
 

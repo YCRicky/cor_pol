@@ -15,6 +15,8 @@ from typing import Any, Callable, Dict, Iterable, Optional
 from .post_close import PairedBook, SideBook
 
 MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+CONNECT_TIMEOUT_S = 2.0
+RECEIVE_TIMEOUT_S = 0.25
 
 
 def _float(value: Any) -> Optional[float]:
@@ -161,7 +163,12 @@ class MarketBookStream:
                 # Use the official hostname and normal resolver/TLS path.
                 # A hard-coded CDN IP can drift and is not an acceptable
                 # replacement for the provider's endpoint.
-                ws = websocket.create_connection(self._url, timeout=0.25)
+                # TLS/WebSocket handshakes happen well before the close, so
+                # permit a realistic connection window.  Restore the short
+                # receive timeout immediately afterwards to keep the stream
+                # responsive to stop/reconnect requests.
+                ws = websocket.create_connection(self._url, timeout=CONNECT_TIMEOUT_S)
+                ws.settimeout(RECEIVE_TIMEOUT_S)
                 ws.send(
                     json.dumps(
                         {
