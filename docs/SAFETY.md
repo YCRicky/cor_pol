@@ -23,3 +23,6 @@
   `AFTERTAKE_LIVE_QTY_FLOOR_STEP`.
 
 - Telegram failures are recorded but never alter order state or trigger a retry.
+- Polymarket DNS overrides are disabled by default in the EC2 deployment path.
+  `AFTERTAKE_RESOLVE_OVERRIDES` is an explicit opt-in emergency guard for
+  RPZ-poisoned environments; TLS verification remains enabled when used.

@@ -43,7 +43,7 @@ def test_defaults_are_aftertake_only(monkeypatch):
     assert settings.live_max_account_risk_fraction == 0.5
     assert settings.live_quantity_floor_step == 1.0
     assert settings.dry_run_simulated_balance == 100.0
-    assert settings.resolve_overrides
+    assert settings.resolve_overrides == ""
     assert settings.state_db.name == "aftertake.sqlite3"
 
 
@@ -54,6 +54,15 @@ def test_dry_run_sim_balance_can_be_configured(monkeypatch):
     settings = Settings.from_env()
 
     assert settings.dry_run_simulated_balance == 250
+
+
+def test_resolve_overrides_are_opt_in(monkeypatch):
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("AFTERTAKE_RESOLVE_OVERRIDES", "gamma-api.polymarket.com=104.18.34.205")
+
+    settings = Settings.from_env()
+
+    assert settings.resolve_overrides == "gamma-api.polymarket.com=104.18.34.205"
 
 
 def test_invalid_resolve_override_is_rejected(monkeypatch):

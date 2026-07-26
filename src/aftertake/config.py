@@ -14,11 +14,10 @@ POLYGON_CHAIN_ID = 137
 DEFAULT_CLOB_HOST = "https://clob.polymarket.com"
 DEFAULT_GAMMA_HOST = "https://gamma-api.polymarket.com"
 DEFAULT_GEO_ENDPOINT = "https://polymarket.com/api/geoblock"
-DEFAULT_RESOLVE_OVERRIDES = (
-    "gamma-api.polymarket.com=104.18.34.205,104.18.35.205;"
-    "clob.polymarket.com=104.18.34.205,104.18.35.205;"
-    "ws-subscriptions-clob.polymarket.com=104.18.34.205,104.18.35.205"
-)
+# Production/EC2 default: use normal system DNS. The override is an opt-in
+# emergency guard for RPZ-poisoned environments, configured via
+# AFTERTAKE_RESOLVE_OVERRIDES="host=ip,ip;...".
+DEFAULT_RESOLVE_OVERRIDES = ""
 _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _PRIVATE_KEY_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
 
