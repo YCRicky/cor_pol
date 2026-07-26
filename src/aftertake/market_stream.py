@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, Optional
 
 from .post_close import PairedBook, SideBook
+from .resolver import ResolveOverrides, scoped_getaddrinfo
 
 MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 CONNECT_TIMEOUT_S = 2.0
@@ -109,6 +110,7 @@ class MarketBookStream:
         clock: Callable[[], float] = time.time,
         url: str = MARKET_WS_URL,
         near_touch_band: float = 0.02,
+        resolve_overrides: Optional[ResolveOverrides] = None,
     ):
         self.yes_token_id = str(yes_token_id)
         self.no_token_id = str(no_token_id)
@@ -116,6 +118,7 @@ class MarketBookStream:
         self._clock = clock
         self._url = url
         self._near_touch_band = near_touch_band
+        self._resolve_overrides = resolve_overrides or {}
         self._books = {
             self.yes_token_id: _TokenBook(),
             self.no_token_id: _TokenBook(),
@@ -167,7 +170,8 @@ class MarketBookStream:
                 # permit a realistic connection window.  Restore the short
                 # receive timeout immediately afterwards to keep the stream
                 # responsive to stop/reconnect requests.
-                ws = websocket.create_connection(self._url, timeout=CONNECT_TIMEOUT_S)
+                with scoped_getaddrinfo(self._resolve_overrides):
+                    ws = websocket.create_connection(self._url, timeout=CONNECT_TIMEOUT_S)
                 ws.settimeout(RECEIVE_TIMEOUT_S)
                 ws.send(
                     json.dumps(

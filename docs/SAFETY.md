@@ -15,8 +15,11 @@
   reconciles/cancels it. It never auto-retries a possibly submitted order.
 - SQLite WAL persists one reservation per market. Unknown execution freezes
   new risk until an operator reconciles it.
-- Dry-run keeps the configured `AFTERTAKE_QTY`. Live mode does not use a fixed
-  five-share quantity: it takes as much displayed ask depth as allowed by the
-  account risk budget, then floors size to `AFTERTAKE_LIVE_QTY_FLOOR_STEP`
-  before order submission. It never rounds size upward.
+- Dry-run and live mode share the same sizing formula. Dry-run uses simulated
+  collateral (`AFTERTAKE_DRY_RUN_SIM_BALANCE`, default `100`) and still never
+  submits an order; live mode uses actual CLOB pUSD balance/allowance.
+- Execution does not use a fixed five-share quantity: it takes as much displayed
+  ask depth as allowed by the account risk budget, then floors size to
+  `AFTERTAKE_LIVE_QTY_FLOOR_STEP`.
+
 - Telegram failures are recorded but never alter order state or trigger a retry.

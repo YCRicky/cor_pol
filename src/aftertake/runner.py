@@ -22,6 +22,7 @@ from .live_sizing import LiveSizingDecision, compute_live_entry_size
 from .market_stream import MarketBookStream
 from .notifier import Notifier, format_event, redacted_chat
 from .pm_client import (
+    BalanceAllowance,
     GammaMarket,
     LivePreflight,
     LivePreflightError,
@@ -37,6 +38,7 @@ from .post_close import (
     PostCloseDecision,
     PostCloseWinnerClassifier,
 )
+from .resolver import parse_resolve_overrides
 from .risk import RiskRejected, check_entry_risk
 from .settlement import builder_fee_total, fee_total, settle_trade
 from .state import RuntimeLock, StateStore
@@ -179,7 +181,22 @@ def _entry_qty_for_decision(
     if decision.entry_ask is None or decision.entry_ask_size is None:
         raise RiskRejected("entry decision has no executable ask")
     if settings.dry_run:
-        return settings.qty, None
+        simulated_collateral = BalanceAllowance(
+            balance=settings.dry_run_simulated_balance,
+            allowance=settings.dry_run_simulated_balance,
+            raw={"simulated": True},
+        )
+        sizing = compute_live_entry_size(
+            price=decision.entry_ask,
+            available_size=decision.entry_ask_size,
+            collateral=simulated_collateral,
+            metadata=metadata,
+            max_account_fraction=settings.live_max_account_risk_fraction,
+            quantity_step=settings.live_quantity_floor_step,
+        )
+        if not sizing.accepted:
+            raise RiskRejected(sizing.reason or "dry_run_simulated_sizing_rejected")
+        return sizing.qty, sizing
     if preflight is None:
         raise RiskRejected("live_preflight_snapshot_missing")
     sizing = compute_live_entry_size(
@@ -234,6 +251,7 @@ def run_round(
         on_book=classifier.record,
         clock=clock,
         near_touch_band=classifier_cfg.near_touch_band,
+        resolve_overrides=parse_resolve_overrides(settings.resolve_overrides),
     )
     decisions: List[PostCloseDecision] = []
     seen_decisions: set = set()
@@ -737,6 +755,8 @@ def _status_payload(settings: Settings, store: StateStore) -> Dict[str, Any]:
         "qty": settings.qty,
         "live_max_account_risk_fraction": settings.live_max_account_risk_fraction,
         "live_quantity_floor_step": settings.live_quantity_floor_step,
+        "dry_run_simulated_balance": settings.dry_run_simulated_balance,
+        "resolve_overrides_enabled": bool(parse_resolve_overrides(settings.resolve_overrides)),
         "entry_window_ms": [100, 1000],
         "confirmations": PostCloseConfig().confirmations,
         "max_daily_loss": settings.max_daily_loss,
@@ -761,7 +781,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     settings.out_dir.mkdir(parents=True, exist_ok=True)
     store = StateStore(settings.state_db)
     public = PolymarketPublicClient(
-        gamma_host=settings.gamma_host, clob_host=settings.clob_host, http=PublicHttpClient()
+        gamma_host=settings.gamma_host,
+        clob_host=settings.clob_host,
+        http=PublicHttpClient(resolve_overrides=parse_resolve_overrides(settings.resolve_overrides)),
     )
     notifier = Notifier(token=settings.telegram_token, chat_id=settings.telegram_chat_id)
     try:

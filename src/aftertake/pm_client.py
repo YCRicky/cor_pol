@@ -17,6 +17,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
 from .config import Settings
+from .resolver import ResolveOverrides, scoped_getaddrinfo
 
 
 class LivePreflightError(RuntimeError):
@@ -128,8 +129,9 @@ class LivePreflight:
 class PublicHttpClient:
     """Plain HTTPS client using the provider's official hostname and TLS path."""
 
-    def __init__(self, user_agent: str = "aftertake/0.2"):
+    def __init__(self, user_agent: str = "aftertake/0.2", resolve_overrides: Optional[ResolveOverrides] = None):
         self.user_agent = user_agent
+        self.resolve_overrides = resolve_overrides or {}
         self._ssl_context = ssl.create_default_context(cafile=self._certifi_ca())
 
     @staticmethod
@@ -145,8 +147,9 @@ class PublicHttpClient:
         req = urllib.request.Request(
             url, headers={"User-Agent": self.user_agent, "Accept": "application/json"}
         )
-        with urllib.request.urlopen(req, timeout=timeout, context=self._ssl_context) as response:
-            raw = response.read().decode("utf-8")
+        with scoped_getaddrinfo(self.resolve_overrides):
+            with urllib.request.urlopen(req, timeout=timeout, context=self._ssl_context) as response:
+                raw = response.read().decode("utf-8")
         return json.loads(raw)
 
 

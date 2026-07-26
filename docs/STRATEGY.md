@@ -80,8 +80,10 @@ cap; ask repricing is recorded as a feature first, not used as a hard reject.
 
 ## Live sizing
 
-Dry-run keeps `AFTERTAKE_QTY` so shadow logs stay comparable. Live mode sizes
-from the observed residual ask:
+Dry-run uses the same sizing math with a simulated account balance
+(`AFTERTAKE_DRY_RUN_SIM_BALANCE`, default `100`) and equal simulated allowance.
+Live mode replaces that simulated collateral with the actual CLOB pUSD balance
+and allowance. Both modes size from the observed residual ask:
 
 ```text
 risk_budget = collateral_balance * AFTERTAKE_LIVE_MAX_ACCOUNT_RISK_FRACTION

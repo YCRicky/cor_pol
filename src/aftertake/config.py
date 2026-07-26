@@ -8,10 +8,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
 
+from .resolver import parse_resolve_overrides
+
 POLYGON_CHAIN_ID = 137
 DEFAULT_CLOB_HOST = "https://clob.polymarket.com"
 DEFAULT_GAMMA_HOST = "https://gamma-api.polymarket.com"
 DEFAULT_GEO_ENDPOINT = "https://polymarket.com/api/geoblock"
+DEFAULT_RESOLVE_OVERRIDES = (
+    "gamma-api.polymarket.com=104.18.34.205,104.18.35.205;"
+    "clob.polymarket.com=104.18.34.205,104.18.35.205;"
+    "ws-subscriptions-clob.polymarket.com=104.18.34.205,104.18.35.205"
+)
 _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _PRIVATE_KEY_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
 
@@ -84,6 +91,8 @@ class Settings:
     min_seconds_between_entries: int = 60
     live_max_account_risk_fraction: float = 0.50
     live_quantity_floor_step: float = 1.0
+    dry_run_simulated_balance: float = 100.0
+    resolve_overrides: str = DEFAULT_RESOLVE_OVERRIDES
 
     # Fixed execution mechanics, not environment strategy settings.
     state_db: Path = Path("out/aftertake.sqlite3")
@@ -135,6 +144,9 @@ class Settings:
             raise ValueError("AFTERTAKE_LIVE_MAX_ACCOUNT_RISK_FRACTION must be in (0, 1]")
         if self.live_quantity_floor_step <= 0:
             raise ValueError("AFTERTAKE_LIVE_QTY_FLOOR_STEP must be > 0")
+        if self.dry_run_simulated_balance <= 0:
+            raise ValueError("AFTERTAKE_DRY_RUN_SIM_BALANCE must be > 0")
+        parse_resolve_overrides(self.resolve_overrides)
         if not 0 < self.order_ttl_s <= 10:
             raise ValueError("internal order TTL must be in (0, 10]")
         if not 0 < self.reconcile_timeout_s <= 30:
@@ -178,6 +190,8 @@ class Settings:
             min_seconds_between_entries=_int("AFTERTAKE_MIN_SECONDS_BETWEEN_ENTRIES", 60),
             live_max_account_risk_fraction=_float("AFTERTAKE_LIVE_MAX_ACCOUNT_RISK_FRACTION", 0.50),
             live_quantity_floor_step=_float("AFTERTAKE_LIVE_QTY_FLOOR_STEP", 1.0),
+            dry_run_simulated_balance=_float("AFTERTAKE_DRY_RUN_SIM_BALANCE", 100.0),
+            resolve_overrides=os.getenv("AFTERTAKE_RESOLVE_OVERRIDES", DEFAULT_RESOLVE_OVERRIDES).strip(),
             builder_code=os.getenv("POLY_BUILDER_CODE", "").strip(),
             clob_host=os.getenv("CLOB_API_URL", DEFAULT_CLOB_HOST).strip().rstrip("/"),
             polymarket_private_key=os.getenv("POLYMARKET_PRIVATE_KEY", "").strip(),

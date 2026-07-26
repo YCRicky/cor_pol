@@ -155,7 +155,7 @@ def test_shadow_round_uses_websocket_classifier_and_never_sends_an_order(tmp_pat
         open_positions = store.open_positions()
         assert len(open_positions) == 1
         assert open_positions[0].state == "filled"
-        assert open_positions[0].filled_qty == 5
+        assert open_positions[0].filled_qty == 20
     finally:
         store.close()
 
