@@ -61,9 +61,10 @@ that does not exceed displayed ask depth, collateral allowance, or
 `collateral_balance * AFTERTAKE_LIVE_MAX_ACCOUNT_RISK_FRACTION`. With the
 default integer floor step, a calculated 67.5 shares is submitted as 67, never
 68. That final quantity must also pass the same bid-support checks as the
-candidate; insufficient support blocks the order. It has a five-second order lifetime, explicit cancellation/reconciliation,
-no automatic submission retry, durable SQLite state, one entry attempt per
-market, and an `execution_unknown` freeze.
+candidate; insufficient support blocks the order. A default GTC submission is
+not locally cancelled after five seconds; it remains `submitted` until later
+CLOB reconciliation or official settlement resolves it. The bot never
+automatically retries the same market.
 
 Telegram reports `DEPLOYMENT_CHECK_OK`, `BOOT`, `ORDER_SUBMITTED`, actual
 `ENTRY_CONFIRMED` or `ORDER_RESULT`, `ENTRY_BLOCKED`, `ALERT`, round-level

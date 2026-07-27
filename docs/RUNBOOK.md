@@ -29,9 +29,10 @@ process and do not print secret values.
 ## Live promotion
 
 Set `AFTERTAKE_DRY_RUN=false` plus the required CLOB V2 account identity in
-`.env`, then re-run the deployment command. Do not delete SQLite state when
-an `execution_unknown` alert exists: attach/reconcile the confirmed CLOB order
-before another entry is permitted.
+`.env`, then re-run the deployment command. Do not delete SQLite state just to
+hide diagnostics. Pending GTC orders should remain submitted until later CLOB
+reconciliation / official settlement; submit-path infrastructure failures skip
+only the affected market and do not block unrelated future entries.
 
 ## Operator evidence
 

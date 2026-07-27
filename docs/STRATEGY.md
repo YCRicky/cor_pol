@@ -124,6 +124,7 @@ used.
 The critical path deliberately has no REST book request and no Telegram call.
 Before close it has already completed market/account preflight. After
 confirmation it atomically reserves the market in SQLite and submits only the
-single bounded execution path configured by the runtime. Any ambiguous live
-response becomes `execution_unknown`, which blocks further entries until
-reconciled.
+single bounded execution path configured by the runtime. Default GTC submits
+remain pending until later CLOB reconciliation / official settlement; submit-path
+infrastructure ambiguity skips/rests only the affected market rather than
+freezing unrelated future entries.

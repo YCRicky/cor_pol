@@ -19,8 +19,9 @@
   left pending until later CLOB reconciliation / official settlement; only
   explicitly configured GTD orders receive a local TTL cancel. It never auto-retries
   a possibly submitted order.
-- SQLite WAL persists one reservation per market. Unknown execution freezes
-  new risk until an operator reconciles it.
+- SQLite WAL persists one reservation per market. Submit-path infrastructure
+  ambiguity or pending GTC state must not globally freeze unrelated markets;
+  same-market retry remains blocked until reconciliation/settlement resolves it.
 - Dry-run and live mode share the same sizing formula. Dry-run uses simulated
   collateral (`AFTERTAKE_DRY_RUN_SIM_BALANCE`, default `100`) and still never
   submits an order; live mode uses actual CLOB pUSD balance/allowance.
