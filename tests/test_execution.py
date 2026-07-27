@@ -264,7 +264,7 @@ def test_live_executor_cancels_remainder_and_records_confirmed_partial_fill(tmp_
         store.close()
 
 
-def test_submit_timeout_is_unknown_and_blocks_future_entries(tmp_path):
+def test_submit_timeout_skips_only_current_market_without_global_freeze(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     try:
         record = _reserve(store)
@@ -279,9 +279,14 @@ def test_submit_timeout_is_unknown_and_blocks_future_entries(tmp_path):
             heartbeat_factory=NoopHeartbeat,
         ).execute_reserved(record, _metadata())
 
-        assert result.submission_state == "unknown"
-        assert store.has_execution_unknown() is True
-        assert _reserve(store) is None
+        assert result.terminal is True
+        assert result.status == "submit_skipped"
+        assert result.submission_state == "skipped"
+        assert result.error == "submit_exception"
+        assert result.raw["terminal_skip"] is True
+        assert store.has_execution_unknown() is False
+        assert _reserve(store) is None  # same slug still cannot be retried
+        assert store.reserve_entry("eth-updown-5m-300", "condition", 300, "token", "YES", 5, 0.51) is not None
     finally:
         store.close()
 
@@ -588,14 +593,18 @@ def test_submit_exception_persists_sanitized_diagnostics(tmp_path):
             heartbeat_factory=NoopHeartbeat,
         ).execute_reserved(record, _metadata(), fast=True)
 
-        assert result.status == "execution_unknown"
+        assert result.terminal is True
+        assert result.status == "submit_skipped"
+        assert result.submission_state == "skipped"
         assert result.error == "submit_exception"
         assert result.raw["error_type"] == "PolyStyleError"
         assert result.raw["status_code"] == 400
         assert result.raw["order_type"] == "FAK"
         assert result.raw["error_hint"] == "order_type_compatibility"
+        assert result.raw["terminal_skip"] is True
         assert "invalid order type FAK" in result.raw["error_message"]
-        assert store.has_execution_unknown() is True
+        assert store.has_execution_unknown() is False
+        assert store.reserve_entry("eth-updown-5m-300", "condition", 300, "token", "YES", 5, 0.51) is not None
     finally:
         store.close()
 
@@ -618,5 +627,6 @@ def test_fak_no_match_error_is_terminal_no_fill_not_execution_unknown(tmp_path):
         assert result.raw["terminal_no_fill"] is True
         assert store.has_execution_unknown() is False
         assert _reserve(store) is None
+        assert store.reserve_entry("eth-updown-5m-300", "condition", 300, "token", "YES", 5, 0.51) is not None
     finally:
         store.close()

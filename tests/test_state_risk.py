@@ -39,21 +39,22 @@ def test_sqlite_reservation_is_one_entry_per_market(tmp_path):
         store.close()
 
 
-def test_unknown_execution_freezes_risk_before_external_submit(tmp_path):
+def test_unknown_execution_does_not_globally_freeze_new_entries(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     try:
         record = _reserve(store)
         store.mark_execution_unknown(record.intent_id, "timeout")
 
-        with pytest.raises(RiskRejected, match="unknown"):
-            check_entry_risk(
-                settings=Settings(),
-                store=store,
-                slug="new-market",
-                price=0.5,
-                qty=5,
-                displayed_ask_size=10,
-            )
+        snapshot = check_entry_risk(
+            settings=Settings(),
+            store=store,
+            slug="eth-updown-5m-300",
+            price=0.5,
+            qty=5,
+            displayed_ask_size=10,
+        )
+
+        assert snapshot.requested_notional == 2.5
     finally:
         store.close()
 

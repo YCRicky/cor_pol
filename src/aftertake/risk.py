@@ -44,9 +44,6 @@ def check_entry_risk(
         raise RiskRejected("invalid_entry_size")
     if qty > displayed_ask_size:
         raise RiskRejected("requested_qty_exceeds_displayed_ask_depth")
-    if store.has_execution_unknown():
-        raise RiskRejected("execution_unknown_requires_manual_reconciliation")
-
     now = float(time.time() if now_ts is None else now_ts)
     open_positions = len(store.open_positions_for_asset(slug))
     daily_loss = store.daily_realized_loss()

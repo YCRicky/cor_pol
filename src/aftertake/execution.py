@@ -317,23 +317,27 @@ class OrderExecutor:
                         record, "no_fill", 0.0, 0.0, True, "acknowledged", reason, raw
                     )
 
-                # Once the gateway call starts, even a local-looking exception
-                # may have occurred while parsing a successful HTTP response.
-                # Never classify unknown submit failures as definitely-not-submitted
-                # or retry them.
+                # Polymarket CLOB/network failures are common enough that they
+                # must not globally freeze future entries.  Do not retry this
+                # market after a submit-path exception, but persist diagnostics
+                # and terminal-skip only the affected slug.
                 reason = "matching_engine_restart" if is_matching_engine_restart_error(exc) else "submit_exception"
                 raw["classification"] = reason
-                self.store.mark_execution_unknown(record.intent_id, reason, raw)
+                raw["terminal_skip"] = True
+                self.store.mark_terminal_execution(record.intent_id, 0.0, 0.0, raw, "submit_skipped")
                 return self._result_from_record(
-                    record, "execution_unknown", 0.0, 0.0, False, "unknown", reason, raw
+                    record, "submit_skipped", 0.0, 0.0, True, "skipped", reason, raw
                 )
 
             order_id = str(submitted.get("orderID") or submitted.get("id") or "")
             if not order_id:
                 reason = "missing_order_id_after_submit"
-                self.store.mark_execution_unknown(record.intent_id, reason, submitted)
+                raw = dict(submitted)
+                raw["classification"] = reason
+                raw["terminal_skip"] = True
+                self.store.mark_terminal_execution(record.intent_id, 0.0, 0.0, raw, "submit_skipped")
                 return self._result_from_record(
-                    record, "execution_unknown", 0.0, 0.0, False, "unknown", reason, submitted
+                    record, "submit_skipped", 0.0, 0.0, True, "skipped", reason, raw
                 )
             self.store.mark_submitted(record.intent_id, order_id, submitted)
             self._emit(
