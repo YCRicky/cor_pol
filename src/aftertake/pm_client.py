@@ -452,8 +452,9 @@ class V2ClobGateway:
 
         The normal path deliberately retries a matching-engine restart.  That
         delay is correct for ordinary entries but would turn a 100--1000ms
-        residual-ask attempt into a stale order.  The caller still treats an
-        ambiguous submission as ``execution_unknown`` and freezes new risk.
+        residual-ask attempt into a stale order.  The caller decides how to
+        classify submit-path infrastructure failures; current Aftertake policy
+        skips only the affected market and never globally freezes new entries.
         """
 
         return self._submit_limit_buy(token_id, price, qty, metadata, retry_on_restart=False, order_type=order_type)

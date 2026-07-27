@@ -179,10 +179,10 @@ def _sanitize_exception(exc: BaseException, *, phase: str, order_type: str) -> D
 class OrderExecutor:
     """Submit one already-reserved entry and reconcile it before returning.
 
-    It never automatically retries a failed/ambiguous submission.  A CLOB
-    timeout, HTTP 425 restart, missing order ID, or non-terminal cancellation
-    produces ``execution_unknown`` and freezes future entries through the
-    durable state store.
+    It never automatically retries a failed/ambiguous submission for the same
+    market.  Polymarket CLOB/network submit-path failures are terminal-skipped
+    for the affected slug; confirmed fills/reconciliation still update durable
+    state, but stale infrastructure errors must not globally block future entries.
     """
 
     def __init__(
