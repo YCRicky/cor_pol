@@ -2,8 +2,9 @@
 
 JSONL is useful as an audit export, but it cannot provide an atomic per-market
 entry lock.  This store uses SQLite WAL and records an intent *before* an
-external submission.  An interrupted or uncertain submission blocks new risk
-until it has been reconciled against the CLOB.
+external submission.  An interrupted or uncertain submission is never retried
+for the same slug; current Aftertake policy terminal-skips PM infrastructure
+failures for that market instead of globally blocking future entries.
 """
 
 from __future__ import annotations

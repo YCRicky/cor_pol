@@ -518,7 +518,7 @@ def test_confirmed_open_fill_is_settled_from_pm_outcome(tmp_path):
         store.close()
 
 
-def test_startup_reconciliation_missing_order_id_blocks_without_crash_or_spam(tmp_path):
+def test_startup_reconciliation_missing_order_id_terminal_skips_without_alert_spam(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     try:
         record = store.reserve_entry(
@@ -540,9 +540,10 @@ def test_startup_reconciliation_missing_order_id_blocks_without_crash_or_spam(tm
             notifier,
         )
 
-        assert store.has_execution_unknown() is True
-        assert len(notifier.messages) == 1
-        assert "reason=startup_reconciliation_blocked" in notifier.messages[0]
-        assert "manual_clob_reconciliation_required" in notifier.messages[0]
+        assert store.has_execution_unknown() is False
+        unresolved = store.unresolved_orders()
+        assert unresolved == []
+        assert notifier.messages == []
+        assert store.reserve_entry("eth-updown-5m-1200", "condition", 1200, "token", "YES", 5, 0.51) is not None
     finally:
         store.close()
