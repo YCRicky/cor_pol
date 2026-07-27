@@ -86,7 +86,19 @@ def format_event(kind: str, payload: Dict[str, Any], slug: str = "") -> str:
             f"fee=${_number(payload['entry_fee'], 4)} slug={slug}"
         )
     if kind == "alert":
-        return f"[Aftertake] ALERT\nreason={payload['reason']}\nslug={slug or 'runtime'}"
+        lines = ["[Aftertake] ALERT", f"reason={payload['reason']}"]
+        for key in ("error_type", "status_code", "error_hint", "order_type", "submission_state", "order_id"):
+            value = payload.get(key)
+            if value not in (None, ""):
+                lines.append(f"{key}={value}")
+        message = str(payload.get("error_message") or "")
+        if message:
+            message = " ".join(message.split())
+            if len(message) > 400:
+                message = message[:400] + "..."
+            lines.append(f"error_message={message}")
+        lines.append(f"slug={slug or 'runtime'}")
+        return "\n".join(lines)
     raise ValueError(f"unsupported notification event: {kind}")
 
 

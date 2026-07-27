@@ -484,7 +484,10 @@ class V2ClobGateway:
             try:
                 # Reuse the exact same signed order across a short 425
                 # restart retry; never create a second salt/order intent.
-                raw = self._client.post_order(order, self._order_type(order_type))
+                # Polymarket py-clob-client documents FAK/FOK as order types
+                # on post_order with post_only disabled. Pass by keyword first
+                # so SDK parameter-name drift does not silently alter intent.
+                raw = self._post_order(order, self._order_type(order_type))
                 break
             except Exception as exc:
                 if not is_matching_engine_restart_error(exc) or attempt == attempts - 1:
@@ -493,6 +496,18 @@ class V2ClobGateway:
         if not isinstance(raw, dict):
             raise RuntimeError("CLOB returned an invalid order response")
         return raw
+
+    def _post_order(self, order: Any, order_type: Any) -> Any:
+        try:
+            return self._client.post_order(order, order_type=order_type, post_only=False)
+        except TypeError as first_exc:
+            try:
+                return self._client.post_order(order, orderType=order_type, post_only=False)
+            except TypeError:
+                try:
+                    return self._client.post_order(order, order_type)
+                except TypeError:
+                    raise first_exc from None
 
     def _order_type(self, order_type: str) -> Any:
         normalized = str(order_type or "").upper().strip()

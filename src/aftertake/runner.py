@@ -126,7 +126,17 @@ def _notify_order_result(
         }
     elif result.submission_state == "unknown":
         kind = "alert"
-        payload = {"reason": result.error or "execution_unknown"}
+        raw = result.raw or {}
+        payload = {
+            "reason": result.error or "execution_unknown",
+            "submission_state": result.submission_state,
+            "order_id": result.order_id or "n/a",
+            "order_type": settings.order_type,
+            "error_type": raw.get("error_type", ""),
+            "status_code": raw.get("status_code", ""),
+            "error_message": raw.get("error_message", raw.get("submit_error", "")),
+            "error_hint": raw.get("error_hint", ""),
+        }
     else:
         kind = "order_result"
         payload = {

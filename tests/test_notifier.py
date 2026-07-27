@@ -130,3 +130,28 @@ def test_deployment_check_notification_is_not_a_strategy_signal():
 
     assert "DEPLOYMENT_CHECK_OK" in text
     assert "SIGNAL" not in text
+
+
+def test_alert_formatter_expands_submit_exception_diagnostics():
+    text = format_event(
+        "alert",
+        {
+            "reason": "submit_exception",
+            "error_type": "PolyApiException",
+            "status_code": 400,
+            "error_hint": "order_type_compatibility",
+            "order_type": "FAK",
+            "submission_state": "unknown",
+            "order_id": "n/a",
+            "error_message": "invalid order type FAK",
+        },
+        "btc-updown-5m-1",
+    )
+
+    assert "reason=submit_exception" in text
+    assert "error_type=PolyApiException" in text
+    assert "status_code=400" in text
+    assert "error_hint=order_type_compatibility" in text
+    assert "order_type=FAK" in text
+    assert "order_id=n/a" in text
+    assert "error_message=invalid order type FAK" in text

@@ -124,6 +124,43 @@ def _terminal_status(status: str) -> bool:
     }
 
 
+def _truncate(text: Any, limit: int = 500) -> str:
+    text = " ".join(str(text or "").split())
+    return text[:limit] + "..." if len(text) > limit else text
+
+
+def _safe_error_message(value: Any) -> str:
+    if isinstance(value, dict):
+        allowed = {k: value.get(k) for k in ("error", "message", "detail", "code") if k in value}
+        return _truncate(allowed or value, 500)
+    return _truncate(value, 500)
+
+
+def _sanitize_exception(exc: BaseException, *, phase: str, order_type: str) -> Dict[str, Any]:
+    status_code = getattr(exc, "status_code", None)
+    error_msg = getattr(exc, "error_msg", None)
+    message = _safe_error_message(error_msg if error_msg is not None else str(exc))
+    error_type = type(exc).__name__
+    lowered = message.lower()
+    hint = "unknown"
+    if "fak" in lowered or "order type" in lowered or "ordertype" in lowered:
+        hint = "order_type_compatibility"
+    elif status_code in {400, 422}:
+        hint = "clob_rejected_request"
+    elif status_code in {401, 403}:
+        hint = "clob_auth_or_permission"
+    elif status_code in {408, 429, 500, 502, 503, 504} or "request exception" in lowered or "timeout" in lowered:
+        hint = "transport_or_clob_transient"
+    return {
+        "phase": phase,
+        "order_type": str(order_type or "").upper(),
+        "error_type": error_type,
+        "status_code": status_code,
+        "error_message": message,
+        "error_hint": hint,
+    }
+
+
 class OrderExecutor:
     """Submit one already-reserved entry and reconcile it before returning.
 
@@ -252,7 +289,11 @@ class OrderExecutor:
                 # may have occurred while parsing a successful HTTP response.
                 # Never classify it as definitely-not-submitted or retry it.
                 reason = "matching_engine_restart" if is_matching_engine_restart_error(exc) else "submit_exception"
-                raw = {"submit_error": str(exc), "classification": reason}
+                raw = {
+                    "classification": reason,
+                    "submit_error": _safe_error_message(str(exc)),
+                    **_sanitize_exception(exc, phase="post_order", order_type=self.settings.order_type),
+                }
                 self.store.mark_execution_unknown(record.intent_id, reason, raw)
                 return self._result_from_record(
                     record, "execution_unknown", 0.0, 0.0, False, "unknown", reason, raw

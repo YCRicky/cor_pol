@@ -81,6 +81,18 @@ class FastGateway(ConfirmingGateway):
         return [{"order_id": order_id, "size": "5", "price": "0.51"}]
 
 
+
+
+class PolyStyleError(Exception):
+    status_code = 400
+    error_msg = {"error": "invalid order type FAK for this request"}
+
+
+class DetailedSubmitExceptionGateway(ConfirmingGateway):
+    def submit_limit_buy_fast(self, token_id, price, qty, metadata, order_type="FAK"):
+        raise PolyStyleError("should prefer structured error_msg")
+
+
 class RetryingCancelGateway(ConfirmingGateway):
     def __init__(self):
         super().__init__()
@@ -550,4 +562,27 @@ def test_slow_submission_notification_does_not_delay_cancel_reconciliation(tmp_p
         executor.wait_for_event_delivery()
     finally:
         release_notification.set()
+        store.close()
+
+
+def test_submit_exception_persists_sanitized_diagnostics(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        record = _reserve(store)
+        result = OrderExecutor(
+            Settings(dry_run=False, order_type="FAK", reconcile_timeout_s=2),
+            store,
+            gateway=DetailedSubmitExceptionGateway(),
+            heartbeat_factory=NoopHeartbeat,
+        ).execute_reserved(record, _metadata(), fast=True)
+
+        assert result.status == "execution_unknown"
+        assert result.error == "submit_exception"
+        assert result.raw["error_type"] == "PolyStyleError"
+        assert result.raw["status_code"] == 400
+        assert result.raw["order_type"] == "FAK"
+        assert result.raw["error_hint"] == "order_type_compatibility"
+        assert "invalid order type FAK" in result.raw["error_message"]
+        assert store.has_execution_unknown() is True
+    finally:
         store.close()

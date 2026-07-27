@@ -342,3 +342,49 @@ def test_fast_post_close_submission_uses_fak_order_type():
     gateway.submit_limit_buy_fast("token", 0.5, 5, MarketMetadata("condition", "0.01", 1, False, 0.07, {}, {}))
 
     assert client.order_types == ["FAK"]
+
+
+def test_fak_post_order_uses_documented_keyword_order_type_and_post_only_false():
+    class Args:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class Options:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class Client:
+        def __init__(self):
+            self.seen = None
+
+        def create_order(self, args, options=None):
+            return {"signed": True}
+
+        def post_order(self, order, *, order_type="GTC", post_only=True):
+            self.seen = {"order": order, "order_type": order_type, "post_only": post_only}
+            return {"orderID": "order-fak"}
+
+    client = Client()
+    gateway = V2ClobGateway(
+        client,
+        {
+            "OrderArgs": Args,
+            "PartialCreateOrderOptions": Options,
+            "BUY": "BUY",
+            "OrderType": type("OrderType", (), {"FAK": "FAK"}),
+        },
+    )
+
+    metadata = MarketMetadata(
+        condition_id="condition",
+        tick_size="0.01",
+        min_order_size=1.0,
+        neg_risk=False,
+        fee_rate=0.0,
+        tokens={"up": "token"},
+        raw={},
+    )
+    raw = gateway.submit_limit_buy_fast("token", 0.5, 5, metadata, "FAK")
+
+    assert raw["orderID"] == "order-fak"
+    assert client.seen == {"order": {"signed": True}, "order_type": "FAK", "post_only": False}
