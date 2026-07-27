@@ -45,6 +45,7 @@ def test_defaults_are_aftertake_only(monkeypatch):
     assert settings.dry_run_simulated_balance == 100.0
     assert settings.resolve_overrides == ""
     assert settings.state_db.name == "aftertake.sqlite3"
+    assert settings.order_type == "GTC"
 
 
 def test_dry_run_sim_balance_can_be_configured(monkeypatch):

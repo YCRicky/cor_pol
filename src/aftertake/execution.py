@@ -378,10 +378,12 @@ class OrderExecutor:
         assert self.gateway is not None
         started_at = self._monotonic()
         deadline = started_at + self.settings.reconcile_timeout_s
-        cancelable_order = self.settings.order_type in {"GTC", "GTD"}
-        # FAK/FOK are exchange-side immediate-or-cancel/fill-or-kill intents;
-        # do not emulate taker behavior by submitting GTC and cancelling after
-        # a tiny local TTL. Only resting-capable orders receive a local cancel.
+        cancelable_order = self.settings.order_type in {"GTD"}
+        # Owner-approved live policy: default GTC should not be locally
+        # cancelled after a tiny TTL. A submitted GTC may rest through the
+        # post-close window; keep it pending and let later reconciliation /
+        # official settlement decide the outcome. GTD remains the only
+        # explicitly locally-cancelled resting order type.
         cancel_at = min(started_at + self.settings.order_ttl_s, deadline - 0.5) if cancelable_order else float("inf")
         cancel_sent = False
         cancel_raw: Dict[str, Any] = {}
@@ -454,9 +456,8 @@ class OrderExecutor:
                 )
 
             if cancelable_order and not cancel_sent and self._monotonic() >= cancel_at:
-                # Resting-capable order: explicitly cancel after bounded TTL.
-                # FAK/FOK skip this path and rely on exchange-side immediate
-                # semantics while reconciliation polls longer for slow status propagation.
+                # GTD only: explicitly cancel after bounded TTL. GTC is left
+                # working; FAK/FOK rely on exchange-side immediate semantics.
                 try:
                     cancel_raw = self.gateway.cancel_order(order_id)
                     cancel_sent = True
@@ -475,6 +476,19 @@ class OrderExecutor:
             "trades": last_trades,
         }
         reason = "order_not_terminal_after_reconcile_timeout"
+        if self.settings.order_type == "GTC" and order_id:
+            raw["awaiting_settlement"] = True
+            raw["order_type"] = self.settings.order_type
+            return self._result_from_record(
+                record,
+                "submitted_pending",
+                0.0,
+                0.0,
+                False,
+                "awaiting_settlement",
+                "gtc_awaiting_settlement",
+                raw,
+            )
         self.store.mark_execution_unknown(record.intent_id, reason, raw)
         return self._result_from_record(
             record, "execution_unknown", 0.0, 0.0, False, "unknown", reason, raw

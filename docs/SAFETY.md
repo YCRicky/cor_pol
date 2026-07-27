@@ -14,10 +14,10 @@
   must be at least 1x final quantity. This prevents a small shadow baseline from
   authorizing an unsupported larger order without rejecting executable small
   residual asks solely because they lack a 2x depth buffer.
-- Default live execution submits one FAK marketable limit order and does not
-  emulate taker behavior by cancelling a GTC after five seconds. FAK/FOK
-  orders are reconciled with a longer status-polling window; only explicitly
-  configured GTC/GTD orders receive a local TTL cancel. It never auto-retries
+- Default live execution submits one GTC marketable limit order and does not
+  emulate taker behavior with a five-second local cancel. A submitted GTC is
+  left pending until later CLOB reconciliation / official settlement; only
+  explicitly configured GTD orders receive a local TTL cancel. It never auto-retries
   a possibly submitted order.
 - SQLite WAL persists one reservation per market. Unknown execution freezes
   new risk until an operator reconciles it.

@@ -55,6 +55,38 @@ class ConfirmingGateway:
         return {"heartbeat_id": "h1"}
 
 
+
+
+class PendingGtcGateway(ConfirmingGateway):
+    def get_order(self, order_id):
+        return {"id": order_id, "status": "live", "size_matched": "0"}
+
+    def cancel_order(self, order_id):
+        raise AssertionError("GTC must not be locally cancelled")
+
+    def order_trades(self, token_id, order_id):
+        return []
+
+
+class SubmittedThenMatchedGateway(ConfirmingGateway):
+    def __init__(self):
+        super().__init__()
+        self.lookups = 0
+
+    def get_order(self, order_id):
+        self.lookups += 1
+        if self.lookups <= 2:
+            return {"id": order_id, "status": "live", "size_matched": "0"}
+        return {"id": order_id, "status": "matched", "size_matched": "5", "average_price": "0.51"}
+
+    def cancel_order(self, order_id):
+        raise AssertionError("GTC must not be locally cancelled")
+
+    def order_trades(self, token_id, order_id):
+        if self.lookups <= 2:
+            return []
+        return [{"order_id": order_id, "size": "5", "price": "0.51"}]
+
 class TimeoutGateway(ConfirmingGateway):
     def submit_limit_buy(self, token_id, price, qty, metadata, order_type="GTC"):
         raise TimeoutError("request timed out after send")
@@ -236,12 +268,12 @@ def test_dry_run_reservation_records_a_shadow_simulated_take_without_real_order(
         store.close()
 
 
-def test_live_executor_cancels_remainder_and_records_confirmed_partial_fill(tmp_path):
+def test_gtc_submit_is_left_pending_without_local_cancel(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     try:
         record = _reserve(store)
         clock = FakeClock()
-        gateway = ConfirmingGateway()
+        gateway = PendingGtcGateway()
         settings = Settings(dry_run=False, order_type="GTC", order_ttl_s=1, reconcile_timeout_s=3, heartbeat_interval_s=1)
         executor = OrderExecutor(
             settings,
@@ -255,11 +287,52 @@ def test_live_executor_cancels_remainder_and_records_confirmed_partial_fill(tmp_
         result = executor.execute_reserved(record, _metadata())
 
         assert gateway.submits == 1
-        assert gateway.cancelled is True
+        assert gateway.cancelled is False
+        assert result.terminal is False
+        assert result.status == "submitted_pending"
+        assert result.submission_state == "awaiting_settlement"
+        assert result.error == "gtc_awaiting_settlement"
+        assert store.market_state(record.slug) == "submitted"
+        assert store.total_risk_exposure() == record.requested_notional
+        assert store.has_execution_unknown() is False
+    finally:
+        store.close()
+
+
+def test_gtc_pending_order_can_reconcile_later_to_confirmed_fill(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        record = _reserve(store)
+        first_clock = FakeClock()
+        first_gateway = PendingGtcGateway()
+        settings = Settings(dry_run=False, order_type="GTC", order_ttl_s=1, reconcile_timeout_s=1, heartbeat_interval_s=1)
+        first = OrderExecutor(
+            settings,
+            store,
+            gateway=first_gateway,
+            sleep=first_clock.sleep,
+            monotonic=first_clock,
+            heartbeat_factory=NoopHeartbeat,
+        ).execute_reserved(record, _metadata())
+        assert first.status == "submitted_pending"
+
+        pending = store.unresolved_orders()[0]
+        second_clock = FakeClock()
+        result = OrderExecutor(
+            settings,
+            store,
+            gateway=SubmittedThenMatchedGateway(),
+            sleep=second_clock.sleep,
+            monotonic=second_clock,
+            heartbeat_factory=NoopHeartbeat,
+        ).reconcile_existing(pending)
+
         assert result.terminal is True
-        assert result.filled_qty == 2
+        assert result.status == "matched"
+        assert result.filled_qty == 5
         assert result.avg_price == 0.51
-        assert store.total_open_exposure() == 1.02
+        assert store.market_state(record.slug) == "open"
+        assert store.total_open_exposure() == 2.55
     finally:
         store.close()
 
@@ -291,14 +364,14 @@ def test_submit_timeout_skips_only_current_market_without_global_freeze(tmp_path
         store.close()
 
 
-def test_unmatched_order_is_cancelled_and_cancel_425_is_retried(tmp_path):
+def test_gtd_unmatched_order_is_cancelled_and_cancel_425_is_retried(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     try:
         record = _reserve(store)
         clock = FakeClock()
         gateway = RetryingCancelGateway()
         settings = Settings(
-            dry_run=False, order_type="GTC", order_ttl_s=0.5, reconcile_timeout_s=3, heartbeat_interval_s=1
+            dry_run=False, order_type="GTD", order_ttl_s=0.5, reconcile_timeout_s=3, heartbeat_interval_s=1
         )
         result = OrderExecutor(
             settings,
@@ -373,9 +446,11 @@ def test_submit_ack_status_is_not_used_as_fill_when_lookup_fails(tmp_path):
             heartbeat_factory=NoopHeartbeat,
         ).execute_reserved(record, _metadata())
 
-        assert result.status == "execution_unknown"
-        assert store.has_execution_unknown() is True
+        assert result.status == "submitted_pending"
+        assert result.submission_state == "awaiting_settlement"
+        assert store.has_execution_unknown() is False
         assert store.total_open_exposure() == 0
+        assert store.total_risk_exposure() == record.requested_notional
     finally:
         store.close()
 
@@ -496,7 +571,7 @@ def test_fak_order_does_not_send_local_cancel(tmp_path):
         store.close()
 
 
-def test_acknowledged_order_emits_submitted_event_before_reconciliation(tmp_path):
+def test_acknowledged_gtc_order_emits_submitted_event_and_stays_pending(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     try:
         record = _reserve(store)
@@ -520,7 +595,9 @@ def test_acknowledged_order_emits_submitted_event_before_reconciliation(tmp_path
 
         result = executor.execute_reserved(record, _metadata())
 
-        assert result.terminal is True
+        assert result.terminal is False
+        assert result.status == "submitted_pending"
+        assert result.submission_state == "awaiting_settlement"
         assert emitted.wait(1)
         assert events == [
             (
@@ -538,7 +615,7 @@ def test_acknowledged_order_emits_submitted_event_before_reconciliation(tmp_path
         store.close()
 
 
-def test_slow_submission_notification_does_not_delay_cancel_reconciliation(tmp_path):
+def test_slow_submission_notification_does_not_delay_gtc_pending_reconciliation(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     release_notification = threading.Event()
     notification_started = threading.Event()
@@ -565,9 +642,10 @@ def test_slow_submission_notification_does_not_delay_cancel_reconciliation(tmp_p
 
         assert notification_started.wait(1)
         assert release_notification.is_set() is False
-        assert gateway.cancelled is True
-        assert result.terminal is True
-        assert clock.now <= 3
+        assert gateway.cancelled is False
+        assert result.terminal is False
+        assert result.status == "submitted_pending"
+        assert clock.now <= 3.1
         executor.wait_for_event_delivery(timeout_s=0)
         audit = store._conn.execute(
             """SELECT kind, payload_json FROM audit_events

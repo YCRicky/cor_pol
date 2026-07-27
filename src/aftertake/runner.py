@@ -589,6 +589,30 @@ def _reconcile_startup(
         )
 
 
+def reconcile_submitted_orders(
+    *, settings: Settings, store: StateStore, executor: OrderExecutor, notifier: Notifier
+) -> List[OrderResult]:
+    """Reconcile live submitted GTC/GTD orders without blocking fresh runtime.
+
+    Pending GTC orders are intentionally left working after the initial submit
+    window.  Each loop probes their CLOB status; terminal fills become open
+    positions and terminal zero-fills become no_fill. Non-terminal submitted
+    orders stay pending and are not treated as runtime failures.
+    """
+
+    results: List[OrderResult] = []
+    if not settings.is_live:
+        return results
+    for record in store.unresolved_orders():
+        if record.state != "submitted" or not record.order_id:
+            continue
+        result = executor.reconcile_existing(record)
+        results.append(result)
+        if result.terminal:
+            _notify_order_result(notifier, settings, store, result, record.slug)
+    return results
+
+
 def _live_runtime(
     settings: Settings, store: StateStore, public: PolymarketPublicClient, notifier: Notifier
 ) -> Tuple[Optional[V2ClobGateway], OrderExecutor]:
@@ -637,7 +661,6 @@ def _run_round_loop(
     processed_round_starts: set[int] = set()
 
     while forever or completed < max(1, rounds):
-        settle_open_positions(settings=settings, store=store, public=public, notifier=notifier)
         if settings.is_live and gateway is None:
             try:
                 gateway, executor = live_runtime_factory(settings, store, public, notifier)
@@ -657,6 +680,13 @@ def _run_round_loop(
                 _audit(settings, store, "runtime_recovered", {"previous_error": last_runtime_error})
                 _safe_notify(notifier, settings, store, "alert", {"reason": "PM runtime recovered"})
                 last_runtime_error = ""
+
+        if settings.is_live:
+            try:
+                reconcile_submitted_orders(settings=settings, store=store, executor=executor, notifier=notifier)
+            except Exception as exc:
+                _audit(settings, store, "submitted_reconcile_error", {"error": str(exc)})
+        settle_open_positions(settings=settings, store=store, public=public, notifier=notifier)
 
         if wait_for_next_boundary is not _wait_for_next_boundary:
             start = wait_for_next_boundary()

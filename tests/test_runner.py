@@ -19,6 +19,7 @@ from aftertake.runner import (
     _select_next_round_start,
     current_crypto_5m_slug,
     deployment_check,
+    reconcile_submitted_orders,
     run_round,
     settle_open_positions,
 )
@@ -125,6 +126,29 @@ class NoOrderIdStartupExecutor:
             {},
         )
 
+
+
+
+class PendingThenMatchedStartupExecutor:
+    def __init__(self):
+        self.calls = 0
+
+    def reconcile_existing(self, record):
+        self.calls += 1
+        if self.calls == 1:
+            return OrderExecutor(Settings(dry_run=False), StateStore.__new__(StateStore), gateway=object())._result_from_record(
+                record,
+                "submitted_pending",
+                0.0,
+                0.0,
+                False,
+                "awaiting_settlement",
+                "gtc_awaiting_settlement",
+                {"awaiting_settlement": True},
+            )
+        return OrderExecutor(Settings(dry_run=False), StateStore.__new__(StateStore), gateway=object())._result_from_record(
+            record, "matched", record.requested_qty, record.requested_price, True, "acknowledged", "", {}
+        )
 
 class InstantGateway:
     submitted_qty = 0.0
@@ -545,5 +569,28 @@ def test_startup_reconciliation_missing_order_id_terminal_skips_without_alert_sp
         assert unresolved == []
         assert notifier.messages == []
         assert store.reserve_entry("eth-updown-5m-1200", "condition", 1200, "token", "YES", 5, 0.51) is not None
+    finally:
+        store.close()
+
+
+def test_reconcile_submitted_orders_keeps_pending_quiet_then_notifies_terminal(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        record = store.reserve_entry("btc-updown-5m-900", "condition", 900, "up-token", "YES", 5, 0.64)
+        assert record is not None
+        store.mark_submitted(record.intent_id, "order-live-1", {"orderID": "order-live-1"})
+        notifier = CaptureNotifier()
+        executor = PendingThenMatchedStartupExecutor()
+        settings = Settings(dry_run=False, order_type="GTC", out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3")
+
+        first = reconcile_submitted_orders(settings=settings, store=store, executor=executor, notifier=notifier)
+        assert first[0].status == "submitted_pending"
+        assert notifier.messages == []
+        assert store.market_state("btc-updown-5m-900") == "submitted"
+
+        second = reconcile_submitted_orders(settings=settings, store=store, executor=executor, notifier=notifier)
+        assert second[0].terminal is True
+        assert notifier.messages
+        assert notifier.messages[-1].startswith("[Aftertake] ENTRY_CONFIRMED")
     finally:
         store.close()

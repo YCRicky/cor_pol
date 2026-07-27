@@ -14,7 +14,7 @@ Official public CLOB WebSocket (YES + NO paired books)
                winner-side residual ask + local risk check
                               |
                               v
-             SQLite reservation -> single CLOB taker-intent order; default FAK, optional bounded GTC/GTD
+             SQLite reservation -> single CLOB GTC taker-intent order; pending until CLOB reconciliation / settlement
                               |
                               v
                  reconciliation -> Telegram lifecycle -> PM settlement

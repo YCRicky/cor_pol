@@ -101,7 +101,7 @@ class Settings:
 
     # Fixed execution mechanics, not environment strategy settings.
     state_db: Path = Path("out/aftertake.sqlite3")
-    order_type: str = "FAK"
+    order_type: str = "GTC"
     order_ttl_s: float = 5.0
     reconcile_timeout_s: float = 45.0
     heartbeat_interval_s: float = 5.0
@@ -222,7 +222,7 @@ class Settings:
             live_quantity_floor_step=_float("AFTERTAKE_LIVE_QTY_FLOOR_STEP", 1.0),
             dry_run_simulated_balance=_float("AFTERTAKE_DRY_RUN_SIM_BALANCE", 100.0),
             resolve_overrides=os.getenv("AFTERTAKE_RESOLVE_OVERRIDES", DEFAULT_RESOLVE_OVERRIDES).strip(),
-            order_type=os.getenv("AFTERTAKE_ORDER_TYPE", "FAK").strip().upper(),
+            order_type=os.getenv("AFTERTAKE_ORDER_TYPE", "GTC").strip().upper(),
             order_ttl_s=_float("AFTERTAKE_ORDER_TTL_S", 5.0),
             reconcile_timeout_s=_float("AFTERTAKE_RECONCILE_TIMEOUT_S", 45.0),
             builder_code=os.getenv("POLY_BUILDER_CODE", "").strip(),
