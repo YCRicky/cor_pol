@@ -441,12 +441,12 @@ class V2ClobGateway:
         )
 
     def submit_limit_buy(
-        self, token_id: str, price: float, qty: float, metadata: MarketMetadata
+        self, token_id: str, price: float, qty: float, metadata: MarketMetadata, order_type: str = "GTC"
     ) -> Dict[str, Any]:
-        return self._submit_limit_buy(token_id, price, qty, metadata, retry_on_restart=True)
+        return self._submit_limit_buy(token_id, price, qty, metadata, retry_on_restart=True, order_type=order_type)
 
     def submit_limit_buy_fast(
-        self, token_id: str, price: float, qty: float, metadata: MarketMetadata
+        self, token_id: str, price: float, qty: float, metadata: MarketMetadata, order_type: str = "FAK"
     ) -> Dict[str, Any]:
         """Submit exactly once for a sub-second post-close opportunity.
 
@@ -456,7 +456,7 @@ class V2ClobGateway:
         ambiguous submission as ``execution_unknown`` and freezes new risk.
         """
 
-        return self._submit_limit_buy(token_id, price, qty, metadata, retry_on_restart=False)
+        return self._submit_limit_buy(token_id, price, qty, metadata, retry_on_restart=False, order_type=order_type)
 
     def _submit_limit_buy(
         self,
@@ -466,6 +466,7 @@ class V2ClobGateway:
         metadata: MarketMetadata,
         *,
         retry_on_restart: bool,
+        order_type: str,
     ) -> Dict[str, Any]:
         if qty < metadata.min_order_size:
             raise LivePreflightError("requested quantity is below the CLOB minimum order size")
@@ -483,7 +484,7 @@ class V2ClobGateway:
             try:
                 # Reuse the exact same signed order across a short 425
                 # restart retry; never create a second salt/order intent.
-                raw = self._client.post_order(order, self._sdk["OrderType"].GTC)
+                raw = self._client.post_order(order, self._order_type(order_type))
                 break
             except Exception as exc:
                 if not is_matching_engine_restart_error(exc) or attempt == attempts - 1:
@@ -492,6 +493,13 @@ class V2ClobGateway:
         if not isinstance(raw, dict):
             raise RuntimeError("CLOB returned an invalid order response")
         return raw
+
+    def _order_type(self, order_type: str) -> Any:
+        normalized = str(order_type or "").upper().strip()
+        value = getattr(self._sdk["OrderType"], normalized, None)
+        if value is None:
+            raise LivePreflightError(f"CLOB SDK does not support OrderType.{normalized}")
+        return value
 
     def get_order(self, order_id: str) -> Dict[str, Any]:
         raw = self._client.get_order(order_id)

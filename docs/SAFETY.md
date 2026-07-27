@@ -14,8 +14,11 @@
   must be at least 1x final quantity. This prevents a small shadow baseline from
   authorizing an unsupported larger order without rejecting executable small
   residual asks solely because they lack a 2x depth buffer.
-- It submits one GTC limit order, has a five-second lifetime, and explicitly
-  reconciles/cancels it. It never auto-retries a possibly submitted order.
+- Default live execution submits one FAK marketable limit order and does not
+  emulate taker behavior by cancelling a GTC after five seconds. FAK/FOK
+  orders are reconciled with a longer status-polling window; only explicitly
+  configured GTC/GTD orders receive a local TTL cancel. It never auto-retries
+  a possibly submitted order.
 - SQLite WAL persists one reservation per market. Unknown execution freezes
   new risk until an operator reconciles it.
 - Dry-run and live mode share the same sizing formula. Dry-run uses simulated

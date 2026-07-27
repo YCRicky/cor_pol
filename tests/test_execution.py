@@ -33,7 +33,7 @@ class ConfirmingGateway:
         self.cancelled = False
         self.submits = 0
 
-    def submit_limit_buy(self, token_id, price, qty, metadata):
+    def submit_limit_buy(self, token_id, price, qty, metadata, order_type="GTC"):
         self.submits += 1
         return {"orderID": "order-1", "status": "live"}
 
@@ -56,7 +56,7 @@ class ConfirmingGateway:
 
 
 class TimeoutGateway(ConfirmingGateway):
-    def submit_limit_buy(self, token_id, price, qty, metadata):
+    def submit_limit_buy(self, token_id, price, qty, metadata, order_type="GTC"):
         raise TimeoutError("request timed out after send")
 
 
@@ -65,7 +65,7 @@ class FastGateway(ConfirmingGateway):
         super().__init__()
         self.fast_submits = 0
 
-    def submit_limit_buy_fast(self, token_id, price, qty, metadata):
+    def submit_limit_buy_fast(self, token_id, price, qty, metadata, order_type="FAK"):
         self.fast_submits += 1
         return {"orderID": "order-1", "status": "matched"}
 
@@ -99,7 +99,7 @@ class RetryingCancelGateway(ConfirmingGateway):
 
 
 class MatchedAckLookupFailure(ConfirmingGateway):
-    def submit_limit_buy(self, token_id, price, qty, metadata):
+    def submit_limit_buy(self, token_id, price, qty, metadata, order_type="GTC"):
         return {"orderID": "order-1", "status": "matched"}
 
     def get_order(self, order_id):
@@ -110,7 +110,7 @@ class MatchedAckLookupFailure(ConfirmingGateway):
 
 
 class FillWithoutPriceGateway(ConfirmingGateway):
-    def submit_limit_buy(self, token_id, price, qty, metadata):
+    def submit_limit_buy(self, token_id, price, qty, metadata, order_type="GTC"):
         return {"orderID": "order-1", "status": "matched"}
 
     def get_order(self, order_id):
@@ -218,7 +218,7 @@ def test_live_executor_cancels_remainder_and_records_confirmed_partial_fill(tmp_
         record = _reserve(store)
         clock = FakeClock()
         gateway = ConfirmingGateway()
-        settings = Settings(dry_run=False, order_ttl_s=1, reconcile_timeout_s=3, heartbeat_interval_s=1)
+        settings = Settings(dry_run=False, order_type="GTC", order_ttl_s=1, reconcile_timeout_s=3, heartbeat_interval_s=1)
         executor = OrderExecutor(
             settings,
             store,
@@ -245,7 +245,7 @@ def test_submit_timeout_is_unknown_and_blocks_future_entries(tmp_path):
     try:
         record = _reserve(store)
         clock = FakeClock()
-        settings = Settings(dry_run=False, order_ttl_s=1, reconcile_timeout_s=3, heartbeat_interval_s=1)
+        settings = Settings(dry_run=False, order_type="GTC", order_ttl_s=1, reconcile_timeout_s=3, heartbeat_interval_s=1)
         result = OrderExecutor(
             settings,
             store,
@@ -269,7 +269,7 @@ def test_unmatched_order_is_cancelled_and_cancel_425_is_retried(tmp_path):
         clock = FakeClock()
         gateway = RetryingCancelGateway()
         settings = Settings(
-            dry_run=False, order_ttl_s=0.5, reconcile_timeout_s=3, heartbeat_interval_s=1
+            dry_run=False, order_type="GTC", order_ttl_s=0.5, reconcile_timeout_s=3, heartbeat_interval_s=1
         )
         result = OrderExecutor(
             settings,
@@ -293,7 +293,7 @@ def test_fast_execution_prefers_single_attempt_fast_gateway_method(tmp_path):
         record = _reserve(store)
         gateway = FastGateway()
         executor = OrderExecutor(
-            Settings(dry_run=False, order_ttl_s=1, reconcile_timeout_s=3, heartbeat_interval_s=1),
+            Settings(dry_run=False, order_type="GTC", order_ttl_s=1, reconcile_timeout_s=3, heartbeat_interval_s=1),
             store,
             gateway=gateway,
             heartbeat_factory=NoopHeartbeat,
@@ -315,7 +315,7 @@ def test_documented_prefixed_terminal_status_is_reconciled(tmp_path):
         record = _reserve(store)
         clock = FakeClock()
         result = OrderExecutor(
-            Settings(dry_run=False, order_ttl_s=0.5, reconcile_timeout_s=2),
+            Settings(dry_run=False, order_type="GTC", order_ttl_s=0.5, reconcile_timeout_s=2),
             store,
             gateway=PrefixedTerminalStatusGateway(),
             sleep=clock.sleep,
@@ -336,7 +336,7 @@ def test_submit_ack_status_is_not_used_as_fill_when_lookup_fails(tmp_path):
         record = _reserve(store)
         clock = FakeClock()
         result = OrderExecutor(
-            Settings(dry_run=False, order_ttl_s=0.5, reconcile_timeout_s=2),
+            Settings(dry_run=False, order_type="GTC", order_ttl_s=0.5, reconcile_timeout_s=2),
             store,
             gateway=MatchedAckLookupFailure(),
             sleep=clock.sleep,
@@ -357,7 +357,7 @@ def test_confirmed_fill_without_execution_price_remains_unknown(tmp_path):
         record = _reserve(store)
         clock = FakeClock()
         result = OrderExecutor(
-            Settings(dry_run=False, order_ttl_s=0.5, reconcile_timeout_s=2),
+            Settings(dry_run=False, order_type="GTC", order_ttl_s=0.5, reconcile_timeout_s=2),
             store,
             gateway=FillWithoutPriceGateway(),
             sleep=clock.sleep,
@@ -378,7 +378,7 @@ def test_partial_trade_page_cannot_price_the_full_matched_quantity(tmp_path):
         record = _reserve(store)
         clock = FakeClock()
         result = OrderExecutor(
-            Settings(dry_run=False, order_ttl_s=0.5, reconcile_timeout_s=2),
+            Settings(dry_run=False, order_type="GTC", order_ttl_s=0.5, reconcile_timeout_s=2),
             store,
             gateway=PartialTradeCoverageGateway(),
             sleep=clock.sleep,
@@ -403,7 +403,7 @@ def test_recovered_order_identity_mismatch_stays_unknown(tmp_path):
         clock = FakeClock()
 
         result = OrderExecutor(
-            Settings(dry_run=False, order_ttl_s=0.5, reconcile_timeout_s=2),
+            Settings(dry_run=False, order_type="GTC", order_ttl_s=0.5, reconcile_timeout_s=2),
             store,
             gateway=WrongRecoveredOrderGateway(),
             sleep=clock.sleep,
@@ -428,7 +428,7 @@ def test_matching_recovered_order_identity_can_reconcile(tmp_path):
         clock = FakeClock()
 
         result = OrderExecutor(
-            Settings(dry_run=False, order_ttl_s=0.5, reconcile_timeout_s=2),
+            Settings(dry_run=False, order_type="GTC", order_ttl_s=0.5, reconcile_timeout_s=2),
             store,
             gateway=MatchingRecoveredOrderGateway(),
             sleep=clock.sleep,
@@ -439,6 +439,30 @@ def test_matching_recovered_order_identity_can_reconcile(tmp_path):
         assert result.terminal is True
         assert result.filled_qty == 5
         assert store.market_state(record.slug) == "open"
+    finally:
+        store.close()
+
+
+def test_fak_order_does_not_send_local_cancel(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        record = _reserve(store)
+        clock = FakeClock()
+        gateway = ConfirmingGateway()
+        result = OrderExecutor(
+            Settings(dry_run=False, order_type="FAK", reconcile_timeout_s=2),
+            store,
+            gateway=gateway,
+            sleep=clock.sleep,
+            monotonic=clock,
+            heartbeat_factory=NoopHeartbeat,
+        ).execute_reserved(record, _metadata())
+
+        assert gateway.submits == 1
+        assert gateway.cancelled is False
+        assert result.status == "execution_unknown"
+        assert result.submission_state == "unknown"
+        assert store.has_execution_unknown() is True
     finally:
         store.close()
 
@@ -456,7 +480,7 @@ def test_acknowledged_order_emits_submitted_event_before_reconciliation(tmp_path
             emitted.set()
 
         executor = OrderExecutor(
-            Settings(dry_run=False, order_ttl_s=1, reconcile_timeout_s=3),
+            Settings(dry_run=False, order_type="GTC", order_ttl_s=1, reconcile_timeout_s=3),
             store,
             gateway=ConfirmingGateway(),
             sleep=clock.sleep,
@@ -499,7 +523,7 @@ def test_slow_submission_notification_does_not_delay_cancel_reconciliation(tmp_p
             release_notification.wait(2)
 
         executor = OrderExecutor(
-            Settings(dry_run=False, order_ttl_s=1, reconcile_timeout_s=3),
+            Settings(dry_run=False, order_type="GTC", order_ttl_s=1, reconcile_timeout_s=3),
             store,
             gateway=gateway,
             sleep=clock.sleep,

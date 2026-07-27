@@ -124,7 +124,7 @@ class InstantGateway:
             closed_only=False,
         )
 
-    def submit_limit_buy_fast(self, token_id, price, qty, metadata):
+    def submit_limit_buy_fast(self, token_id, price, qty, metadata, order_type="FAK"):
         self.submitted_qty = qty
         return {"orderID": "order-live-1"}
 
@@ -192,7 +192,7 @@ def test_residual_ten_ask_is_supported_when_near_touch_depth_covers_final_size(t
 def test_live_round_emits_only_execution_lifecycle_messages(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     try:
-        settings = Settings(dry_run=False, out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3")
+        settings = Settings(dry_run=False, order_type="GTC", out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3")
         notifier = CaptureNotifier()
         gateway = InstantGateway()
         timestamps = iter((1190.0, 1190.1, 1200.35))
@@ -222,7 +222,7 @@ def test_live_round_emits_only_execution_lifecycle_messages(tmp_path):
 def test_live_round_blocks_dynamic_quantity_that_the_observed_bid_support_cannot_cover(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     try:
-        settings = Settings(dry_run=False, out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3")
+        settings = Settings(dry_run=False, order_type="GTC", out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3")
         notifier = CaptureNotifier()
         gateway = InstantGateway()
         timestamps = iter((1190.0, 1190.1, 1200.35))
@@ -333,7 +333,7 @@ def test_forever_runner_retries_a_live_pm_bootstrap_failure_without_exiting(tmp_
 
     store = StateStore(tmp_path / "state.sqlite3")
     try:
-        settings = Settings(dry_run=False, out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3")
+        settings = Settings(dry_run=False, order_type="GTC", out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3")
         notifier = CaptureNotifier()
         attempts = []
 
@@ -370,7 +370,7 @@ def test_forever_runner_retries_a_live_pm_bootstrap_failure_without_exiting(tmp_
 
 
 def test_service_main_reports_boot_before_any_live_pm_connection(monkeypatch, tmp_path):
-    settings = Settings(dry_run=False, out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3")
+    settings = Settings(dry_run=False, order_type="GTC", out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3")
     notifier = CaptureNotifier()
 
     class NoLock:

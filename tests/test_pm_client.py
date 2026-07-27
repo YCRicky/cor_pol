@@ -256,7 +256,7 @@ def test_http_425_retries_the_same_signed_order_object():
             "OrderArgs": Args,
             "PartialCreateOrderOptions": Options,
             "BUY": "BUY",
-            "OrderType": type("OrderType", (), {"GTC": "GTC"}),
+            "OrderType": type("OrderType", (), {"GTC": "GTC", "FAK": "FAK"}),
         },
         sleep=lambda _: None,
     )
@@ -296,7 +296,7 @@ def test_fast_post_close_submission_does_not_retry_a_matching_engine_restart():
             "OrderArgs": Args,
             "PartialCreateOrderOptions": Options,
             "BUY": "BUY",
-            "OrderType": type("OrderType", (), {"GTC": "GTC"}),
+            "OrderType": type("OrderType", (), {"GTC": "GTC", "FAK": "FAK"}),
         },
         sleep=lambda _seconds: (_ for _ in ()).throw(AssertionError("fast path must not sleep")),
     )
@@ -306,3 +306,39 @@ def test_fast_post_close_submission_does_not_retry_a_matching_engine_restart():
         gateway.submit_limit_buy_fast("token", 0.5, 5, metadata)
 
     assert len(client.posted) == 1
+
+
+def test_fast_post_close_submission_uses_fak_order_type():
+    class Args:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class Options:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class Client:
+        def __init__(self):
+            self.order_types = []
+
+        def create_order(self, args, options=None):
+            return object()
+
+        def post_order(self, order, order_type):
+            self.order_types.append(order_type)
+            return {"orderID": "order-1"}
+
+    client = Client()
+    gateway = V2ClobGateway(
+        client,
+        {
+            "OrderArgs": Args,
+            "PartialCreateOrderOptions": Options,
+            "BUY": "BUY",
+            "OrderType": type("OrderType", (), {"GTC": "GTC", "FAK": "FAK"}),
+        },
+    )
+
+    gateway.submit_limit_buy_fast("token", 0.5, 5, MarketMetadata("condition", "0.01", 1, False, 0.07, {}, {}))
+
+    assert client.order_types == ["FAK"]

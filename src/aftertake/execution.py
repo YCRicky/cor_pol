@@ -15,7 +15,7 @@ from .state import OrderRecord, StateStore
 
 class OrderGateway(Protocol):
     def submit_limit_buy(
-        self, token_id: str, price: float, qty: float, metadata: MarketMetadata
+        self, token_id: str, price: float, qty: float, metadata: MarketMetadata, order_type: str = "GTC"
     ) -> Dict[str, Any]:
         ...
 
@@ -233,11 +233,19 @@ class OrderExecutor:
                 fast_submit = getattr(self.gateway, "submit_limit_buy_fast", None) if fast else None
                 if fast_submit is not None:
                     submitted = fast_submit(
-                        record.token_id, record.requested_price, record.requested_qty, metadata
+                        record.token_id,
+                        record.requested_price,
+                        record.requested_qty,
+                        metadata,
+                        self.settings.order_type,
                     )
                 else:
                     submitted = self.gateway.submit_limit_buy(
-                        record.token_id, record.requested_price, record.requested_qty, metadata
+                        record.token_id,
+                        record.requested_price,
+                        record.requested_qty,
+                        metadata,
+                        self.settings.order_type,
                     )
             except Exception as exc:
                 # Once the gateway call starts, even a local-looking exception
@@ -296,8 +304,11 @@ class OrderExecutor:
         assert self.gateway is not None
         started_at = self._monotonic()
         deadline = started_at + self.settings.reconcile_timeout_s
-        # Reserve a small post-cancel window for terminal confirmation.
-        cancel_at = min(started_at + self.settings.order_ttl_s, deadline - 0.5)
+        cancelable_order = self.settings.order_type in {"GTC", "GTD"}
+        # FAK/FOK are exchange-side immediate-or-cancel/fill-or-kill intents;
+        # do not emulate taker behavior by submitting GTC and cancelling after
+        # a tiny local TTL. Only resting-capable orders receive a local cancel.
+        cancel_at = min(started_at + self.settings.order_ttl_s, deadline - 0.5) if cancelable_order else float("inf")
         cancel_sent = False
         cancel_raw: Dict[str, Any] = {}
         cancel_errors: List[str] = []
@@ -368,10 +379,10 @@ class OrderExecutor:
                     raw,
                 )
 
-            if not cancel_sent and self._monotonic() >= cancel_at:
-                # Share-sized GTC is made marketable by the current best ask,
-                # then explicitly cancelled after its tiny allowed lifetime.
-                # We do not leave a strategy order resting unattended.
+            if cancelable_order and not cancel_sent and self._monotonic() >= cancel_at:
+                # Resting-capable order: explicitly cancel after bounded TTL.
+                # FAK/FOK skip this path and rely on exchange-side immediate
+                # semantics while reconciliation polls longer for slow status propagation.
                 try:
                     cancel_raw = self.gateway.cancel_order(order_id)
                     cancel_sent = True

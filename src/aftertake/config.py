@@ -95,8 +95,9 @@ class Settings:
 
     # Fixed execution mechanics, not environment strategy settings.
     state_db: Path = Path("out/aftertake.sqlite3")
+    order_type: str = "FAK"
     order_ttl_s: float = 5.0
-    reconcile_timeout_s: float = 8.0
+    reconcile_timeout_s: float = 45.0
     heartbeat_interval_s: float = 5.0
     builder_code: str = ""
 
@@ -146,10 +147,14 @@ class Settings:
         if self.dry_run_simulated_balance <= 0:
             raise ValueError("AFTERTAKE_DRY_RUN_SIM_BALANCE must be > 0")
         parse_resolve_overrides(self.resolve_overrides)
-        if not 0 < self.order_ttl_s <= 10:
-            raise ValueError("internal order TTL must be in (0, 10]")
-        if not 0 < self.reconcile_timeout_s <= 30:
-            raise ValueError("internal reconciliation timeout must be in (0, 30]")
+        order_type = self.order_type.upper().strip()
+        if order_type not in {"FAK", "FOK", "GTC", "GTD"}:
+            raise ValueError("AFTERTAKE_ORDER_TYPE must be one of FAK, FOK, GTC, GTD")
+        object.__setattr__(self, "order_type", order_type)
+        if not 0 < self.order_ttl_s <= 120:
+            raise ValueError("internal order TTL must be in (0, 120]")
+        if not 0 < self.reconcile_timeout_s <= 180:
+            raise ValueError("internal reconciliation timeout must be in (0, 180]")
         if not 0 < self.heartbeat_interval_s <= 5:
             raise ValueError("internal heartbeat interval must be in (0, 5]")
 
@@ -191,6 +196,9 @@ class Settings:
             live_quantity_floor_step=_float("AFTERTAKE_LIVE_QTY_FLOOR_STEP", 1.0),
             dry_run_simulated_balance=_float("AFTERTAKE_DRY_RUN_SIM_BALANCE", 100.0),
             resolve_overrides=os.getenv("AFTERTAKE_RESOLVE_OVERRIDES", DEFAULT_RESOLVE_OVERRIDES).strip(),
+            order_type=os.getenv("AFTERTAKE_ORDER_TYPE", "FAK").strip().upper(),
+            order_ttl_s=_float("AFTERTAKE_ORDER_TTL_S", 5.0),
+            reconcile_timeout_s=_float("AFTERTAKE_RECONCILE_TIMEOUT_S", 45.0),
             builder_code=os.getenv("POLY_BUILDER_CODE", "").strip(),
             clob_host=os.getenv("CLOB_API_URL", DEFAULT_CLOB_HOST).strip().rstrip("/"),
             polymarket_private_key=os.getenv("POLYMARKET_PRIVATE_KEY", "").strip(),
