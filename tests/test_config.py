@@ -113,6 +113,29 @@ def test_assets_env_accepts_multi_asset_universe(monkeypatch, tmp_path):
     assert settings.asset == "BTC"
 
 
+
+
+def test_legacy_asset_env_accepts_comma_separated_universe(monkeypatch, tmp_path):
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("AFTERTAKE_ASSET", "BTC,ETH,XRP,HYPE,SOL")
+    monkeypatch.setenv("AFTERTAKE_OUT_DIR", str(tmp_path / "out"))
+
+    settings = Settings.from_env()
+
+    assert settings.assets == ("BTC", "ETH", "XRP", "HYPE", "SOL")
+    assert settings.asset == "BTC"
+
+
+def test_legacy_asset_env_btc_only_keeps_default_universe(monkeypatch, tmp_path):
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("AFTERTAKE_ASSET", "BTC")
+    monkeypatch.setenv("AFTERTAKE_OUT_DIR", str(tmp_path / "out"))
+
+    settings = Settings.from_env()
+
+    assert settings.assets == ("BTC", "ETH", "XRP", "HYPE", "DOGE", "SOL")
+
+
 def test_assets_env_rejects_unsupported_assets(monkeypatch, tmp_path):
     monkeypatch.setenv("AFTERTAKE_ASSETS", "btc,avax")
     monkeypatch.setenv("AFTERTAKE_OUT_DIR", str(tmp_path / "out"))

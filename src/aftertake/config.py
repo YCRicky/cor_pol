@@ -64,6 +64,10 @@ def _int(name: str, default: int) -> int:
         raise ValueError("%s must be an integer" % name) from exc
 
 
+def _parse_asset_list(raw: str) -> Tuple[str, ...]:
+    return tuple(part.strip().upper() for part in str(raw or "").replace(";", ",").split(",") if part.strip())
+
+
 def _signature_type_from_env() -> Optional[int]:
     raw = os.getenv("SIGNATURE_TYPE", "").strip().strip('"').strip("'")
     if not raw:
@@ -194,9 +198,13 @@ class Settings:
         raw_assets = os.getenv("AFTERTAKE_ASSETS", "").strip()
         legacy_asset = os.getenv("AFTERTAKE_ASSET", "").strip()
         if raw_assets:
-            assets = tuple(part.strip().upper() for part in raw_assets.replace(";", ",").split(",") if part.strip())
-        elif legacy_asset and legacy_asset.upper() != "BTC":
-            assets = (legacy_asset.upper(),)
+            assets = _parse_asset_list(raw_assets)
+        elif legacy_asset:
+            # Be lenient with old EC2 .env files that accidentally put a
+            # comma-separated universe in the legacy single-asset variable.
+            assets = _parse_asset_list(legacy_asset)
+            if assets == ("BTC",):
+                assets = DEFAULT_ASSETS
         else:
             assets = DEFAULT_ASSETS
         settings = cls(
