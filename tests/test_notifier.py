@@ -155,3 +155,14 @@ def test_alert_formatter_expands_submit_exception_diagnostics():
     assert "order_type=FAK" in text
     assert "order_id=n/a" in text
     assert "error_message=invalid order type FAK" in text
+
+
+def test_boot_formatter_uses_multi_asset_wording():
+    text = format_event(
+        "boot",
+        {"dry_run": False, "qty": 5, "assets": ("BTC", "ETH", "XRP", "HYPE", "SOL")},
+    )
+
+    assert "assets=BTC,ETH,XRP,HYPE,SOL" in text
+    assert "multi-asset per-asset risk gates" in text
+    assert "one-entry-per-market" not in text

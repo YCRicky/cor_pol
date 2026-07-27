@@ -13,6 +13,7 @@ from aftertake.post_close import PairedBook, SideBook
 from aftertake.risk import RiskRejected, check_entry_risk
 from aftertake.runner import (
     _probe_stream,
+    _reconcile_startup,
     _run_asset_rounds,
     _run_round_loop,
     _select_next_round_start,
@@ -104,6 +105,25 @@ class DeepSupportPairedStream(PairedStream):
 
 class ResidualTenSupportPairedStream(PairedStream):
     no_ask_size = 10
+
+
+
+
+class NoOrderIdStartupExecutor:
+    def __init__(self, store):
+        self.store = store
+
+    def reconcile_existing(self, record):
+        return OrderExecutor(Settings(dry_run=False), self.store, gateway=object())._result_from_record(
+            record,
+            "execution_unknown",
+            0.0,
+            0.0,
+            False,
+            "unknown",
+            "persisted_intent_has_no_order_id",
+            {},
+        )
 
 
 class InstantGateway:
@@ -472,7 +492,7 @@ def test_service_main_reports_boot_before_any_live_pm_connection(monkeypatch, tm
 
     def assert_boot_then_stop(**_kwargs):
         assert notifier.messages == [
-            "[Aftertake] BOOT\nmode=LIVE qty=5.0000 assets=BTC,ETH,XRP,HYPE,DOGE,SOL\none-entry-per-market + SQLite recovery + CLOB V2 preflight"
+            "[Aftertake] BOOT\nmode=LIVE qty=5.0000 assets=BTC,ETH,XRP,HYPE,DOGE,SOL\nmulti-asset per-asset risk gates + SQLite recovery + CLOB V2 preflight"
         ]
 
     monkeypatch.setattr(runner_module.Settings, "from_env", staticmethod(lambda: settings))
@@ -494,5 +514,35 @@ def test_confirmed_open_fill_is_settled_from_pm_outcome(tmp_path):
         assert settled[0]["settlement_source"] == "pm"
         assert settled[0]["win"] is True
         assert store.market_state(record.slug) == "settled"
+    finally:
+        store.close()
+
+
+def test_startup_reconciliation_missing_order_id_blocks_without_crash_or_spam(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        record = store.reserve_entry(
+            "btc-updown-5m-900",
+            "condition",
+            900,
+            "token",
+            "NO",
+            5,
+            0.64,
+        )
+        store.mark_execution_unknown(record.intent_id, "submit_exception", {"order_type": "FAK"})
+        notifier = CaptureNotifier()
+
+        _reconcile_startup(
+            Settings(dry_run=False, order_type="FAK", out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3"),
+            store,
+            NoOrderIdStartupExecutor(store),
+            notifier,
+        )
+
+        assert store.has_execution_unknown() is True
+        assert len(notifier.messages) == 1
+        assert "reason=startup_reconciliation_blocked" in notifier.messages[0]
+        assert "manual_clob_reconciliation_required" in notifier.messages[0]
     finally:
         store.close()

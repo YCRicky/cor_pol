@@ -22,7 +22,7 @@ def format_event(kind: str, payload: Dict[str, Any], slug: str = "") -> str:
             "[Aftertake] BOOT\n"
             f"mode={'SHADOW' if payload['dry_run'] else 'LIVE'} "
             f"qty={_number(payload['qty'])} assets={','.join(payload.get('assets', []))}\n"
-            "one-entry-per-market + SQLite recovery + CLOB V2 preflight"
+            "multi-asset per-asset risk gates + SQLite recovery + CLOB V2 preflight"
         )
     if kind == "preflight":
         return (

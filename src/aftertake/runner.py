@@ -546,13 +546,35 @@ def _select_next_round_start(
 def _reconcile_startup(
     settings: Settings, store: StateStore, executor: OrderExecutor, notifier: Notifier
 ) -> None:
-    for record in store.unresolved_orders():
+    blocked: list[str] = []
+    unresolved = store.unresolved_orders()
+    for record in unresolved:
         result = executor.reconcile_existing(record)
-        _notify_order_result(notifier, settings, store, result, record.slug)
-        if not result.terminal:
-            raise RuntimeError("startup reconciliation remains unknown for %s" % record.slug)
-    if store.has_execution_unknown():
-        raise RuntimeError("execution_unknown remains; manual CLOB reconciliation is required")
+        if result.terminal:
+            _notify_order_result(notifier, settings, store, result, record.slug)
+            continue
+        blocked.append(record.slug)
+
+    if blocked or store.has_execution_unknown():
+        # Startup recovery may discover an old ambiguous intent with no durable
+        # order id.  Crashing here only creates a systemd restart loop and TG
+        # spam; safety is already enforced by the risk gate, which blocks new
+        # entries while any execution_unknown remains.
+        message = (
+            "startup reconciliation left execution_unknown; "
+            "live entries remain risk-blocked until manual CLOB/state reconciliation"
+        )
+        if blocked:
+            message += "; affected_slugs=" + ",".join(blocked[:5])
+        payload = {
+            "reason": "startup_reconciliation_blocked",
+            "error_hint": "manual_clob_reconciliation_required",
+            "order_type": settings.order_type,
+            "submission_state": "unknown",
+            "order_id": "n/a",
+            "error_message": message,
+        }
+        _safe_notify(notifier, settings, store, "alert", payload, "runtime")
 
 
 def _live_runtime(
