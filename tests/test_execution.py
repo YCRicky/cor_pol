@@ -622,6 +622,7 @@ def test_fak_no_match_error_is_terminal_no_fill_not_execution_unknown(tmp_path):
 
         assert result.terminal is True
         assert result.status == "no_fill"
+        assert result.submission_state == "venue_no_match"
         assert result.filled_qty == 0
         assert result.error == "fak_no_matching_resting_order"
         assert result.raw["terminal_no_fill"] is True

@@ -139,6 +139,7 @@ def _notify_order_result(
         }
     else:
         kind = "order_result"
+        raw = result.raw or {}
         payload = {
             "side": result.side,
             "status": result.status,
@@ -146,6 +147,14 @@ def _notify_order_result(
             "avg_price": result.avg_price,
             "submission_state": result.submission_state,
             "order_id": result.order_id,
+            "reason": result.error or raw.get("classification", ""),
+            "order_type": settings.order_type,
+            "requested_qty": result.requested_qty,
+            "requested_price": result.price,
+            "available_size": available_size,
+            "error_message": raw.get("error_message", raw.get("submit_error", "")),
+            "status_code": raw.get("status_code", ""),
+            "error_hint": raw.get("error_hint", ""),
         }
     _safe_notify(notifier, settings, store, kind, payload, slug)
 

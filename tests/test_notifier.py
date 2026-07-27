@@ -166,3 +166,33 @@ def test_boot_formatter_uses_multi_asset_wording():
     assert "assets=BTC,ETH,XRP,HYPE,SOL" in text
     assert "multi-asset per-asset risk gates" in text
     assert "one-entry-per-market" not in text
+
+
+def test_order_result_includes_no_match_diagnostics_and_requested_context():
+    text = format_event(
+        "order_result",
+        {
+            "side": "YES",
+            "status": "no_fill",
+            "filled_qty": 0,
+            "avg_price": 0,
+            "submission_state": "venue_no_match",
+            "order_id": "",
+            "reason": "fak_no_matching_resting_order",
+            "order_type": "FAK",
+            "status_code": 400,
+            "requested_qty": 50,
+            "requested_price": 0.99,
+            "available_size": 509.46,
+            "error_message": "no orders found to match with FAK order",
+        },
+        "btc-updown-5m-1785167400",
+    )
+
+    assert "submission=venue_no_match order=n/a" in text
+    assert "reason=fak_no_matching_resting_order" in text
+    assert "order_type=FAK" in text
+    assert "requested_qty=50.0000" in text
+    assert "requested_price=0.9900" in text
+    assert "available_size=509.4600" in text
+    assert "error_message=no orders found to match with FAK order" in text

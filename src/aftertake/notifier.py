@@ -57,14 +57,33 @@ def format_event(kind: str, payload: Dict[str, Any], slug: str = "") -> str:
             f"status={payload['status']} order={payload['order_id']} slug={slug}"
         )
     if kind == "order_result":
-        return (
-            "[Aftertake] ORDER_RESULT\n"
-            f"{payload['side']} status={payload['status']} "
-            f"filled={_number(payload['filled_qty'])} "
-            f"avg={_number(payload['avg_price'])}\n"
-            f"submission={payload['submission_state']} "
-            f"order={payload.get('order_id') or 'n/a'} slug={slug}"
-        )
+        lines = [
+            "[Aftertake] ORDER_RESULT",
+            (
+                f"{payload['side']} status={payload['status']} "
+                f"filled={_number(payload['filled_qty'])} "
+                f"avg={_number(payload['avg_price'])}"
+            ),
+            f"submission={payload['submission_state']} order={payload.get('order_id') or 'n/a'}",
+        ]
+        for key in ("reason", "order_type", "status_code", "error_hint"):
+            value = payload.get(key)
+            if value not in (None, ""):
+                lines.append(f"{key}={value}")
+        if payload.get("requested_qty") is not None or payload.get("requested_price") is not None:
+            lines.append(
+                f"requested_qty={_number(payload.get('requested_qty'))} "
+                f"requested_price={_number(payload.get('requested_price'))} "
+                f"available_size={_number(payload.get('available_size'))}"
+            )
+        message = str(payload.get("error_message") or "")
+        if message:
+            message = " ".join(message.split())
+            if len(message) > 300:
+                message = message[:300] + "..."
+            lines.append(f"error_message={message}")
+        lines.append(f"slug={slug}")
+        return "\n".join(lines)
     if kind == "blocked":
         return (
             "[Aftertake] ENTRY_BLOCKED\n"

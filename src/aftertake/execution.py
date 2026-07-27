@@ -314,7 +314,7 @@ class OrderExecutor:
                     raw["terminal_no_fill"] = True
                     self.store.mark_terminal_execution(record.intent_id, 0.0, 0.0, raw, "no_fill")
                     return self._result_from_record(
-                        record, "no_fill", 0.0, 0.0, True, "acknowledged", reason, raw
+                        record, "no_fill", 0.0, 0.0, True, "venue_no_match", reason, raw
                     )
 
                 # Polymarket CLOB/network failures are common enough that they
