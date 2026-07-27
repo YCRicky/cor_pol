@@ -58,7 +58,7 @@ def test_unknown_execution_freezes_risk_before_external_submit(tmp_path):
         store.close()
 
 
-def test_displayed_depth_and_original_open_position_limit_are_enforced(tmp_path):
+def test_displayed_depth_and_per_asset_open_position_limit_are_enforced(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     try:
         with pytest.raises(RiskRejected, match="depth"):
@@ -71,15 +71,15 @@ def test_displayed_depth_and_original_open_position_limit_are_enforced(tmp_path)
                 displayed_ask_size=4,
             )
 
-        record = _reserve(store, "first")
+        record = _reserve(store, "btc-updown-5m-0")
         store.mark_terminal_execution(
             record.intent_id, filled_qty=5, avg_price=0.5, raw={}, reason="matched"
         )
         with pytest.raises(RiskRejected, match="max_open_positions"):
             check_entry_risk(
-                settings=Settings(),
+                settings=Settings(max_open_positions=1),
                 store=store,
-                slug="second",
+                slug="btc-updown-5m-300",
                 price=0.5,
                 qty=5,
                 displayed_ask_size=10,
@@ -122,15 +122,15 @@ def test_original_daily_loss_and_loss_streak_limits_are_enforced(tmp_path):
         store.close()
 
 
-def test_original_entry_cooldown_is_enforced(tmp_path):
+def test_per_asset_entry_cooldown_is_enforced(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     try:
-        _reserve(store, "first")
+        _reserve(store, "btc-updown-5m-0")
         with pytest.raises(RiskRejected, match="entry_cooldown"):
             check_entry_risk(
                 settings=Settings(),
                 store=store,
-                slug="second",
+                slug="btc-updown-5m-300",
                 price=0.5,
                 qty=5,
                 displayed_ask_size=10,

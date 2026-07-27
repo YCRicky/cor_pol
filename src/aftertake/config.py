@@ -87,7 +87,7 @@ class Settings:
     qty: float = 5.0
     out_dir: Path = Path("out")
     max_daily_loss: float = 25.0
-    max_open_positions: int = 1
+    max_open_positions: int = 3
     max_consecutive_losses: int = 5
     min_seconds_between_entries: int = 60
     live_max_account_risk_fraction: float = 0.50
@@ -207,7 +207,7 @@ class Settings:
             out_dir=out_dir,
             state_db=out_dir / "aftertake.sqlite3",
             max_daily_loss=_float("AFTERTAKE_MAX_DAILY_LOSS", 25.0),
-            max_open_positions=_int("AFTERTAKE_MAX_OPEN_POSITIONS", 1),
+            max_open_positions=_int("AFTERTAKE_MAX_OPEN_POSITIONS", 3),
             max_consecutive_losses=_int("AFTERTAKE_MAX_CONSECUTIVE_LOSSES", 5),
             min_seconds_between_entries=_int("AFTERTAKE_MIN_SECONDS_BETWEEN_ENTRIES", 60),
             live_max_account_risk_fraction=_float("AFTERTAKE_LIVE_MAX_ACCOUNT_RISK_FRACTION", 0.50),

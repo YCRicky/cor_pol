@@ -703,7 +703,8 @@ def deployment_check(
         slug_markets[slug] = market
 
     first_slug, first_market = next(iter(slug_markets.items()))
-    _probe_stream(first_market, stream_factory=stream_factory)
+    for market in slug_markets.values():
+        _probe_stream(market, stream_factory=stream_factory)
 
     metadata_verified = False
     if settings.is_live:

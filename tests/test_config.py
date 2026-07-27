@@ -122,3 +122,10 @@ def test_assets_env_rejects_unsupported_assets(monkeypatch, tmp_path):
         assert "unsupported assets" in str(exc)
     else:
         raise AssertionError("unsupported assets must be rejected")
+
+
+def test_default_max_open_positions_is_three(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AFTERTAKE_MAX_OPEN_POSITIONS", raising=False)
+    monkeypatch.setenv("AFTERTAKE_OUT_DIR", str(tmp_path / "out"))
+    assert Settings.from_env().max_open_positions == 3

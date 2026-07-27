@@ -35,7 +35,8 @@ def check_entry_risk(
 ) -> RiskSnapshot:
     """Apply only the risk controls that existed in the strategy configuration."""
 
-    del slug  # Market uniqueness is enforced by StateStore.reserve_entry().
+    # Market uniqueness is enforced by StateStore.reserve_entry(); open-position
+    # and cooldown caps are per asset so BTC/ETH/etc. do not block one another.
     price = float(price)
     qty = float(qty)
     displayed_ask_size = float(displayed_ask_size)
@@ -47,20 +48,20 @@ def check_entry_risk(
         raise RiskRejected("execution_unknown_requires_manual_reconciliation")
 
     now = float(time.time() if now_ts is None else now_ts)
-    open_positions = len(store.open_positions())
+    open_positions = len(store.open_positions_for_asset(slug))
     daily_loss = store.daily_realized_loss()
     consecutive_losses = store.consecutive_losses()
-    last_entry = store.last_entry_timestamp()
+    last_entry = store.last_entry_timestamp_for_asset(slug)
     elapsed = None if last_entry is None else max(0.0, now - last_entry)
 
     if open_positions >= settings.max_open_positions:
-        raise RiskRejected("max_open_positions")
+        raise RiskRejected("max_open_positions_for_asset")
     if daily_loss >= abs(settings.max_daily_loss):
         raise RiskRejected("daily_loss_limit")
     if consecutive_losses >= settings.max_consecutive_losses:
         raise RiskRejected("consecutive_loss_limit")
     if elapsed is not None and elapsed < settings.min_seconds_between_entries:
-        raise RiskRejected("entry_cooldown")
+        raise RiskRejected("entry_cooldown_for_asset")
 
     return RiskSnapshot(
         requested_notional=price * qty,

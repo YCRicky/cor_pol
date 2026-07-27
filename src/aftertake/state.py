@@ -23,6 +23,10 @@ def _utc_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
+def _asset_slug_prefix(slug: str) -> str:
+    return str(slug).split("-", 1)[0].lower() + "-%"
+
+
 class RuntimeLock:
     """Cross-platform non-blocking lock preventing duplicate trading loops."""
 
@@ -502,13 +506,40 @@ class StateStore:
             ).fetchall()
         return [self._record_from_row(row) for row in rows]
 
+    def open_positions_for_asset(self, slug: str) -> List[OrderRecord]:
+        """Return open positions sharing the same asset slug prefix."""
+
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT o.* FROM orders AS o
+                   JOIN markets AS m ON m.slug = o.slug
+                   WHERE m.state = 'open' AND o.filled_qty > 0 AND o.slug LIKE ?
+                   ORDER BY o.created_at""",
+                (_asset_slug_prefix(slug),),
+            ).fetchall()
+        return [self._record_from_row(row) for row in rows]
+
     def last_entry_timestamp(self) -> Optional[float]:
         """Return the most recent persisted strategy-entry timestamp."""
 
+        return self.last_entry_timestamp_for_asset("")
+
+    def last_entry_timestamp_for_asset(self, slug: str) -> Optional[float]:
+        """Return the most recent persisted entry timestamp for one asset prefix.
+
+        Empty slug keeps the legacy global query for status/debug callers.
+        """
+
         with self._lock:
-            row = self._conn.execute(
-                "SELECT created_at FROM orders ORDER BY created_at DESC LIMIT 1"
-            ).fetchone()
+            if slug:
+                row = self._conn.execute(
+                    "SELECT created_at FROM orders WHERE slug LIKE ? ORDER BY created_at DESC LIMIT 1",
+                    (_asset_slug_prefix(slug),),
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT created_at FROM orders ORDER BY created_at DESC LIMIT 1"
+                ).fetchone()
         if row is None:
             return None
         try:

@@ -10,6 +10,7 @@ from aftertake.pm_client import (
     MarketMetadata,
 )
 from aftertake.post_close import PairedBook, SideBook
+from aftertake.risk import RiskRejected, check_entry_risk
 from aftertake.runner import (
     _probe_stream,
     _run_asset_rounds,
@@ -283,6 +284,47 @@ def test_configured_assets_run_for_the_same_round_boundary(tmp_path):
     finally:
         store.close()
 
+
+def test_configured_assets_do_not_block_each_other_by_position_or_cooldown(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        settings = Settings(max_open_positions=1, min_seconds_between_entries=60, state_db=tmp_path / "state.sqlite3")
+        btc = store.reserve_entry("btc-updown-5m-900", "condition-btc", 900, "btc-token", "NO", 5, 0.64)
+        assert btc is not None
+        store.mark_terminal_execution(btc.intent_id, 5, 0.64, {"test": True}, "matched")
+
+        # Same asset is capped/cooldowned.
+        try:
+            check_entry_risk(
+                settings=settings,
+                store=store,
+                slug="btc-updown-5m-1200",
+                price=0.64,
+                qty=5,
+                displayed_ask_size=5,
+                now_ts=1201,
+            )
+        except RiskRejected as exc:
+            assert str(exc) in {"max_open_positions_for_asset", "entry_cooldown_for_asset"}
+        else:
+            raise AssertionError("same asset must respect per-asset risk gates")
+
+        # Different assets must not be blocked by BTC's position or cooldown.
+        snapshot = check_entry_risk(
+            settings=settings,
+            store=store,
+            slug="eth-updown-5m-1200",
+            price=0.64,
+            qty=5,
+            displayed_ask_size=5,
+            now_ts=1201,
+        )
+        assert snapshot.open_positions == 0
+        assert snapshot.seconds_since_last_entry is None
+    finally:
+        store.close()
+
+
 def test_round_scheduler_joins_active_round_after_previous_close_instead_of_skipping():
     slept = []
     processed = {900}
@@ -312,6 +354,13 @@ def test_round_scheduler_waits_when_active_round_is_too_close_to_close():
 
 
 def test_deployment_check_requires_tg_and_verifies_paired_websocket():
+    class CountingPairedStream(PairedStream):
+        starts = 0
+
+        def start(self):
+            type(self).starts += 1
+            return super().start()
+
     notifier = CaptureNotifier()
     result = deployment_check(
         settings=Settings(dry_run=True),
@@ -319,9 +368,10 @@ def test_deployment_check_requires_tg_and_verifies_paired_websocket():
         gateway=None,
         notifier=notifier,
         clock=lambda: 1200.0,
-        stream_factory=PairedStream,
+        stream_factory=CountingPairedStream,
     )
     assert result["websocket_verified"] is True
+    assert CountingPairedStream.starts == 6
     assert result["telegram_verified"] is True
     assert notifier.messages[0].startswith("[Aftertake] DEPLOYMENT_CHECK_OK")
 
