@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -46,12 +47,21 @@ from .state import RuntimeLock, StateStore
 RUNTIME_RETRY_S = 5.0
 
 
-def current_btc_5m_slug(now: Optional[int] = None) -> Tuple[str, int, int]:
-    """Return the official current BTC 5m Gamma slug and its UTC boundaries."""
+def current_crypto_5m_slug(asset: str, now: Optional[int] = None) -> Tuple[str, int, int]:
+    """Return the official current crypto 5m Gamma slug and its UTC boundaries."""
 
     timestamp = int(now if now is not None else time.time())
     start = timestamp - timestamp % 300
-    return "btc-updown-5m-%s" % start, start, start + 300
+    normalized = str(asset).lower().strip()
+    if not normalized:
+        raise ValueError("asset is required")
+    return "%s-updown-5m-%s" % (normalized, start), start, start + 300
+
+
+def current_btc_5m_slug(now: Optional[int] = None) -> Tuple[str, int, int]:
+    """Backward-compatible BTC 5m slug helper."""
+
+    return current_crypto_5m_slug("BTC", now)
 
 
 def _audit(
@@ -220,6 +230,7 @@ def run_round(
     executor: OrderExecutor,
     live_gateway: Optional[V2ClobGateway],
     round_start: int,
+    asset: Optional[str] = None,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
     notifier: Optional[Notifier] = None,
@@ -232,7 +243,8 @@ def run_round(
     or retry I/O, so a qualifying residual ask is not intentionally delayed.
     """
 
-    slug, expected_start, round_end = current_btc_5m_slug(round_start)
+    active_asset = str(asset or settings.asset).upper().strip()
+    slug, expected_start, round_end = current_crypto_5m_slug(active_asset, round_start)
     if expected_start != int(round_start):
         raise ValueError("run_round requires a 5-minute boundary")
     market = public.market_by_slug(slug)
@@ -435,6 +447,58 @@ def run_round(
     return decisions
 
 
+def _run_asset_rounds(
+    *,
+    settings: Settings,
+    store: StateStore,
+    public: PolymarketPublicClient,
+    executor: OrderExecutor,
+    live_gateway: Optional[V2ClobGateway],
+    round_start: int,
+    notifier: Optional[Notifier] = None,
+    stream_factory: Callable[..., MarketBookStream] = MarketBookStream,
+) -> Dict[str, List[PostCloseDecision]]:
+    """Run all configured assets for the same 5-minute round concurrently."""
+
+    assets = tuple(settings.assets)
+    if len(assets) == 1:
+        return {
+            assets[0]: run_round(
+                settings=settings,
+                store=store,
+                public=public,
+                executor=executor,
+                live_gateway=live_gateway,
+                round_start=round_start,
+                asset=assets[0],
+                notifier=notifier,
+                stream_factory=stream_factory,
+            )
+        }
+
+    results: Dict[str, List[PostCloseDecision]] = {}
+    with ThreadPoolExecutor(max_workers=len(assets), thread_name_prefix="aftertake-asset") as pool:
+        futures = {
+            pool.submit(
+                run_round,
+                settings=settings,
+                store=store,
+                public=public,
+                executor=executor,
+                live_gateway=live_gateway,
+                round_start=round_start,
+                asset=asset,
+                notifier=notifier,
+                stream_factory=stream_factory,
+            ): asset
+            for asset in assets
+        }
+        for future in as_completed(futures):
+            asset = futures[future]
+            results[asset] = future.result()
+    return results
+
+
 def _wait_for_next_boundary(
     clock: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep
 ) -> int:
@@ -450,7 +514,7 @@ def _select_next_round_start(
     processed_round_starts: set[int],
     sleep: Callable[[float], None] = time.sleep,
 ) -> int:
-    """Return the next runnable BTC 5m round without skipping active markets.
+    """Return the next runnable 5m round without skipping active markets.
 
     The strategy needs the close-adjacent scene, not the full 5-minute history.
     After a round finishes at close+~1s, the next market is already active but
@@ -560,7 +624,7 @@ def _run_round_loop(
             )
         processed_round_starts.add(start)
         try:
-            run_round(
+            _run_asset_rounds(
                 settings=settings,
                 store=store,
                 public=public,
@@ -630,28 +694,41 @@ def deployment_check(
 
     if not notifier.enabled:
         raise LivePreflightError("deployment requires TG_BOT_TOKEN and TG_CHAT_ID")
-    slug, _, _ = current_btc_5m_slug(int(clock()))
-    market = public.market_by_slug(slug)
-    if not market.condition_id:
-        raise LivePreflightError("Gamma market has no condition ID")
-    _probe_stream(market, stream_factory=stream_factory)
+    slug_markets: Dict[str, GammaMarket] = {}
+    for asset in settings.assets:
+        slug, _, _ = current_crypto_5m_slug(asset, int(clock()))
+        market = public.market_by_slug(slug)
+        if not market.condition_id:
+            raise LivePreflightError("Gamma market has no condition ID for %s" % slug)
+        slug_markets[slug] = market
 
-    metadata: Optional[MarketMetadata] = None
+    first_slug, first_market = next(iter(slug_markets.items()))
+    _probe_stream(first_market, stream_factory=stream_factory)
+
+    metadata_verified = False
     if settings.is_live:
         if gateway is None:
             raise RuntimeError("live deployment check requires a V2 CLOB gateway")
-        metadata = gateway.market_metadata(market.condition_id)
-        _metadata_token_matches(market, metadata, "YES")
-        _metadata_token_matches(market, metadata, "NO")
+        for market in slug_markets.values():
+            metadata = gateway.market_metadata(market.condition_id)
+            _metadata_token_matches(market, metadata, "YES")
+            _metadata_token_matches(market, metadata, "NO")
+            metadata_verified = True
         gateway.preflight(public.geoblock_status(settings.geo_endpoint), _required_cash(settings, metadata))
 
-    notifier.send(format_event("preflight", {"dry_run": settings.dry_run, "qty": settings.qty, "slug": slug}))
+    notifier.send(
+        format_event(
+            "preflight",
+            {"dry_run": settings.dry_run, "qty": settings.qty, "assets": list(settings.assets), "slug": first_slug},
+        )
+    )
     return {
         "mode": "live_deployment_check_passed" if settings.is_live else "dry_run_deployment_check_passed",
-        "slug": slug,
-        "gamma_condition_id": market.condition_id,
+        "assets": list(settings.assets),
+        "slugs": sorted(slug_markets),
+        "gamma_condition_id": first_market.condition_id,
         "websocket_verified": True,
-        "metadata_verified": metadata is not None,
+        "metadata_verified": metadata_verified,
         "telegram_verified": True,
     }
 
@@ -738,7 +815,7 @@ def settle_open_positions(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Aftertake post-close CLOB runner")
-    parser.add_argument("--rounds", type=int, default=1, help="number of fresh BTC 5m rounds")
+    parser.add_argument("--rounds", type=int, default=1, help="number of fresh 5m rounds per configured asset")
     parser.add_argument("--forever", action="store_true", help="run fresh rounds until stopped")
     parser.add_argument("--dry-run", action="store_true", help="force shadow mode regardless of .env")
     parser.add_argument("--status", action="store_true", help="print sanitized runtime status")
@@ -755,6 +832,7 @@ def _status_payload(settings: Settings, store: StateStore) -> Dict[str, Any]:
         "strategy": STRATEGY_VERSION,
         "dry_run": settings.dry_run,
         "qty": settings.qty,
+        "assets": list(settings.assets),
         "live_max_account_risk_fraction": settings.live_max_account_risk_fraction,
         "live_quantity_floor_step": settings.live_quantity_floor_step,
         "dry_run_simulated_balance": settings.dry_run_simulated_balance,
@@ -825,7 +903,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                     raise
                 print(json.dumps(result, indent=2, sort_keys=True))
                 return 0
-            _safe_notify(notifier, settings, store, "boot", {"dry_run": settings.dry_run, "qty": settings.qty})
+            _safe_notify(
+                notifier,
+                settings,
+                store,
+                "boot",
+                {"dry_run": settings.dry_run, "qty": settings.qty, "assets": list(settings.assets)},
+            )
             _run_round_loop(
                 settings=settings,
                 store=store,

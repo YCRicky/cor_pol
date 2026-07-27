@@ -12,8 +12,10 @@ from aftertake.pm_client import (
 from aftertake.post_close import PairedBook, SideBook
 from aftertake.runner import (
     _probe_stream,
+    _run_asset_rounds,
     _run_round_loop,
     _select_next_round_start,
+    current_crypto_5m_slug,
     deployment_check,
     run_round,
     settle_open_positions,
@@ -246,6 +248,41 @@ def test_live_round_blocks_dynamic_quantity_that_the_observed_bid_support_cannot
         store.close()
 
 
+
+def test_crypto_slug_helper_supports_configured_assets():
+    assert current_crypto_5m_slug("BTC", 901) == ("btc-updown-5m-900", 900, 1200)
+    assert current_crypto_5m_slug("ETH", 901) == ("eth-updown-5m-900", 900, 1200)
+    assert current_crypto_5m_slug("XRP", 901) == ("xrp-updown-5m-900", 900, 1200)
+    assert current_crypto_5m_slug("HYPE", 901) == ("hype-updown-5m-900", 900, 1200)
+    assert current_crypto_5m_slug("DOGE", 901) == ("doge-updown-5m-900", 900, 1200)
+    assert current_crypto_5m_slug("SOL", 901) == ("sol-updown-5m-900", 900, 1200)
+
+
+def test_configured_assets_run_for_the_same_round_boundary(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        settings = Settings(
+            dry_run=True,
+            assets=("BTC", "ETH", "XRP", "HYPE", "DOGE", "SOL"),
+            out_dir=tmp_path / "out",
+            state_db=tmp_path / "state.sqlite3",
+        )
+        results = _run_asset_rounds(
+            settings=settings,
+            store=store,
+            public=FakePublic(),
+            executor=OrderExecutor(settings, store),
+            live_gateway=None,
+            round_start=900,
+            notifier=CaptureNotifier(),
+            stream_factory=DeepSupportPairedStream,
+        )
+        assert sorted(results) == ["BTC", "DOGE", "ETH", "HYPE", "SOL", "XRP"]
+        for asset in settings.assets:
+            assert store.market_state(f"{asset.lower()}-updown-5m-900") in {"observing", "open"}
+    finally:
+        store.close()
+
 def test_round_scheduler_joins_active_round_after_previous_close_instead_of_skipping():
     slept = []
     processed = {900}
@@ -385,7 +422,7 @@ def test_service_main_reports_boot_before_any_live_pm_connection(monkeypatch, tm
 
     def assert_boot_then_stop(**_kwargs):
         assert notifier.messages == [
-            "[Aftertake] BOOT\nmode=LIVE qty=5.0000\none-entry-per-market + SQLite recovery + CLOB V2 preflight"
+            "[Aftertake] BOOT\nmode=LIVE qty=5.0000 assets=BTC,ETH,XRP,HYPE,DOGE,SOL\none-entry-per-market + SQLite recovery + CLOB V2 preflight"
         ]
 
     monkeypatch.setattr(runner_module.Settings, "from_env", staticmethod(lambda: settings))

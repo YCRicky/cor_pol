@@ -1,6 +1,6 @@
 # Aftertake
 
-Aftertake is a standalone BTC 5-minute Polymarket CLOB strategy. It does not
+Aftertake is a standalone multi-asset 5-minute Polymarket CLOB strategy. It does not
 use a pre-close price-direction model or any outside price feed.
 
 At the market frontend close, it watches the official public CLOB book for
@@ -80,3 +80,11 @@ without marking the service failed.
 
 See [RUNBOOK.md](docs/RUNBOOK.md), [SAFETY.md](docs/SAFETY.md), and
 [ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+Default market universe:
+
+```text
+AFTERTAKE_ASSETS=BTC,ETH,XRP,HYPE,DOGE,SOL
+```
+
+The runner observes every configured 5-minute asset market for the same round boundary concurrently.

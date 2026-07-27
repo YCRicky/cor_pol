@@ -103,3 +103,22 @@ def test_partial_l2_credentials_are_rejected_in_shadow_mode(monkeypatch):
     monkeypatch.setenv("POLYMARKET_API_KEY", "key-only")
     with pytest.raises(ValueError, match="credentials"):
         Settings.from_env()
+
+
+def test_assets_env_accepts_multi_asset_universe(monkeypatch, tmp_path):
+    monkeypatch.setenv("AFTERTAKE_ASSETS", "btc,eth,xrp,hype,doge,sol")
+    monkeypatch.setenv("AFTERTAKE_OUT_DIR", str(tmp_path / "out"))
+    settings = Settings.from_env()
+    assert settings.assets == ("BTC", "ETH", "XRP", "HYPE", "DOGE", "SOL")
+    assert settings.asset == "BTC"
+
+
+def test_assets_env_rejects_unsupported_assets(monkeypatch, tmp_path):
+    monkeypatch.setenv("AFTERTAKE_ASSETS", "btc,avax")
+    monkeypatch.setenv("AFTERTAKE_OUT_DIR", str(tmp_path / "out"))
+    try:
+        Settings.from_env()
+    except ValueError as exc:
+        assert "unsupported assets" in str(exc)
+    else:
+        raise AssertionError("unsupported assets must be rejected")

@@ -6,7 +6,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 from .resolver import parse_resolve_overrides
 
@@ -18,6 +18,7 @@ DEFAULT_GEO_ENDPOINT = "https://polymarket.com/api/geoblock"
 # emergency guard for RPZ-poisoned environments, configured via
 # AFTERTAKE_RESOLVE_OVERRIDES="host=ip,ip;...".
 DEFAULT_RESOLVE_OVERRIDES = ""
+DEFAULT_ASSETS = ("BTC", "ETH", "XRP", "HYPE", "DOGE", "SOL")
 _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _PRIVATE_KEY_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
 
@@ -82,6 +83,7 @@ class Settings:
     # Aftertake strategy controls.
     dry_run: bool = True
     asset: str = "BTC"
+    assets: Tuple[str, ...] = DEFAULT_ASSETS
     qty: float = 5.0
     out_dir: Path = Path("out")
     max_daily_loss: float = 25.0
@@ -128,8 +130,15 @@ class Settings:
         return bool(self.clob_api_key and self.clob_api_secret and self.clob_api_passphrase)
 
     def validate(self) -> None:
-        if self.asset.upper() != "BTC":
-            raise ValueError("AFTERTAKE_ASSET currently supports BTC only")
+        allowed_assets = {"BTC", "ETH", "XRP", "HYPE", "DOGE", "SOL"}
+        assets = tuple(str(asset).upper().strip() for asset in (self.assets or (self.asset,)) if str(asset).strip())
+        if not assets:
+            raise ValueError("AFTERTAKE_ASSETS must contain at least one asset")
+        invalid_assets = sorted(set(assets) - allowed_assets)
+        if invalid_assets:
+            raise ValueError("AFTERTAKE_ASSETS contains unsupported assets: %s" % ",".join(invalid_assets))
+        object.__setattr__(self, "assets", assets)
+        object.__setattr__(self, "asset", assets[0])
         if self.qty <= 0:
             raise ValueError("AFTERTAKE_QTY must be > 0")
         if self.max_daily_loss <= 0:
@@ -182,9 +191,18 @@ class Settings:
     def from_env(cls) -> Settings:
         load_dotenv()
         out_dir = Path(os.getenv("AFTERTAKE_OUT_DIR", "out"))
+        raw_assets = os.getenv("AFTERTAKE_ASSETS", "").strip()
+        legacy_asset = os.getenv("AFTERTAKE_ASSET", "").strip()
+        if raw_assets:
+            assets = tuple(part.strip().upper() for part in raw_assets.replace(";", ",").split(",") if part.strip())
+        elif legacy_asset and legacy_asset.upper() != "BTC":
+            assets = (legacy_asset.upper(),)
+        else:
+            assets = DEFAULT_ASSETS
         settings = cls(
             dry_run=_bool("AFTERTAKE_DRY_RUN", True),
-            asset=os.getenv("AFTERTAKE_ASSET", "BTC").strip().upper(),
+            asset=assets[0] if assets else "BTC",
+            assets=assets,
             qty=_float("AFTERTAKE_QTY", 5.0),
             out_dir=out_dir,
             state_db=out_dir / "aftertake.sqlite3",
