@@ -83,6 +83,18 @@ class FastGateway(ConfirmingGateway):
 
 
 
+
+
+class FakNoMatchError(Exception):
+    status_code = 400
+    error_msg = {"error": "no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found."}
+
+
+class FakNoMatchGateway(ConfirmingGateway):
+    def submit_limit_buy_fast(self, token_id, price, qty, metadata, order_type="FAK"):
+        raise FakNoMatchError("request error")
+
+
 class PolyStyleError(Exception):
     status_code = 400
     error_msg = {"error": "invalid order type FAK for this request"}
@@ -584,5 +596,27 @@ def test_submit_exception_persists_sanitized_diagnostics(tmp_path):
         assert result.raw["error_hint"] == "order_type_compatibility"
         assert "invalid order type FAK" in result.raw["error_message"]
         assert store.has_execution_unknown() is True
+    finally:
+        store.close()
+
+
+def test_fak_no_match_error_is_terminal_no_fill_not_execution_unknown(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        record = _reserve(store)
+        result = OrderExecutor(
+            Settings(dry_run=False, order_type="FAK", reconcile_timeout_s=2),
+            store,
+            gateway=FakNoMatchGateway(),
+            heartbeat_factory=NoopHeartbeat,
+        ).execute_reserved(record, _metadata(), fast=True)
+
+        assert result.terminal is True
+        assert result.status == "no_fill"
+        assert result.filled_qty == 0
+        assert result.error == "fak_no_matching_resting_order"
+        assert result.raw["terminal_no_fill"] is True
+        assert store.has_execution_unknown() is False
+        assert _reserve(store) is None
     finally:
         store.close()

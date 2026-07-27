@@ -136,6 +136,21 @@ def _safe_error_message(value: Any) -> str:
     return _truncate(value, 500)
 
 
+def _is_fak_no_match_exception(exc: BaseException, order_type: str) -> bool:
+    if str(order_type or "").upper().strip() != "FAK":
+        return False
+    status_code = getattr(exc, "status_code", None)
+    if status_code not in {400, 422}:
+        return False
+    error_msg = getattr(exc, "error_msg", None)
+    message = _safe_error_message(error_msg if error_msg is not None else str(exc)).lower()
+    return (
+        "no orders found" in message
+        and "match" in message
+        and "fak" in message
+    )
+
+
 def _sanitize_exception(exc: BaseException, *, phase: str, order_type: str) -> Dict[str, Any]:
     status_code = getattr(exc, "status_code", None)
     error_msg = getattr(exc, "error_msg", None)
@@ -285,15 +300,29 @@ class OrderExecutor:
                         self.settings.order_type,
                     )
             except Exception as exc:
-                # Once the gateway call starts, even a local-looking exception
-                # may have occurred while parsing a successful HTTP response.
-                # Never classify it as definitely-not-submitted or retry it.
-                reason = "matching_engine_restart" if is_matching_engine_restart_error(exc) else "submit_exception"
                 raw = {
-                    "classification": reason,
                     "submit_error": _safe_error_message(str(exc)),
                     **_sanitize_exception(exc, phase="post_order", order_type=self.settings.order_type),
                 }
+                if _is_fak_no_match_exception(exc, self.settings.order_type):
+                    # Polymarket CLOB returns an explicit 400/422 no-match for
+                    # zero-fill FAK attempts.  No order id is expected because
+                    # no resting order matched; treat it as a terminal miss, not
+                    # an ambiguous submission that freezes future unrelated risk.
+                    reason = "fak_no_matching_resting_order"
+                    raw["classification"] = reason
+                    raw["terminal_no_fill"] = True
+                    self.store.mark_terminal_execution(record.intent_id, 0.0, 0.0, raw, "no_fill")
+                    return self._result_from_record(
+                        record, "no_fill", 0.0, 0.0, True, "acknowledged", reason, raw
+                    )
+
+                # Once the gateway call starts, even a local-looking exception
+                # may have occurred while parsing a successful HTTP response.
+                # Never classify unknown submit failures as definitely-not-submitted
+                # or retry them.
+                reason = "matching_engine_restart" if is_matching_engine_restart_error(exc) else "submit_exception"
+                raw["classification"] = reason
                 self.store.mark_execution_unknown(record.intent_id, reason, raw)
                 return self._result_from_record(
                     record, "execution_unknown", 0.0, 0.0, False, "unknown", reason, raw
