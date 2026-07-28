@@ -1,4 +1,5 @@
 import json
+import threading
 
 import pytest
 
@@ -343,6 +344,66 @@ def test_fast_post_close_submission_does_not_retry_a_matching_engine_restart():
         gateway.submit_limit_buy_fast("token", 0.5, 5, metadata)
 
     assert len(client.posted) == 1
+
+
+def test_fast_submit_is_not_delayed_by_held_market_metadata_lock():
+    metadata_started = threading.Event()
+    release_metadata = threading.Event()
+    fast_submit_completed = threading.Event()
+
+    class Args:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class Options:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class Client:
+        def get_clob_market_info(self, condition_id):
+            metadata_started.set()
+            assert release_metadata.wait(timeout=1)
+            return {
+                "mts": "0.01",
+                "mos": 1,
+                "ao": True,
+                "t": [{"t": "token", "o": "Up"}],
+            }
+
+        def create_order(self, args, options=None):
+            return {"signed": True}
+
+        def post_order(self, order, order_type):
+            fast_submit_completed.set()
+            return {"orderID": "order-1"}
+
+    gateway = V2ClobGateway(
+        Client(),
+        {
+            "OrderArgs": Args,
+            "PartialCreateOrderOptions": Options,
+            "BUY": "BUY",
+            "OrderType": type("OrderType", (), {"FAK": "FAK"}),
+        },
+    )
+    metadata_thread = threading.Thread(target=gateway.market_metadata, args=("condition",))
+    submit_thread = threading.Thread(
+        target=gateway.submit_limit_buy_fast,
+        args=("token", 0.5, 1, MarketMetadata("condition", "0.01", 1, False, 0.07, {}, {})),
+    )
+
+    try:
+        metadata_thread.start()
+        assert metadata_started.wait(timeout=1)
+        submit_thread.start()
+        assert fast_submit_completed.wait(timeout=1)
+    finally:
+        release_metadata.set()
+        metadata_thread.join(timeout=1)
+        submit_thread.join(timeout=1)
+
+    assert not metadata_thread.is_alive()
+    assert not submit_thread.is_alive()
 
 
 def test_fast_post_close_submission_uses_fak_order_type():

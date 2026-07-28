@@ -9,6 +9,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import ssl
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -277,6 +278,11 @@ class V2ClobGateway:
         self._signature_type = signature_type
         self._builder_code = builder_code
         self._sleep = sleep
+        # `get_clob_market_info()` updates the V2 SDK's market/token/fee caches.
+        # Asset rounds call that method concurrently before close, so only the
+        # metadata/preflight path is serialized. Fast post-close order submits
+        # intentionally remain outside this lock.
+        self._client_lock = threading.RLock()
 
     @classmethod
     def from_settings(cls, settings: Settings) -> V2ClobGateway:
@@ -340,110 +346,114 @@ class V2ClobGateway:
         return cls(client, sdk, settings.polymarket_signature_type, settings.builder_code)
 
     def preflight(self, geo: GeoStatus, required_notional: float) -> LivePreflight:
-        if geo.blocked:
-            raise LivePreflightError(
-                "Polymarket geoblock prohibits new orders from %s %s" % (geo.country, geo.region)
+        with self._client_lock:
+            if geo.blocked:
+                raise LivePreflightError(
+                    "Polymarket geoblock prohibits new orders from %s %s" % (geo.country, geo.region)
+                )
+            closed_only = self._client.get_closed_only_mode()
+            is_closed_only = (
+                bool(closed_only)
+                if isinstance(closed_only, bool)
+                else bool(
+                    closed_only.get("closed_only") or closed_only.get("closedOnly")
+                )
+                if isinstance(closed_only, dict)
+                else bool(getattr(closed_only, "closed_only", False))
             )
-        closed_only = self._client.get_closed_only_mode()
-        is_closed_only = (
-            bool(closed_only)
-            if isinstance(closed_only, bool)
-            else bool(
-                closed_only.get("closed_only") or closed_only.get("closedOnly")
-            )
-            if isinstance(closed_only, dict)
-            else bool(getattr(closed_only, "closed_only", False))
-        )
-        if is_closed_only:
-            raise LivePreflightError("CLOB account is in close-only mode")
-        collateral = self.collateral_balance_allowance()
-        if collateral.balance < required_notional:
-            raise LivePreflightError("deposit wallet pUSD balance is below the final order requirement")
-        if collateral.allowance < required_notional:
-            raise LivePreflightError("deposit wallet pUSD allowance is below the final order requirement")
-        return LivePreflight(geo=geo, collateral=collateral, closed_only=False)
+            if is_closed_only:
+                raise LivePreflightError("CLOB account is in close-only mode")
+            collateral = self.collateral_balance_allowance()
+            if collateral.balance < required_notional:
+                raise LivePreflightError("deposit wallet pUSD balance is below the final order requirement")
+            if collateral.allowance < required_notional:
+                raise LivePreflightError("deposit wallet pUSD allowance is below the final order requirement")
+            return LivePreflight(geo=geo, collateral=collateral, closed_only=False)
 
     def collateral_balance_allowance(self) -> BalanceAllowance:
-        params = self._sdk["BalanceAllowanceParams"](
-            asset_type=self._sdk["AssetType"].COLLATERAL,
-            signature_type=self._signature_type,
-        )
-        raw = self._client.get_balance_allowance(params)
-        if not isinstance(raw, dict):
-            raise LivePreflightError("invalid CLOB collateral balance response")
-        balance = _as_pusd(raw.get("balance"), "collateral balance")
-        # CLOB V2 returns ``allowances`` (plural): a pUSD base-unit allowance
-        # for each exchange spender. Before the exact market exchange is
-        # selected, the minimum is the only safe generic buying-power limit.
-        allowances = raw.get("allowances")
-        if allowances is not None:
-            allowance = _minimum_pusd_allowance(allowances, "collateral allowances")
-        else:
-            # Preserve support for a legacy scalar response while still
-            # treating it as six-decimal pUSD base units.
-            allowance_value = raw.get("allowance")
-            allowance = (
-                _minimum_pusd_allowance(allowance_value, "collateral allowance")
-                if isinstance(allowance_value, dict)
-                else _as_pusd(allowance_value, "collateral allowance")
+        with self._client_lock:
+            params = self._sdk["BalanceAllowanceParams"](
+                asset_type=self._sdk["AssetType"].COLLATERAL,
+                signature_type=self._signature_type,
             )
-        return BalanceAllowance(balance=balance, allowance=allowance, raw=raw)
+            raw = self._client.get_balance_allowance(params)
+            if not isinstance(raw, dict):
+                raise LivePreflightError("invalid CLOB collateral balance response")
+            balance = _as_pusd(raw.get("balance"), "collateral balance")
+            # CLOB V2 returns ``allowances`` (plural): a pUSD base-unit allowance
+            # for each exchange spender. Before the exact market exchange is
+            # selected, the minimum is the only safe generic buying-power limit.
+            allowances = raw.get("allowances")
+            if allowances is not None:
+                allowance = _minimum_pusd_allowance(allowances, "collateral allowances")
+            else:
+                # Preserve support for a legacy scalar response while still
+                # treating it as six-decimal pUSD base units.
+                allowance_value = raw.get("allowance")
+                allowance = (
+                    _minimum_pusd_allowance(allowance_value, "collateral allowance")
+                    if isinstance(allowance_value, dict)
+                    else _as_pusd(allowance_value, "collateral allowance")
+                )
+            return BalanceAllowance(balance=balance, allowance=allowance, raw=raw)
 
     def sync_collateral_allowance(self) -> Dict[str, Any]:
         """Refresh the CLOB cache after the operator confirms wallet approval."""
 
-        params = self._sdk["BalanceAllowanceParams"](
-            asset_type=self._sdk["AssetType"].COLLATERAL,
-            signature_type=self._signature_type,
-        )
-        raw = self._client.update_balance_allowance(params)
-        return raw if isinstance(raw, dict) else {"raw": raw}
+        with self._client_lock:
+            params = self._sdk["BalanceAllowanceParams"](
+                asset_type=self._sdk["AssetType"].COLLATERAL,
+                signature_type=self._signature_type,
+            )
+            raw = self._client.update_balance_allowance(params)
+            return raw if isinstance(raw, dict) else {"raw": raw}
 
     def market_metadata(self, condition_id: str) -> MarketMetadata:
-        raw = self._client.get_clob_market_info(condition_id)
-        if not isinstance(raw, dict):
-            raise LivePreflightError("invalid CLOB market metadata")
-        accepting_orders = raw.get("ao", raw.get("accepting_orders"))
-        if accepting_orders is not True:
-            raise LivePreflightError("CLOB market is not accepting orders")
-        tick_size = str(raw.get("mts") or "")
-        min_order_size = _as_float(raw.get("mos"), "minimum order size")
-        if not tick_size or min_order_size <= 0:
-            raise LivePreflightError("CLOB market metadata is incomplete")
-        tokens: Dict[str, str] = {}
-        for token in raw.get("t") or []:
-            if not isinstance(token, dict):
-                continue
-            token_id = str(token.get("t") or "")
-            outcome = str(token.get("o") or "").strip().lower()
-            if token_id and outcome:
-                tokens[outcome] = token_id
-        if not tokens:
-            raise LivePreflightError("CLOB market metadata has no outcome/token mapping")
-        fee_details = raw.get("fd") or {}
-        fee_rate = _as_float(fee_details.get("r", 0.0), "market fee rate")
-        fee_exponent = _as_float(fee_details.get("e", 1.0), "market fee exponent")
-        builder_taker_fee_bps = 0.0
-        if self._builder_code:
-            # The pinned V2 client resolves the fee configured for this exact
-            # builder code. Market `tbf` is not the builder-program fee.
-            builder_rate = self._client._get_builder_taker_fee_rate(self._builder_code)
-            builder_taker_fee_bps = _as_float(builder_rate, "builder taker fee") * 10_000.0
-        itode = bool(raw.get("itode", raw.get("immediate_taker_order_delay_enabled", False)))
-        return MarketMetadata(
-            condition_id=condition_id,
-            tick_size=tick_size,
-            min_order_size=min_order_size,
-            neg_risk=bool(raw.get("nr", False)),
-            fee_rate=fee_rate,
-            tokens=tokens,
-            raw=raw,
-            fee_exponent=fee_exponent,
-            builder_taker_fee_bps=builder_taker_fee_bps,
-            accepting_orders=True,
-            immediate_taker_order_delay_enabled=itode,
-            expected_taker_delay_ms=250.0 if itode else 0.0,
-        )
+        with self._client_lock:
+            raw = self._client.get_clob_market_info(condition_id)
+            if not isinstance(raw, dict):
+                raise LivePreflightError("invalid CLOB market metadata")
+            accepting_orders = raw.get("ao", raw.get("accepting_orders"))
+            if accepting_orders is not True:
+                raise LivePreflightError("CLOB market is not accepting orders")
+            tick_size = str(raw.get("mts") or "")
+            min_order_size = _as_float(raw.get("mos"), "minimum order size")
+            if not tick_size or min_order_size <= 0:
+                raise LivePreflightError("CLOB market metadata is incomplete")
+            tokens: Dict[str, str] = {}
+            for token in raw.get("t") or []:
+                if not isinstance(token, dict):
+                    continue
+                token_id = str(token.get("t") or "")
+                outcome = str(token.get("o") or "").strip().lower()
+                if token_id and outcome:
+                    tokens[outcome] = token_id
+            if not tokens:
+                raise LivePreflightError("CLOB market metadata has no outcome/token mapping")
+            fee_details = raw.get("fd") or {}
+            fee_rate = _as_float(fee_details.get("r", 0.0), "market fee rate")
+            fee_exponent = _as_float(fee_details.get("e", 1.0), "market fee exponent")
+            builder_taker_fee_bps = 0.0
+            if self._builder_code:
+                # The pinned V2 client resolves the fee configured for this exact
+                # builder code. Market `tbf` is not the builder-program fee.
+                builder_rate = self._client._get_builder_taker_fee_rate(self._builder_code)
+                builder_taker_fee_bps = _as_float(builder_rate, "builder taker fee") * 10_000.0
+            itode = bool(raw.get("itode", raw.get("immediate_taker_order_delay_enabled", False)))
+            return MarketMetadata(
+                condition_id=condition_id,
+                tick_size=tick_size,
+                min_order_size=min_order_size,
+                neg_risk=bool(raw.get("nr", False)),
+                fee_rate=fee_rate,
+                tokens=tokens,
+                raw=raw,
+                fee_exponent=fee_exponent,
+                builder_taker_fee_bps=builder_taker_fee_bps,
+                accepting_orders=True,
+                immediate_taker_order_delay_enabled=itode,
+                expected_taker_delay_ms=250.0 if itode else 0.0,
+            )
 
     def submit_limit_buy(
         self, token_id: str, price: float, qty: float, metadata: MarketMetadata, order_type: str = "GTC"

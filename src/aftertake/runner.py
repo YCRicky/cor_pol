@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, replace
@@ -261,6 +263,102 @@ def _required_cash(settings: Settings, metadata: MarketMetadata) -> float:
     )
 
 
+class _RoundAccountPreflight:
+    """Share one live account snapshot across the configured assets in a round."""
+
+    def __init__(self, settings: Settings, public: PolymarketPublicClient, gateway: V2ClobGateway):
+        self._settings = settings
+        self._public = public
+        self._gateway = gateway
+        self._lock = threading.Lock()
+        self._snapshot: Optional[LivePreflight] = None
+        self._error: Optional[BaseException] = None
+
+    def snapshot(self) -> LivePreflight:
+        with self._lock:
+            if self._error is not None:
+                raise self._error
+            if self._snapshot is None:
+                try:
+                    geo = self._public.geoblock_status(self._settings.geo_endpoint)
+                    # Per-market metadata determines the minimum order requirement.
+                    # It is checked against this one fresh account snapshot below.
+                    self._snapshot = self._gateway.preflight(geo, 0.0)
+                except Exception as exc:
+                    self._error = exc
+                    raise
+            return self._snapshot
+
+
+def _check_preflight_collateral(preflight: LivePreflight, required_cash: float) -> None:
+    if preflight.collateral.balance < required_cash:
+        raise LivePreflightError("deposit wallet pUSD balance is below the final order requirement")
+    if preflight.collateral.allowance < required_cash:
+        raise LivePreflightError("deposit wallet pUSD allowance is below the final order requirement")
+
+
+_SENSITIVE_ERROR_VALUE = re.compile(
+    r"(?i)\b(api[_-]?(?:key|secret)|passphrase|private[_-]?key|authorization|bearer|token)\b"
+    r"\s*(?:([=:])\s*|(\s+))(?:bearer\s+)?[^\s,;]+"
+)
+
+
+def _safe_transport_message(exc: BaseException) -> str:
+    value = getattr(exc, "error_message", None)
+    if value is None:
+        value = getattr(exc, "error_msg", None)
+    if value is None:
+        value = str(exc)
+    if isinstance(value, dict):
+        value = {key: value.get(key) for key in ("error", "message", "detail", "code") if key in value}
+    text = " ".join(str(value or "").split())
+    text = _SENSITIVE_ERROR_VALUE.sub(
+        lambda match: "%s%s[redacted]" % (match.group(1), match.group(2) or match.group(3)), text
+    )
+    return text[:500] + "..." if len(text) > 500 else text
+
+
+def _is_transient_transport_error(exc: BaseException) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    message = _safe_transport_message(exc).lower()
+    if status_code in {408, 429, 500, 502, 503, 504}:
+        return True
+    if isinstance(exc, (ConnectionError, OSError, TimeoutError)):
+        return True
+    return status_code is None and any(
+        phrase in message
+        for phrase in ("request exception", "connection", "timeout", "temporarily unavailable")
+    )
+
+
+def _audit_asset_transport_error(
+    settings: Settings,
+    store: StateStore,
+    *,
+    asset: str,
+    slug: str,
+    phase: str,
+    exc: BaseException,
+) -> None:
+    status_code = getattr(exc, "status_code", None)
+    if status_code is not None and not isinstance(status_code, (bool, float, int, str)):
+        status_code = str(status_code)
+    _audit(
+        settings,
+        store,
+        "asset_transport_error",
+        {
+            "asset": asset,
+            "slug": slug,
+            "phase": phase,
+            "error_type": type(exc).__name__,
+            "status_code": status_code,
+            "error_message": _safe_transport_message(exc),
+        },
+        slug,
+    )
+
+
 def _entry_qty_for_decision(
     *,
     settings: Settings,
@@ -311,6 +409,7 @@ def run_round(
     live_gateway: Optional[V2ClobGateway],
     round_start: int,
     asset: Optional[str] = None,
+    round_preflight: Optional[_RoundAccountPreflight] = None,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
     notifier: Optional[Notifier] = None,
@@ -373,11 +472,38 @@ def run_round(
                     break
                 if live_gateway is None:
                     raise RuntimeError("live Aftertake requires a CLOB V2 gateway")
-                geo = public.geoblock_status(settings.geo_endpoint)
-                metadata = live_gateway.market_metadata(market.condition_id)
-                _metadata_token_matches(market, metadata, "YES")
-                _metadata_token_matches(market, metadata, "NO")
-                live_preflight = live_gateway.preflight(geo, _required_cash(settings, metadata))
+                if round_preflight is not None:
+                    # A shared account snapshot failure applies to every asset,
+                    # so it must remain a daemon-visible runtime failure.
+                    live_preflight = round_preflight.snapshot()
+                phase = "market_metadata"
+                try:
+                    metadata = live_gateway.market_metadata(market.condition_id)
+                    _metadata_token_matches(market, metadata, "YES")
+                    _metadata_token_matches(market, metadata, "NO")
+                    required_cash = _required_cash(settings, metadata)
+                    if round_preflight is not None:
+                        _check_preflight_collateral(live_preflight, required_cash)
+                    else:
+                        phase = "account_preflight"
+                        geo = public.geoblock_status(settings.geo_endpoint)
+                        live_preflight = live_gateway.preflight(geo, required_cash)
+                except Exception as exc:
+                    if not _is_transient_transport_error(exc):
+                        raise
+                    # This is intentionally audit-only: a single CLOB request
+                    # failure has a concrete asset/slug and must not be promoted
+                    # to the daemon-wide slug=runtime alert or rebuild its gateway.
+                    _audit_asset_transport_error(
+                        settings,
+                        store,
+                        asset=active_asset,
+                        slug=slug,
+                        phase=phase,
+                        exc=exc,
+                    )
+                    decisions.append(PostCloseDecision("hold", "%s_transport_error" % phase))
+                    break
                 if float(clock()) >= round_end:
                     decisions.append(PostCloseDecision("hold", "post_close_preflight_missed"))
                     _audit(
@@ -547,10 +673,17 @@ def _run_asset_rounds(
     round_start: int,
     notifier: Optional[Notifier] = None,
     stream_factory: Callable[..., MarketBookStream] = MarketBookStream,
+    clock: Callable[[], float] = time.time,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> Dict[str, List[PostCloseDecision]]:
     """Run all configured assets for the same 5-minute round concurrently."""
 
     assets = tuple(settings.assets)
+    round_preflight = (
+        _RoundAccountPreflight(settings, public, live_gateway)
+        if settings.is_live and live_gateway is not None
+        else None
+    )
     if len(assets) == 1:
         return {
             assets[0]: run_round(
@@ -561,8 +694,11 @@ def _run_asset_rounds(
                 live_gateway=live_gateway,
                 round_start=round_start,
                 asset=assets[0],
+                round_preflight=round_preflight,
                 notifier=notifier,
                 stream_factory=stream_factory,
+                clock=clock,
+                sleep=sleep,
             )
         }
 
@@ -578,8 +714,11 @@ def _run_asset_rounds(
                 live_gateway=live_gateway,
                 round_start=round_start,
                 asset=asset,
+                round_preflight=round_preflight,
                 notifier=notifier,
                 stream_factory=stream_factory,
+                clock=clock,
+                sleep=sleep,
             ): asset
             for asset in assets
         }

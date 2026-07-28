@@ -1,3 +1,6 @@
+import json
+import threading
+
 import aftertake.runner as runner_module
 from aftertake.config import Settings
 from aftertake.execution import OrderExecutor
@@ -416,6 +419,158 @@ def test_configured_assets_run_for_the_same_round_boundary(tmp_path):
         assert sorted(results) == ["BTC", "DOGE", "ETH", "HYPE", "SOL", "XRP"]
         for asset in settings.assets:
             assert store.market_state(f"{asset.lower()}-updown-5m-900") in {"observing", "open"}
+    finally:
+        store.close()
+
+
+def test_live_round_account_preflight_is_shared_once_across_assets(tmp_path):
+    class AssetPublic(LivePublic):
+        def __init__(self):
+            self.geo_calls = 0
+
+        def geoblock_status(self, endpoint):
+            self.geo_calls += 1
+            return super().geoblock_status(endpoint)
+
+    class CountingGateway(InstantGateway):
+        def __init__(self):
+            self.preflight_calls = 0
+
+        def preflight(self, geo, required_cash):
+            self.preflight_calls += 1
+            assert required_cash == 0.0
+            return super().preflight(geo, required_cash)
+
+    class PreflightThenExpiredClock:
+        def __init__(self):
+            self._local = threading.local()
+
+        def __call__(self):
+            calls = getattr(self._local, "calls", 0) + 1
+            self._local.calls = calls
+            return 1190.0 if calls <= 2 else 1201.1
+
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        settings = Settings(
+            dry_run=False,
+            assets=("BTC", "ETH", "XRP"),
+            out_dir=tmp_path / "out",
+            state_db=tmp_path / "state.sqlite3",
+        )
+        public = AssetPublic()
+        gateway = CountingGateway()
+        results = _run_asset_rounds(
+            settings=settings,
+            store=store,
+            public=public,
+            executor=OrderExecutor(settings, store, gateway=gateway),
+            live_gateway=gateway,
+            round_start=900,
+            notifier=CaptureNotifier(),
+            stream_factory=DeepSupportPairedStream,
+            clock=PreflightThenExpiredClock(),
+            sleep=lambda _seconds: None,
+        )
+
+        assert sorted(results) == ["BTC", "ETH", "XRP"]
+        assert public.geo_calls == 1
+        assert gateway.preflight_calls == 1
+    finally:
+        store.close()
+
+
+def test_live_asset_transport_failure_isolated_without_rebuilding_runtime(tmp_path, monkeypatch):
+    class PolyApiExceptionLike(Exception):
+        status_code = None
+        error_message = "Request exception!"
+
+    class AssetPublic(LivePublic):
+        def market_by_slug(self, slug, allow_closed=False):
+            market = super().market_by_slug(slug, allow_closed=allow_closed)
+            return GammaMarket(
+                slug=market.slug,
+                condition_id="condition-" + slug.split("-", 1)[0],
+                outcomes=market.outcomes,
+                clob_token_ids=market.clob_token_ids,
+                active=market.active,
+            )
+
+    class FlakyGateway(InstantGateway):
+        def market_metadata(self, condition_id):
+            if condition_id == "condition-eth":
+                raise PolyApiExceptionLike()
+            return super().market_metadata(condition_id)
+
+    class PreflightThenExpiredClock:
+        def __init__(self):
+            self._local = threading.local()
+
+        def __call__(self):
+            calls = getattr(self._local, "calls", 0) + 1
+            self._local.calls = calls
+            return 1190.0 if calls <= 2 else 1201.1
+
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        settings = Settings(
+            dry_run=False,
+            assets=("BTC", "ETH", "XRP"),
+            out_dir=tmp_path / "out",
+            state_db=tmp_path / "state.sqlite3",
+        )
+        notifier = CaptureNotifier()
+        gateway = FlakyGateway()
+        runtime_calls = []
+        asset_results = {}
+
+        def live_runtime(*_args):
+            runtime_calls.append("runtime")
+            return gateway, OrderExecutor(settings, store, gateway=gateway)
+
+        def run_with_test_clock(**kwargs):
+            asset_results.update(
+                _run_asset_rounds(
+                    **kwargs,
+                    stream_factory=DeepSupportPairedStream,
+                    clock=PreflightThenExpiredClock(),
+                    sleep=lambda _seconds: None,
+                )
+            )
+            return asset_results
+
+        monkeypatch.setattr(runner_module, "_run_asset_rounds", run_with_test_clock)
+        _run_round_loop(
+            settings=settings,
+            store=store,
+            public=AssetPublic(),
+            notifier=notifier,
+            forever=False,
+            rounds=1,
+            live_runtime_factory=live_runtime,
+            wait_for_next_boundary=lambda: 900,
+            sleep=lambda _seconds: None,
+        )
+
+        assert runtime_calls == ["runtime"]
+        assert sorted(asset_results) == ["BTC", "ETH", "XRP"]
+        assert asset_results["ETH"][-1].reason == "market_metadata_transport_error"
+        assert all(asset_results[asset] for asset in ("BTC", "XRP"))
+        assert notifier.messages == []
+        audit = store._conn.execute(
+            """SELECT slug, payload_json FROM audit_events
+               WHERE kind = 'asset_transport_error' ORDER BY id DESC LIMIT 1"""
+        ).fetchone()
+        assert audit["slug"] == "eth-updown-5m-900"
+        payload = json.loads(audit["payload_json"])
+        assert payload == {
+            "asset": "ETH",
+            "error_message": "Request exception!",
+            "error_type": "PolyApiExceptionLike",
+            "phase": "market_metadata",
+            "slug": "eth-updown-5m-900",
+            "status_code": None,
+        }
     finally:
         store.close()
 
