@@ -1,5 +1,7 @@
 import threading
 
+import pytest
+
 from aftertake.config import Settings
 from aftertake.execution import OrderExecutor
 from aftertake.pm_client import MarketMetadata
@@ -599,18 +601,17 @@ def test_acknowledged_gtc_order_emits_submitted_event_and_stays_pending(tmp_path
         assert result.status == "submitted_pending"
         assert result.submission_state == "awaiting_settlement"
         assert emitted.wait(1)
-        assert events == [
-            (
-                "submitted",
-                {
-                    "slug": record.slug,
-                    "side": "YES",
-                    "order_id": "order-1",
-                    "requested_qty": 5.0,
-                    "requested_price": 0.51,
-                },
-            )
-        ]
+        assert len(events) == 1
+        kind, payload = events[0]
+        assert kind == "submitted"
+        assert payload["slug"] == record.slug
+        assert payload["side"] == "YES"
+        assert payload["order_id"] == "order-1"
+        assert payload["requested_qty"] == 5.0
+        assert payload["requested_price"] == 0.51
+        assert payload["submit_roundtrip_ms"] >= 0
+        assert "decision_to_submit_ms" in payload
+        assert "observed_book_age_ms" in payload
     finally:
         store.close()
 
@@ -683,6 +684,78 @@ def test_submit_exception_persists_sanitized_diagnostics(tmp_path):
         assert "invalid order type FAK" in result.raw["error_message"]
         assert store.has_execution_unknown() is False
         assert store.reserve_entry("eth-updown-5m-300", "condition", 300, "token", "YES", 5, 0.51) is not None
+    finally:
+        store.close()
+
+
+def test_execution_result_persists_decision_submit_timing_context(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        record = _reserve(store)
+        clock = FakeClock()
+        wall = FakeClock()
+        wall.now = 1000.0
+        gateway = FastGateway()
+        result = OrderExecutor(
+            Settings(dry_run=False, order_type="GTC", order_ttl_s=1, reconcile_timeout_s=1),
+            store,
+            gateway=gateway,
+            sleep=clock.sleep,
+            monotonic=clock,
+            wall_clock=wall,
+            heartbeat_factory=NoopHeartbeat,
+        ).execute_reserved(
+            record,
+            _metadata(),
+            fast=True,
+            timing_context={
+                "decision_ts": 999.9,
+                "book_observed_ts": 999.8,
+                "round_end_ts": 999.7,
+                "seconds_after_close_at_decision": 0.2,
+            },
+        )
+
+        assert result.terminal is True
+        assert result.decision_to_submit_ms == pytest.approx(100.0)
+        assert result.observed_book_age_ms == pytest.approx(200.0)
+        assert result.submit_roundtrip_ms >= 0.0
+        assert result.reconcile_duration_ms >= 0.0
+        assert result.raw["timing"]["decision_ts"] == 999.9
+        assert result.raw["timing"]["book_observed_ts"] == 999.8
+    finally:
+        store.close()
+
+
+def test_live_execution_result_preserves_official_itode_delay_metadata(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        record = _reserve(store)
+        metadata = MarketMetadata(
+            condition_id="condition",
+            tick_size="0.01",
+            min_order_size=1.0,
+            neg_risk=False,
+            fee_rate=0.0,
+            tokens={"up": "token"},
+            raw={"itode": True},
+            immediate_taker_order_delay_enabled=True,
+            expected_taker_delay_ms=250.0,
+        )
+        result = OrderExecutor(
+            Settings(dry_run=False),
+            store,
+            gateway=FastGateway(),
+            heartbeat_factory=NoopHeartbeat,
+            sleep=lambda _: None,
+        ).execute_reserved(record, metadata, fast=True)
+
+        assert result.immediate_taker_order_delay_enabled is True
+        assert result.expected_taker_delay_ms == 250.0
+        assert result.raw["submit"]["_market_delay"] == {
+            "immediate_taker_order_delay_enabled": True,
+            "expected_taker_delay_ms": 250.0,
+        }
     finally:
         store.close()
 

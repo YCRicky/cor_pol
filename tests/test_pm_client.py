@@ -218,6 +218,43 @@ def test_market_metadata_keeps_fee_exponent_and_builder_specific_rate():
     assert metadata.accepting_orders is True
 
 
+def test_market_metadata_parses_official_itode_taker_delay_flag():
+    class Client:
+        def get_clob_market_info(self, condition_id):
+            return {
+                "mts": "0.01",
+                "mos": 5,
+                "ao": True,
+                "nr": False,
+                "itode": True,
+                "fd": {"r": 0.07, "e": 1},
+                "t": [{"t": "up-token", "o": "Up"}, {"t": "down-token", "o": "Down"}],
+            }
+
+    metadata = V2ClobGateway(Client(), {}).market_metadata("condition")
+
+    assert metadata.immediate_taker_order_delay_enabled is True
+    assert metadata.expected_taker_delay_ms == 250.0
+
+
+def test_market_metadata_defaults_itode_delay_off_when_absent():
+    class Client:
+        def get_clob_market_info(self, condition_id):
+            return {
+                "mts": "0.01",
+                "mos": 5,
+                "ao": True,
+                "nr": False,
+                "fd": {"r": 0.07, "e": 1},
+                "t": [{"t": "up-token", "o": "Up"}],
+            }
+
+    metadata = V2ClobGateway(Client(), {}).market_metadata("condition")
+
+    assert metadata.immediate_taker_order_delay_enabled is False
+    assert metadata.expected_taker_delay_ms == 0.0
+
+
 def test_market_metadata_refuses_market_not_accepting_orders():
     class Client:
         def get_clob_market_info(self, condition_id):

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import ssl
+import time
 import urllib.parse
 import urllib.request
-from typing import Any, Dict
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 
 
 def _number(value: Any, digits: int = 4) -> str:
@@ -14,8 +16,125 @@ def _number(value: Any, digits: int = 4) -> str:
         return "n/a"
 
 
-def format_event(kind: str, payload: Dict[str, Any], slug: str = "") -> str:
-    """Format the complete operator-facing trading lifecycle without secrets."""
+def _positive_number(value: Any, digits: int = 1) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    return f"{number:.{digits}f}" if number >= 0 else "n/a"
+
+
+def _fill_rate(payload: Dict[str, Any]) -> str:
+    try:
+        requested = float(payload.get("requested_qty"))
+        filled = float(payload.get("filled_qty"))
+    except (TypeError, ValueError):
+        return "n/a"
+    if requested <= 0:
+        return "n/a"
+    return f"{filled / requested * 100:.2f}%"
+
+
+def _unfilled_qty(payload: Dict[str, Any]) -> str:
+    try:
+        return _number(max(0.0, float(payload.get("requested_qty")) - float(payload.get("filled_qty"))))
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _timestamp_fields(prefix: str, timestamp: Any) -> str:
+    try:
+        ts = float(timestamp)
+    except (TypeError, ValueError):
+        return f"{prefix}_utc=n/a {prefix}_ms=n/a"
+    if ts <= 0:
+        return f"{prefix}_utc=n/a {prefix}_ms=n/a"
+    iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return f"{prefix}_utc={iso} {prefix}_ms={int(ts * 1000)}"
+
+
+def _event_timestamp_fields(payload: Dict[str, Any]) -> str:
+    return _timestamp_fields("event_ts", payload.get("event_ts"))
+
+
+def _notification_timestamp_line(timestamp: float) -> str:
+    return _timestamp_fields("notification_ts", timestamp)
+
+
+def _text(value: Any, default: str = "n/a") -> str:
+    return default if value in (None, "") else str(value)
+
+
+def _market_line(payload: Dict[str, Any], slug: str) -> str:
+    return f"Market: slug={slug or _text(payload.get('slug'))} side={_text(payload.get('side'))}"
+
+
+def _order_line(payload: Dict[str, Any], *, default_status: str = "n/a") -> str:
+    fields = [
+        f"order={_text(payload.get('order_id'))}",
+        f"type={_text(payload.get('order_type'))}",
+        f"status={_text(payload.get('status'), default_status)}",
+    ]
+    submission_state = payload.get("submission_state")
+    if submission_state not in (None, ""):
+        fields.append(f"submission={submission_state}")
+    return "Order: " + " ".join(fields)
+
+
+def _qty_line(payload: Dict[str, Any]) -> str:
+    return (
+        f"Qty: requested={_number(payload.get('requested_qty'))} "
+        f"filled={_number(payload.get('filled_qty'))} "
+        f"unfilled={_unfilled_qty(payload)} fill_rate={_fill_rate(payload)}"
+    )
+
+
+def _price_line(payload: Dict[str, Any], *, label: str) -> str:
+    if label == "take":
+        requested_price = payload.get("requested_price", payload.get("avg_price"))
+    else:
+        requested_price = payload.get("requested_price")
+    return (
+        f"Price: {label}={_number(requested_price)} "
+        f"avg={_number(payload.get('avg_price'))} available={_number(payload.get('available_size'))}"
+    )
+
+
+def _timing_line(payload: Dict[str, Any]) -> str:
+    return f"Timing: {_event_timestamp_fields(payload)}"
+
+
+def _latency_line(payload: Dict[str, Any]) -> str:
+    return (
+        f"Latency: book_age_ms={_positive_number(payload.get('observed_book_age_ms'))} "
+        f"decision_to_submit_ms={_positive_number(payload.get('decision_to_submit_ms'))} "
+        f"submit_roundtrip_ms={_positive_number(payload.get('submit_roundtrip_ms'))} "
+        f"reconcile_duration_ms={_positive_number(payload.get('reconcile_duration_ms'))} "
+        f"itode={str(bool(payload.get('immediate_taker_order_delay_enabled'))).lower()} "
+        f"expected_taker_delay_ms={_positive_number(payload.get('expected_taker_delay_ms'))}"
+    )
+
+
+def format_event(
+    kind: str,
+    payload: Dict[str, Any],
+    slug: str = "",
+    *,
+    notification_ts: Optional[float] = None,
+) -> str:
+    """Format an operator-facing Telegram notification without secrets.
+
+    Every formatted notification carries its own UTC and millisecond-epoch
+    timestamp. ``event_ts`` remains separately available for order lifecycle
+    observability and is never substituted for notification time.
+    """
+
+    message = _format_event(kind, payload, slug)
+    sent_at = time.time() if notification_ts is None else notification_ts
+    return f"{message}\n{_notification_timestamp_line(sent_at)}"
+
+
+def _format_event(kind: str, payload: Dict[str, Any], slug: str = "") -> str:
 
     if kind == "boot":
         return (
@@ -32,11 +151,16 @@ def format_event(kind: str, payload: Dict[str, Any], slug: str = "") -> str:
             f"slug={payload['slug']} Gamma + CLOB WebSocket + Telegram ready"
         )
     if kind == "submitted":
-        return (
-            "[Aftertake] ORDER_SUBMITTED\n"
-            f"{payload['side']} qty={_number(payload['requested_qty'])} "
-            f"limit={_number(payload['requested_price'])}\n"
-            f"order={payload['order_id']} slug={slug}"
+        return "\n".join(
+            [
+                "[Aftertake] ORDER_SUBMITTED",
+                _market_line(payload, slug),
+                _order_line(payload, default_status="submitted"),
+                _qty_line(payload),
+                _price_line(payload, label="limit"),
+                _timing_line(payload),
+                _latency_line(payload),
+            ]
         )
     if kind == "recovery":
         return (
@@ -45,44 +169,56 @@ def format_event(kind: str, payload: Dict[str, Any], slug: str = "") -> str:
             f"order={payload['order_id']} intent={payload['intent_id']} slug={slug or 'unknown'}"
         )
     if kind == "entry":
-        headline = "DRY_RUN_SIMULATED_TAKE" if payload.get("dry_run") else "ENTRY_CONFIRMED"
-        return (
-            f"[Aftertake] {headline}\n"
-            f"{payload['side']} qty={_number(payload['requested_qty'])} "
-            f"take_price={_number(payload.get('requested_price', payload.get('avg_price')))} "
-            f"available_size={_number(payload.get('available_size'))}\n"
-            f"simulated_take={str(bool(payload.get('simulated_take'))).lower()} "
-            f"dry_run={str(bool(payload.get('dry_run'))).lower()}\n"
-            f"filled={_number(payload['filled_qty'])} avg={_number(payload['avg_price'])} "
-            f"status={payload['status']} order={payload['order_id']} slug={slug}"
+        if payload.get("dry_run"):
+            headline = "DRY_RUN_SIMULATED_TAKE"
+        else:
+            try:
+                partial = 0.0 < float(payload.get("filled_qty", 0)) < float(payload.get("requested_qty", 0))
+            except (TypeError, ValueError):
+                partial = False
+            headline = "ENTRY_PARTIAL_CONFIRMED" if partial else "ENTRY_CONFIRMED"
+        return "\n".join(
+            [
+                f"[Aftertake] {headline}",
+                _market_line(payload, slug),
+                _order_line(payload),
+                _qty_line(payload),
+                _price_line(payload, label="take"),
+                _timing_line(payload),
+                _latency_line(payload),
+                (
+                    "Notes: "
+                    f"simulated_take={str(bool(payload.get('simulated_take'))).lower()} "
+                    f"dry_run={str(bool(payload.get('dry_run'))).lower()}"
+                ),
+            ]
         )
     if kind == "order_result":
         lines = [
             "[Aftertake] ORDER_RESULT",
-            (
-                f"{payload['side']} status={payload['status']} "
-                f"filled={_number(payload['filled_qty'])} "
-                f"avg={_number(payload['avg_price'])}"
-            ),
-            f"submission={payload['submission_state']} order={payload.get('order_id') or 'n/a'}",
+            _market_line(payload, slug),
+            _order_line(payload),
+            _qty_line(payload),
+            _price_line(payload, label="limit"),
+            _timing_line(payload),
+            _latency_line(payload),
         ]
-        for key in ("reason", "order_type", "status_code", "error_hint"):
+        reason = payload.get("reason")
+        if reason not in (None, ""):
+            lines.append(f"Reason: {reason}")
+        notes = []
+        for key in ("status_code", "error_hint"):
             value = payload.get(key)
             if value not in (None, ""):
-                lines.append(f"{key}={value}")
-        if payload.get("requested_qty") is not None or payload.get("requested_price") is not None:
-            lines.append(
-                f"requested_qty={_number(payload.get('requested_qty'))} "
-                f"requested_price={_number(payload.get('requested_price'))} "
-                f"available_size={_number(payload.get('available_size'))}"
-            )
+                notes.append(f"{key}={value}")
+        if notes:
+            lines.append("Notes: " + " ".join(notes))
         message = str(payload.get("error_message") or "")
         if message:
             message = " ".join(message.split())
             if len(message) > 300:
                 message = message[:300] + "..."
-            lines.append(f"error_message={message}")
-        lines.append(f"slug={slug}")
+            lines.append(f"Error: {message}")
         return "\n".join(lines)
     if kind == "blocked":
         return (
@@ -116,6 +252,17 @@ def format_event(kind: str, payload: Dict[str, Any], slug: str = "") -> str:
             if len(message) > 400:
                 message = message[:400] + "..."
             lines.append(f"error_message={message}")
+        if any(
+            payload.get(k, -1) not in (None, "", -1, -1.0)
+            for k in (
+                "decision_to_submit_ms",
+                "submit_roundtrip_ms",
+                "reconcile_duration_ms",
+                "observed_book_age_ms",
+            )
+        ):
+            lines.append(_timing_line(payload))
+            lines.append(_latency_line(payload))
         lines.append(f"slug={slug or 'runtime'}")
         return "\n".join(lines)
     raise ValueError(f"unsupported notification event: {kind}")

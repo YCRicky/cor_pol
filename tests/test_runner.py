@@ -99,6 +99,18 @@ class PairedStream:
         return None
 
 
+class ReadyEmptyStream:
+    def __init__(self, **_kwargs):
+        self.ready = False
+        self.last_error = ""
+
+    def start(self):
+        self.ready = True
+
+    def close(self):
+        return None
+
+
 class DeepSupportPairedStream(PairedStream):
     no_bid_size = 40
     no_near_depth = 40
@@ -242,15 +254,15 @@ def test_live_round_emits_only_execution_lifecycle_messages(tmp_path):
         settings = Settings(dry_run=False, order_type="GTC", out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3")
         notifier = CaptureNotifier()
         gateway = InstantGateway()
-        timestamps = iter((1190.0, 1190.1, 1200.35))
+        timestamps = iter((1190.0, 1190.1, 1200.35, 1200.37))
         decisions = run_round(
             settings=settings,
             store=store,
             public=LivePublic(),
-            executor=OrderExecutor(settings, store, gateway=gateway),
+            executor=OrderExecutor(settings, store, gateway=gateway, wall_clock=lambda: 1200.36),
             live_gateway=gateway,
             round_start=900,
-            clock=lambda: next(timestamps, 1200.25),
+            clock=lambda: next(timestamps, 1200.37),
             sleep=lambda _: None,
             notifier=notifier,
             stream_factory=DeepSupportPairedStream,
@@ -259,9 +271,88 @@ def test_live_round_emits_only_execution_lifecycle_messages(tmp_path):
         assert store.market_state("btc-updown-5m-900") == "open"
         assert gateway.submitted_qty == 20
         assert [message.splitlines()[0] for message in notifier.messages] == ["[Aftertake] ENTRY_CONFIRMED"]
-        assert "NO qty=20.0000" in notifier.messages[0]
-        assert "take_price=0.6400" in notifier.messages[0]
-        assert "available_size=20.0000" in notifier.messages[0]
+        assert "Market: slug=btc-updown-5m-900 side=NO" in notifier.messages[0]
+        assert "Qty: requested=20.0000 filled=20.0000 unfilled=0.0000 fill_rate=100.00%" in notifier.messages[0]
+        assert "decision_to_submit_ms=" in notifier.messages[0]
+        assert "reconcile_duration_ms=" in notifier.messages[0]
+        assert "Price: take=0.6400 avg=0.6400 available=20.0000" in notifier.messages[0]
+        assert store.open_positions()[0].raw["timing"]["book_observed_ts"] == 1200.35
+    finally:
+        store.close()
+
+
+def test_post_close_hold_polling_uses_five_millisecond_cadence(tmp_path):
+    class AdvancingClock:
+        def __init__(self):
+            self.now = 1200.0
+            self.sleeps = []
+
+        def __call__(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.sleeps.append(seconds)
+            self.now += seconds
+
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        clock = AdvancingClock()
+        settings = Settings(dry_run=True, out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3")
+        decisions = run_round(
+            settings=settings,
+            store=store,
+            public=FakePublic(),
+            executor=OrderExecutor(settings, store),
+            live_gateway=None,
+            round_start=900,
+            clock=clock,
+            sleep=clock.sleep,
+            stream_factory=ReadyEmptyStream,
+        )
+
+        assert decisions
+        assert clock.sleeps
+        assert set(clock.sleeps) == {0.005}
+    finally:
+        store.close()
+
+
+def test_qualifying_decision_audit_is_deferred_until_after_submit(tmp_path, monkeypatch):
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        settings = Settings(dry_run=False, order_type="GTC", out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3")
+        gateway = InstantGateway()
+        executor = OrderExecutor(settings, store, gateway=gateway, wall_clock=lambda: 1200.36)
+        events = []
+        original_audit = runner_module._audit
+        original_execute = executor.execute_reserved
+
+        def track_audit(settings, store, kind, payload, slug=""):
+            if kind == "aftertake_decision":
+                events.append("decision_audit")
+            return original_audit(settings, store, kind, payload, slug)
+
+        def track_execute(*args, **kwargs):
+            events.append("submit")
+            return original_execute(*args, **kwargs)
+
+        monkeypatch.setattr(runner_module, "_audit", track_audit)
+        monkeypatch.setattr(executor, "execute_reserved", track_execute)
+        timestamps = iter((1190.0, 1190.1, 1200.35, 1200.37))
+
+        run_round(
+            settings=settings,
+            store=store,
+            public=LivePublic(),
+            executor=executor,
+            live_gateway=gateway,
+            round_start=900,
+            clock=lambda: next(timestamps, 1200.37),
+            sleep=lambda _: None,
+            stream_factory=DeepSupportPairedStream,
+        )
+
+        assert events == ["submit", "decision_audit"]
     finally:
         store.close()
 
@@ -515,9 +606,13 @@ def test_service_main_reports_boot_before_any_live_pm_connection(monkeypatch, tm
             return False
 
     def assert_boot_then_stop(**_kwargs):
-        assert notifier.messages == [
-            "[Aftertake] BOOT\nmode=LIVE qty=5.0000 assets=BTC,ETH,XRP,HYPE,DOGE,SOL\nmulti-asset per-asset risk gates + SQLite recovery + CLOB V2 preflight"
-        ]
+        assert len(notifier.messages) == 1
+        assert notifier.messages[0].startswith(
+            "[Aftertake] BOOT\nmode=LIVE qty=5.0000 assets=BTC,ETH,XRP,HYPE,DOGE,SOL\n"
+            "multi-asset per-asset risk gates + SQLite recovery + CLOB V2 preflight\n"
+        )
+        assert "notification_ts_utc=" in notifier.messages[0]
+        assert "notification_ts_ms=" in notifier.messages[0]
 
     monkeypatch.setattr(runner_module.Settings, "from_env", staticmethod(lambda: settings))
     monkeypatch.setattr(runner_module, "RuntimeLock", NoLock)
@@ -592,5 +687,54 @@ def test_reconcile_submitted_orders_keeps_pending_quiet_then_notifies_terminal(t
         assert second[0].terminal is True
         assert notifier.messages
         assert notifier.messages[-1].startswith("[Aftertake] ENTRY_CONFIRMED")
+    finally:
+        store.close()
+
+
+def test_round_loop_scans_assets_before_pending_order_reconciliation(monkeypatch, tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        settings = Settings(dry_run=False, order_type="GTC", out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3")
+        notifier = CaptureNotifier()
+        events = []
+
+        def live_runtime(*_args):
+            events.append("runtime")
+            gateway = InstantGateway()
+            return gateway, OrderExecutor(settings, store, gateway=gateway)
+
+        def boundary():
+            events.append("boundary")
+            return 900
+
+        def scan_assets(**_kwargs):
+            events.append("scan_assets")
+            return {}
+
+        def reconcile_pending(**_kwargs):
+            events.append("reconcile_pending")
+            return []
+
+        def settle(**_kwargs):
+            events.append("settle")
+            return []
+
+        monkeypatch.setattr(runner_module, "_run_asset_rounds", scan_assets)
+        monkeypatch.setattr(runner_module, "reconcile_submitted_orders", reconcile_pending)
+        monkeypatch.setattr(runner_module, "settle_open_positions", settle)
+
+        _run_round_loop(
+            settings=settings,
+            store=store,
+            public=LivePublic(),
+            notifier=notifier,
+            forever=False,
+            rounds=1,
+            live_runtime_factory=live_runtime,
+            wait_for_next_boundary=boundary,
+            sleep=lambda _seconds: None,
+        )
+
+        assert events == ["runtime", "boundary", "scan_assets", "reconcile_pending", "settle"]
     finally:
         store.close()

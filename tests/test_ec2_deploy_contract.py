@@ -8,6 +8,7 @@ def test_cor_pol_ec2_deployment_replaces_the_legacy_main_py_service_contract():
     unit = (ROOT / "deploy" / "systemd" / "cor-pol.service.example").read_text(
         encoding="utf-8"
     )
+    runner = (ROOT / "src" / "aftertake" / "runner.py").read_text(encoding="utf-8")
 
     assert 'REPO_DIR="/opt/cor_pol"' in deploy
     assert 'UNIT_SOURCE="${REPO_DIR}/deploy/systemd/cor-pol.service.example"' in deploy
@@ -23,3 +24,26 @@ def test_cor_pol_ec2_deployment_replaces_the_legacy_main_py_service_contract():
     assert "ExecStart=/opt/cor_pol/.venv/bin/python -m aftertake.runner --forever" in unit
     assert "/opt/aftertake" not in unit
     assert "main.py" not in unit
+
+    # systemd starts from StateDirectory, not the checkout. Runtime revision
+    # probes must therefore not execute Git and emit fatal journal messages.
+    assert "_code_revision" not in runner
+    assert "git rev-parse" not in runner
+    assert '["git"' not in runner
+
+
+def test_ec2_deploy_enforces_multi_asset_live_universe_without_touching_secrets():
+    deploy = (ROOT / "deploy" / "ec2" / "deploy_cor_pol.sh").read_text(encoding="utf-8")
+    env_example = (ROOT / ".env.example").read_text(encoding="utf-8")
+
+    assert "AFTERTAKE_ASSETS=BTC,ETH,XRP,HYPE,DOGE,SOL" in env_example
+    assert "AFTERTAKE_ASSET=BTC" not in env_example
+    assert "AFTERTAKE_MAX_OPEN_POSITIONS=3" in env_example
+
+    assert "normalize_runtime_env" in deploy
+    assert deploy.index("normalize_runtime_env()") < deploy.index("normalize_runtime_env\n")
+    assert "ensure_env_kv AFTERTAKE_ASSETS BTC,ETH,XRP,HYPE,DOGE,SOL" in deploy
+    assert "ensure_env_kv AFTERTAKE_ORDER_TYPE GTC" in deploy
+    assert "comment_out_legacy_env AFTERTAKE_ASSET" in deploy
+    assert "POLYMARKET_PRIVATE_KEY" in deploy  # still only validates, never rewrites secrets
+    assert "ensure_env_kv POLYMARKET_PRIVATE_KEY" not in deploy

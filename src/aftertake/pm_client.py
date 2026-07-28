@@ -110,6 +110,8 @@ class MarketMetadata:
     fee_exponent: float = 1.0
     builder_taker_fee_bps: float = 0.0
     accepting_orders: bool = True
+    immediate_taker_order_delay_enabled: bool = False
+    expected_taker_delay_ms: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -427,6 +429,7 @@ class V2ClobGateway:
             # builder code. Market `tbf` is not the builder-program fee.
             builder_rate = self._client._get_builder_taker_fee_rate(self._builder_code)
             builder_taker_fee_bps = _as_float(builder_rate, "builder taker fee") * 10_000.0
+        itode = bool(raw.get("itode", raw.get("immediate_taker_order_delay_enabled", False)))
         return MarketMetadata(
             condition_id=condition_id,
             tick_size=tick_size,
@@ -438,6 +441,8 @@ class V2ClobGateway:
             fee_exponent=fee_exponent,
             builder_taker_fee_bps=builder_taker_fee_bps,
             accepting_orders=True,
+            immediate_taker_order_delay_enabled=itode,
+            expected_taker_delay_ms=250.0 if itode else 0.0,
         )
 
     def submit_limit_buy(

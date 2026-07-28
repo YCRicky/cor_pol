@@ -49,6 +49,13 @@ class OrderResult:
     submission_state: str
     error: str = ""
     raw: Optional[Dict[str, Any]] = None
+    event_ts: float = 0.0
+    decision_to_submit_ms: float = -1.0
+    submit_roundtrip_ms: float = -1.0
+    reconcile_duration_ms: float = -1.0
+    observed_book_age_ms: float = -1.0
+    immediate_taker_order_delay_enabled: bool = False
+    expected_taker_delay_ms: float = 0.0
 
     @property
     def qty(self) -> float:
@@ -124,6 +131,22 @@ def _terminal_status(status: str) -> bool:
     }
 
 
+def _market_delay_from_raw(raw: Dict[str, Any]) -> Dict[str, Any]:
+    payload = raw.get("_market_delay")
+    if not isinstance(payload, dict):
+        submit = raw.get("submit")
+        payload = submit.get("_market_delay") if isinstance(submit, dict) else {}
+    enabled = bool((payload or {}).get("immediate_taker_order_delay_enabled", False))
+    try:
+        expected = float((payload or {}).get("expected_taker_delay_ms", 0.0))
+    except (TypeError, ValueError):
+        expected = 0.0
+    return {
+        "immediate_taker_order_delay_enabled": enabled,
+        "expected_taker_delay_ms": expected if expected > 0 else (250.0 if enabled else 0.0),
+    }
+
+
 def _truncate(text: Any, limit: int = 500) -> str:
     text = " ".join(str(text or "").split())
     return text[:limit] + "..." if len(text) > limit else text
@@ -192,6 +215,7 @@ class OrderExecutor:
         gateway: Optional[OrderGateway] = None,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
         heartbeat_factory: Callable[[OrderGateway, float], HeartbeatLoop] = HeartbeatLoop,
         event_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ):
@@ -200,6 +224,7 @@ class OrderExecutor:
         self.gateway = gateway
         self._sleep = sleep
         self._monotonic = monotonic
+        self._wall_clock = wall_clock
         self._heartbeat_factory = heartbeat_factory
         self._event_callback = event_callback
         self._event_threads: List[tuple] = []
@@ -243,14 +268,27 @@ class OrderExecutor:
                 )
 
     def execute_reserved(
-        self, record: OrderRecord, metadata: MarketMetadata, *, fast: bool = False
+        self,
+        record: OrderRecord,
+        metadata: MarketMetadata,
+        *,
+        fast: bool = False,
+        timing_context: Optional[Dict[str, Any]] = None,
     ) -> OrderResult:
+        timing_context = dict(timing_context or {})
+        execute_start_wall = self._wall_clock()
+        execute_start_mono = self._monotonic()
         if self.settings.dry_run:
             raw = {
                 "mode": "shadow",
                 "reason": "AFTERTAKE_DRY_RUN=true",
                 "simulated_take": True,
                 "no_live_order": True,
+                "timing": {**timing_context, "execute_start_ts": execute_start_wall},
+                "market_delay": {
+                    "immediate_taker_order_delay_enabled": bool(metadata.immediate_taker_order_delay_enabled),
+                    "expected_taker_delay_ms": float(metadata.expected_taker_delay_ms),
+                },
             }
             self.store.mark_terminal_execution(
                 record.intent_id,
@@ -274,6 +312,9 @@ class OrderExecutor:
                 terminal=True,
                 submission_state="not_submitted",
                 raw=raw,
+                event_ts=self._wall_clock(),
+                immediate_taker_order_delay_enabled=metadata.immediate_taker_order_delay_enabled,
+                expected_taker_delay_ms=metadata.expected_taker_delay_ms,
             )
         if self.gateway is None:
             raise RuntimeError("live order executor requires a V2 CLOB gateway")
@@ -281,8 +322,14 @@ class OrderExecutor:
         heartbeat = self._heartbeat_factory(self.gateway, self.settings.heartbeat_interval_s)
         heartbeat.start()
         try:
+            submit_start_wall = 0.0
+            submit_start_mono = 0.0
+            submit_end_wall = 0.0
+            submit_end_mono = 0.0
             try:
                 fast_submit = getattr(self.gateway, "submit_limit_buy_fast", None) if fast else None
+                submit_start_wall = self._wall_clock()
+                submit_start_mono = self._monotonic()
                 if fast_submit is not None:
                     submitted = fast_submit(
                         record.token_id,
@@ -299,9 +346,26 @@ class OrderExecutor:
                         metadata,
                         self.settings.order_type,
                     )
+                submit_end_mono = self._monotonic()
+                submit_end_wall = self._wall_clock()
             except Exception as exc:
+                submit_end_mono = self._monotonic()
+                submit_end_wall = self._wall_clock()
+                timing = self._build_timing(
+                    timing_context,
+                    execute_start_wall=execute_start_wall,
+                    submit_start_wall=submit_start_wall or execute_start_wall,
+                    submit_end_wall=submit_end_wall,
+                    submit_start_mono=submit_start_mono or execute_start_mono,
+                    submit_end_mono=submit_end_mono,
+                )
                 raw = {
                     "submit_error": _safe_error_message(str(exc)),
+                    "timing": timing,
+                    "_market_delay": {
+                        "immediate_taker_order_delay_enabled": bool(metadata.immediate_taker_order_delay_enabled),
+                        "expected_taker_delay_ms": float(metadata.expected_taker_delay_ms),
+                    },
                     **_sanitize_exception(exc, phase="post_order", order_type=self.settings.order_type),
                 }
                 if _is_fak_no_match_exception(exc, self.settings.order_type):
@@ -329,10 +393,25 @@ class OrderExecutor:
                     record, "submit_skipped", 0.0, 0.0, True, "skipped", reason, raw
                 )
 
+            timing = self._build_timing(
+                timing_context,
+                execute_start_wall=execute_start_wall,
+                submit_start_wall=submit_start_wall,
+                submit_end_wall=submit_end_wall,
+                submit_start_mono=submit_start_mono,
+                submit_end_mono=submit_end_mono,
+            )
+            submitted = dict(submitted)
+            submitted["_timing"] = timing
+            submitted["_market_delay"] = {
+                "immediate_taker_order_delay_enabled": bool(metadata.immediate_taker_order_delay_enabled),
+                "expected_taker_delay_ms": float(metadata.expected_taker_delay_ms),
+            }
             order_id = str(submitted.get("orderID") or submitted.get("id") or "")
             if not order_id:
                 reason = "missing_order_id_after_submit"
                 raw = dict(submitted)
+                raw["timing"] = timing
                 raw["classification"] = reason
                 raw["terminal_skip"] = True
                 self.store.mark_terminal_execution(record.intent_id, 0.0, 0.0, raw, "submit_skipped")
@@ -348,6 +427,12 @@ class OrderExecutor:
                     "order_id": order_id,
                     "requested_qty": record.requested_qty,
                     "requested_price": record.requested_price,
+                    "event_ts": submit_end_wall,
+                    "decision_to_submit_ms": timing.get("decision_to_submit_ms", -1.0),
+                    "submit_roundtrip_ms": timing.get("submit_roundtrip_ms", -1.0),
+                    "observed_book_age_ms": timing.get("observed_book_age_ms", -1.0),
+                    "immediate_taker_order_delay_enabled": metadata.immediate_taker_order_delay_enabled,
+                    "expected_taker_delay_ms": metadata.expected_taker_delay_ms,
                 },
             )
             return self._reconcile(record, order_id, submitted)
@@ -376,6 +461,7 @@ class OrderExecutor:
         self, record: OrderRecord, order_id: str, submitted: Dict[str, Any]
     ) -> OrderResult:
         assert self.gateway is not None
+        reconcile_start_wall = self._wall_clock()
         started_at = self._monotonic()
         deadline = started_at + self.settings.reconcile_timeout_s
         cancelable_order = self.settings.order_type in {"GTD"}
@@ -424,11 +510,13 @@ class OrderExecutor:
             status = _normalise_status(last_order.get("status") or "") if order_lookup_ok else ""
             if order_lookup_ok and _terminal_status(status):
                 filled_qty, avg_price = self._summarize_fill(record, last_order, last_trades)
+                timing = self._merge_reconcile_timing(submitted, reconcile_start_wall, started_at)
                 raw = {
                     "submit": submitted,
                     "order": last_order,
                     "cancel": cancel_raw,
                     "trades": last_trades,
+                    "timing": timing,
                 }
                 if filled_qty > 0 and avg_price <= 0:
                     reason = "confirmed_fill_without_execution_price"
@@ -469,11 +557,13 @@ class OrderExecutor:
                     cancel_raw = {"cancel_errors": list(cancel_errors)}
             self._sleep(min(0.5, max(0.01, deadline - self._monotonic())))
 
+        timing = self._merge_reconcile_timing(submitted, reconcile_start_wall, started_at)
         raw = {
             "submit": submitted,
             "order": last_order,
             "cancel": cancel_raw,
             "trades": last_trades,
+            "timing": timing,
         }
         reason = "order_not_terminal_after_reconcile_timeout"
         if self.settings.order_type == "GTC" and order_id:
@@ -493,6 +583,43 @@ class OrderExecutor:
         return self._result_from_record(
             record, "execution_unknown", 0.0, 0.0, False, "unknown", reason, raw
         )
+
+
+    def _build_timing(
+        self,
+        context: Dict[str, Any],
+        *,
+        execute_start_wall: float,
+        submit_start_wall: float,
+        submit_end_wall: float,
+        submit_start_mono: float,
+        submit_end_mono: float,
+    ) -> Dict[str, Any]:
+        timing = dict(context)
+        timing["execute_start_ts"] = float(execute_start_wall)
+        timing["submit_start_ts"] = float(submit_start_wall)
+        timing["submit_end_ts"] = float(submit_end_wall)
+        decision_ts = timing.get("decision_ts")
+        try:
+            timing["decision_to_submit_ms"] = max(0.0, (float(submit_start_wall) - float(decision_ts)) * 1000.0)
+        except (TypeError, ValueError):
+            timing["decision_to_submit_ms"] = -1.0
+        book_ts = timing.get("book_observed_ts")
+        try:
+            timing["observed_book_age_ms"] = max(0.0, (float(submit_start_wall) - float(book_ts)) * 1000.0)
+        except (TypeError, ValueError):
+            timing["observed_book_age_ms"] = -1.0
+        timing["submit_roundtrip_ms"] = max(0.0, (float(submit_end_mono) - float(submit_start_mono)) * 1000.0)
+        return timing
+
+    def _merge_reconcile_timing(
+        self, submitted: Dict[str, Any], reconcile_start_wall: float, reconcile_start_mono: float
+    ) -> Dict[str, Any]:
+        timing = dict(submitted.get("_timing") or {})
+        timing["reconcile_start_ts"] = float(reconcile_start_wall)
+        timing["reconcile_end_ts"] = float(self._wall_clock())
+        timing["reconcile_duration_ms"] = max(0.0, (self._monotonic() - reconcile_start_mono) * 1000.0)
+        return timing
 
     @staticmethod
     def _summarize_fill(
@@ -576,6 +703,8 @@ class OrderExecutor:
         error: str,
         raw: Dict[str, Any],
     ) -> OrderResult:
+        timing = dict(raw.get("timing") or raw.get("submit", {}).get("_timing") or {})
+        market_delay = _market_delay_from_raw(raw)
         return OrderResult(
             dry_run=False,
             intent_id=record.intent_id,
@@ -592,4 +721,11 @@ class OrderExecutor:
             submission_state=submission_state,
             error=error,
             raw=raw,
+            event_ts=float(timing.get("reconcile_end_ts") or timing.get("submit_end_ts") or 0.0),
+            decision_to_submit_ms=float(timing.get("decision_to_submit_ms", -1.0)),
+            submit_roundtrip_ms=float(timing.get("submit_roundtrip_ms", -1.0)),
+            reconcile_duration_ms=float(timing.get("reconcile_duration_ms", -1.0)),
+            observed_book_age_ms=float(timing.get("observed_book_age_ms", -1.0)),
+            immediate_taker_order_delay_enabled=market_delay["immediate_taker_order_delay_enabled"],
+            expected_taker_delay_ms=market_delay["expected_taker_delay_ms"],
         )

@@ -45,6 +45,10 @@ from .settlement import builder_fee_total, fee_total, settle_trade
 from .state import RuntimeLock, StateStore
 
 RUNTIME_RETRY_S = 5.0
+# This only bounds how long the runner waits to re-check an already-recorded
+# websocket observation. Classifier confirmation spacing and all thresholds
+# remain in PostCloseConfig.
+POST_CLOSE_POLL_INTERVAL_S = 0.005
 
 
 def current_crypto_5m_slug(asset: str, now: Optional[int] = None) -> Tuple[str, int, int]:
@@ -100,6 +104,60 @@ def _safe_notify(
         )
 
 
+
+
+def _latency_payload_from_result(result: OrderResult) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "event_ts": result.event_ts,
+        "decision_to_submit_ms": result.decision_to_submit_ms,
+        "submit_roundtrip_ms": result.submit_roundtrip_ms,
+        "reconcile_duration_ms": result.reconcile_duration_ms,
+        "observed_book_age_ms": result.observed_book_age_ms,
+        "immediate_taker_order_delay_enabled": result.immediate_taker_order_delay_enabled,
+        "expected_taker_delay_ms": result.expected_taker_delay_ms,
+    }
+    raw = result.raw or {}
+    timing = raw.get("timing") or raw.get("submit", {}).get("_timing") or {}
+    for key in (
+        "book_observed_ts",
+        "decision_ts",
+        "round_end_ts",
+        "seconds_after_close_at_decision",
+        "submit_start_ts",
+        "submit_end_ts",
+        "reconcile_start_ts",
+        "reconcile_end_ts",
+    ):
+        if key in timing:
+            payload[key] = timing[key]
+    return payload
+
+
+def _audit_decision(
+    settings: Settings,
+    store: StateStore,
+    decision: PostCloseDecision,
+    slug: str,
+) -> None:
+    _audit(
+        settings,
+        store,
+        "aftertake_decision",
+        {
+            "action": decision.action,
+            "reason": decision.reason,
+            "side": decision.side,
+            "entry_ask": decision.entry_ask,
+            "entry_ask_size": decision.entry_ask_size,
+            "winner_bid": decision.winner_bid,
+            "loser_bid": decision.loser_bid,
+            "confirmations": decision.confirmations,
+            "strategy": STRATEGY_VERSION,
+            "audit": decision.audit,
+        },
+        slug,
+    )
+
 def _notify_order_result(
     notifier: Notifier,
     settings: Settings,
@@ -123,6 +181,7 @@ def _notify_order_result(
             "requested_price": result.price,
             "available_size": available_size,
             "simulated_take": simulated_take or result.dry_run,
+            **_latency_payload_from_result(result),
         }
     elif result.submission_state == "unknown":
         kind = "alert"
@@ -136,6 +195,7 @@ def _notify_order_result(
             "status_code": raw.get("status_code", ""),
             "error_message": raw.get("error_message", raw.get("submit_error", "")),
             "error_hint": raw.get("error_hint", ""),
+            **_latency_payload_from_result(result),
         }
     else:
         kind = "order_result"
@@ -155,6 +215,7 @@ def _notify_order_result(
             "error_message": raw.get("error_message", raw.get("submit_error", "")),
             "status_code": raw.get("status_code", ""),
             "error_hint": raw.get("error_hint", ""),
+            **_latency_payload_from_result(result),
         }
     _safe_notify(notifier, settings, store, kind, payload, slug)
 
@@ -341,29 +402,15 @@ def run_round(
             )
             latest_ts = decision.audit.get("confirmation_timestamps", [None])[-1] if decision.audit else None
             key = (decision.action, decision.reason, decision.side, latest_ts)
+            audit_decision = None
             if key not in seen_decisions:
                 decisions.append(decision)
                 seen_decisions.add(key)
-                _audit(
-                    settings,
-                    store,
-                    "aftertake_decision",
-                    {
-                        "action": decision.action,
-                        "reason": decision.reason,
-                        "side": decision.side,
-                        "entry_ask": decision.entry_ask,
-                        "entry_ask_size": decision.entry_ask_size,
-                        "winner_bid": decision.winner_bid,
-                        "loser_bid": decision.loser_bid,
-                        "confirmations": decision.confirmations,
-                        "strategy": STRATEGY_VERSION,
-                        "audit": decision.audit,
-                    },
-                    slug,
-                )
+                audit_decision = decision
             if decision.action != "enter" or decision.entry_ask is None:
-                sleep(0.01)
+                if audit_decision is not None:
+                    _audit_decision(settings, store, audit_decision, slug)
+                sleep(POST_CLOSE_POLL_INTERVAL_S)
                 continue
 
             try:
@@ -420,10 +467,30 @@ def run_round(
                     builder_taker_fee_bps=metadata.builder_taker_fee_bps,
                 )
                 if record is None:
+                    if audit_decision is not None:
+                        _audit_decision(settings, store, audit_decision, slug)
                     decisions.append(PostCloseDecision("hold", "market_already_reserved"))
                     break
-                result = executor.execute_reserved(record, metadata, fast=True)
+                decision_ts = float(clock())
+                book_observed_ts = None
+                try:
+                    book_observed_ts = float((decision.audit or {}).get("confirmation_timestamps", [None])[-1])
+                except (TypeError, ValueError):
+                    book_observed_ts = None
+                timing_context = {
+                    "asset": active_asset,
+                    "round_start": int(round_start),
+                    "round_end_ts": float(round_end),
+                    "decision_ts": decision_ts,
+                    "seconds_after_close_at_decision": decision_ts - float(round_end),
+                    "book_observed_ts": book_observed_ts,
+                    "immediate_taker_order_delay_enabled": metadata.immediate_taker_order_delay_enabled,
+                    "expected_taker_delay_ms": metadata.expected_taker_delay_ms,
+                }
+                result = executor.execute_reserved(record, metadata, fast=True, timing_context=timing_context)
                 executor.wait_for_event_delivery()
+                if audit_decision is not None:
+                    _audit_decision(settings, store, audit_decision, slug)
                 _audit(
                     settings,
                     store,
@@ -453,10 +520,14 @@ def run_round(
                 )
                 break
             except (RiskRejected, LivePreflightError) as exc:
+                if audit_decision is not None:
+                    _audit_decision(settings, store, audit_decision, slug)
                 _audit(settings, store, "entry_blocked", {"reason": str(exc)}, slug)
                 decisions.append(PostCloseDecision("hold", str(exc), side=decision.side))
                 break
             except Exception as exc:
+                if audit_decision is not None:
+                    _audit_decision(settings, store, audit_decision, slug)
                 _audit(settings, store, "entry_runtime_error", {"error": str(exc)}, slug)
                 _safe_notify(notifier, settings, store, "alert", {"reason": str(exc)}, slug)
                 break
@@ -681,13 +752,6 @@ def _run_round_loop(
                 _safe_notify(notifier, settings, store, "alert", {"reason": "PM runtime recovered"})
                 last_runtime_error = ""
 
-        if settings.is_live:
-            try:
-                reconcile_submitted_orders(settings=settings, store=store, executor=executor, notifier=notifier)
-            except Exception as exc:
-                _audit(settings, store, "submitted_reconcile_error", {"error": str(exc)})
-        settle_open_positions(settings=settings, store=store, public=public, notifier=notifier)
-
         if wait_for_next_boundary is not _wait_for_next_boundary:
             start = wait_for_next_boundary()
         else:
@@ -715,6 +779,15 @@ def _run_round_loop(
             if settings.is_live:
                 gateway = None
                 executor = OrderExecutor(settings=settings, store=store)
+        finally:
+            # Post-round only: pending GTC reconciliation and official settlement
+            # must never delay market discovery for the next 5-minute boundary.
+            if settings.is_live and gateway is not None:
+                try:
+                    reconcile_submitted_orders(settings=settings, store=store, executor=executor, notifier=notifier)
+                except Exception as exc:
+                    _audit(settings, store, "submitted_reconcile_error", {"error": str(exc)})
+            settle_open_positions(settings=settings, store=store, public=public, notifier=notifier)
         completed += 1
 
 

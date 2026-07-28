@@ -1,4 +1,5 @@
 import json
+import re
 import urllib.parse
 
 import pytest
@@ -96,6 +97,53 @@ def test_operator_lifecycle_messages_are_stable(kind, payload, headline):
     assert "token" not in text.lower()
 
 
+@pytest.mark.parametrize(
+    ("kind", "payload", "slug"),
+    [
+        ("boot", {"dry_run": True, "qty": 5, "assets": ("BTC",)}, ""),
+        ("preflight", {"dry_run": True, "qty": 5, "assets": ("BTC",), "slug": "btc-updown-5m-0"}, ""),
+        (
+            "submitted",
+            {"side": "YES", "requested_qty": 5, "requested_price": 0.64, "order_id": "order-1"},
+            "btc-updown-5m-0",
+        ),
+        ("recovery", {"order_id": "order-1", "intent_id": "intent-1"}, "btc-updown-5m-0"),
+        (
+            "entry",
+            {
+                "side": "YES",
+                "filled_qty": 5,
+                "avg_price": 0.64,
+                "requested_qty": 5,
+                "status": "matched",
+                "order_id": "order-1",
+            },
+            "btc-updown-5m-0",
+        ),
+        (
+            "order_result",
+            {"side": "YES", "status": "canceled", "filled_qty": 0, "avg_price": 0, "submission_state": "acknowledged"},
+            "btc-updown-5m-0",
+        ),
+        ("blocked", {"reason": "risk_rejected"}, "btc-updown-5m-0"),
+        ("round", {"ticks": 1, "decisions": 1, "last_reason": "hold"}, "btc-updown-5m-0"),
+        (
+            "settle",
+            {"side": "YES", "win": True, "pm_up": True, "qty": 5, "pnl": 1.0, "entry_price": 0.64, "entry_fee": 0.1},
+            "btc-updown-5m-0",
+        ),
+        ("alert", {"reason": "runtime_unavailable"}, "btc-updown-5m-0"),
+    ],
+)
+def test_every_formatted_notification_includes_utc_and_millisecond_epoch(kind, payload, slug):
+    text = format_event(kind, payload, slug, notification_ts=1785189900.123)
+
+    assert re.search(
+        r"notification_ts_utc=2026-07-27T\d{2}:\d{2}:\d{2}\.123Z notification_ts_ms=1785189900123$",
+        text,
+    )
+
+
 def test_dry_run_entry_message_reports_simulated_take_price_and_available_size():
     text = format_event(
         "entry",
@@ -115,10 +163,8 @@ def test_dry_run_entry_message_reports_simulated_take_price_and_available_size()
     )
 
     assert text.startswith("[Aftertake] DRY_RUN_SIMULATED_TAKE")
-    assert "take_price=0.6400" in text
-    assert "available_size=18.0000" in text
-    assert "simulated_take=true" in text
-    assert "dry_run=true" in text
+    assert "Price: take=0.6400 avg=0.6400 available=18.0000" in text
+    assert "Notes: simulated_take=true dry_run=true" in text
     assert "token" not in text.lower()
 
 
@@ -185,14 +231,103 @@ def test_order_result_includes_no_match_diagnostics_and_requested_context():
             "requested_price": 0.99,
             "available_size": 509.46,
             "error_message": "no orders found to match with FAK order",
+            "event_ts": 1785189900.123,
+            "decision_to_submit_ms": 73.4,
+            "submit_roundtrip_ms": 112.8,
+            "reconcile_duration_ms": 68.5,
+            "observed_book_age_ms": 146.2,
+            "immediate_taker_order_delay_enabled": True,
+            "expected_taker_delay_ms": 250.0,
         },
         "btc-updown-5m-1785167400",
+        notification_ts=1785189901.456,
     )
 
-    assert "submission=venue_no_match order=n/a" in text
-    assert "reason=fak_no_matching_resting_order" in text
-    assert "order_type=FAK" in text
-    assert "requested_qty=50.0000" in text
-    assert "requested_price=0.9900" in text
-    assert "available_size=509.4600" in text
-    assert "error_message=no orders found to match with FAK order" in text
+    assert text.splitlines() == [
+        "[Aftertake] ORDER_RESULT",
+        "Market: slug=btc-updown-5m-1785167400 side=YES",
+        "Order: order=n/a type=FAK status=no_fill submission=venue_no_match",
+        "Qty: requested=50.0000 filled=0.0000 unfilled=50.0000 fill_rate=0.00%",
+        "Price: limit=0.9900 avg=0.0000 available=509.4600",
+        "Timing: event_ts_utc=2026-07-27T22:05:00.123Z event_ts_ms=1785189900123",
+        "Latency: book_age_ms=146.2 decision_to_submit_ms=73.4 submit_roundtrip_ms=112.8 reconcile_duration_ms=68.5 "
+        "itode=true expected_taker_delay_ms=250.0",
+        "Reason: fak_no_matching_resting_order",
+        "Notes: status_code=400",
+        "Error: no orders found to match with FAK order",
+        "notification_ts_utc=2026-07-27T22:05:01.456Z notification_ts_ms=1785189901456",
+    ]
+
+
+def test_live_partial_entry_message_reports_fill_rate_unfilled_and_latency():
+    text = format_event(
+        "entry",
+        {
+            "side": "YES",
+            "filled_qty": 2.7,
+            "avg_price": 0.99,
+            "requested_price": 0.99,
+            "requested_qty": 12,
+            "available_size": 12.81,
+            "status": "canceled",
+            "order_id": "order-live",
+            "dry_run": False,
+            "simulated_take": False,
+            "decision_to_submit_ms": 73.4,
+            "submit_roundtrip_ms": 112.8,
+            "reconcile_duration_ms": 68.5,
+            "observed_book_age_ms": 146.2,
+            "event_ts": 1785189900.123,
+            "immediate_taker_order_delay_enabled": True,
+            "expected_taker_delay_ms": 250.0,
+        },
+        "sol-updown-5m-1785189900",
+        notification_ts=1785189901.456,
+    )
+
+    assert text.splitlines() == [
+        "[Aftertake] ENTRY_PARTIAL_CONFIRMED",
+        "Market: slug=sol-updown-5m-1785189900 side=YES",
+        "Order: order=order-live type=n/a status=canceled",
+        "Qty: requested=12.0000 filled=2.7000 unfilled=9.3000 fill_rate=22.50%",
+        "Price: take=0.9900 avg=0.9900 available=12.8100",
+        "Timing: event_ts_utc=2026-07-27T22:05:00.123Z event_ts_ms=1785189900123",
+        "Latency: book_age_ms=146.2 decision_to_submit_ms=73.4 submit_roundtrip_ms=112.8 reconcile_duration_ms=68.5 "
+        "itode=true expected_taker_delay_ms=250.0",
+        "Notes: simulated_take=false dry_run=false",
+        "notification_ts_utc=2026-07-27T22:05:01.456Z notification_ts_ms=1785189901456",
+    ]
+
+
+def test_submitted_message_uses_compact_ordered_sections():
+    text = format_event(
+        "submitted",
+        {
+            "side": "YES",
+            "requested_qty": 12,
+            "requested_price": 0.99,
+            "order_id": "order-submit",
+            "event_ts": 1785189900.123,
+            "decision_to_submit_ms": 73.4,
+            "submit_roundtrip_ms": 112.8,
+            "observed_book_age_ms": 146.2,
+            "immediate_taker_order_delay_enabled": True,
+            "expected_taker_delay_ms": 250.0,
+        },
+        "sol-updown-5m-1785189900",
+        notification_ts=1785189901.456,
+    )
+
+    assert text.splitlines() == [
+        "[Aftertake] ORDER_SUBMITTED",
+        "Market: slug=sol-updown-5m-1785189900 side=YES",
+        "Order: order=order-submit type=n/a status=submitted",
+        "Qty: requested=12.0000 filled=n/a unfilled=n/a fill_rate=n/a",
+        "Price: limit=0.9900 avg=n/a available=n/a",
+        "Timing: event_ts_utc=2026-07-27T22:05:00.123Z event_ts_ms=1785189900123",
+        "Latency: book_age_ms=146.2 decision_to_submit_ms=73.4 submit_roundtrip_ms=112.8 reconcile_duration_ms=n/a "
+        "itode=true expected_taker_delay_ms=250.0",
+        "notification_ts_utc=2026-07-27T22:05:01.456Z notification_ts_ms=1785189901456",
+    ]
+    assert "expected_taker_delay_ms=250.0" in text
+    assert "token" not in text.lower()

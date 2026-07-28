@@ -26,12 +26,51 @@ read_env() {
     | sed -E 's/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/'
 }
 
+
+ensure_env_kv() {
+  local key="$1"
+  local value="$2"
+  local tmp
+  tmp="$(mktemp)"
+  if grep -q -E "^[[:space:]]*${key}[[:space:]]*=" "${ENV_FILE}"; then
+    sed -E "s|^[[:space:]]*${key}[[:space:]]*=.*|${key}=${value}|" "${ENV_FILE}" > "${tmp}"
+  else
+    cp "${ENV_FILE}" "${tmp}"
+    printf '
+%s=%s
+' "${key}" "${value}" >> "${tmp}"
+  fi
+  cat "${tmp}" > "${ENV_FILE}"
+  rm -f "${tmp}"
+}
+
+comment_out_legacy_env() {
+  local key="$1"
+  local tmp
+  tmp="$(mktemp)"
+  sed -E "s|^[[:space:]]*(${key}[[:space:]]*=.*)|# legacy disabled by deploy_cor_pol.sh: \1|" "${ENV_FILE}" > "${tmp}"
+  cat "${tmp}" > "${ENV_FILE}"
+  rm -f "${tmp}"
+}
+
+normalize_runtime_env() {
+  # Non-secret deployment policy. Keep credentials untouched, but prevent stale
+  # legacy single-asset settings from silently turning live back into BTC-only.
+  ensure_env_kv AFTERTAKE_ASSETS BTC,ETH,XRP,HYPE,DOGE,SOL
+  ensure_env_kv AFTERTAKE_ORDER_TYPE GTC
+  if grep -q -E "^[[:space:]]*AFTERTAKE_ASSET[[:space:]]*=" "${ENV_FILE}"; then
+    comment_out_legacy_env AFTERTAKE_ASSET
+  fi
+}
+
 require_env() {
   local key="$1"
   local value
   value="$(read_env "${key}")"
   test -n "${value}" || { echo "required setting is blank: ${key}" >&2; exit 2; }
 }
+
+normalize_runtime_env
 
 dry_run="$(read_env AFTERTAKE_DRY_RUN)"
 test "${dry_run}" = "true" || test "${dry_run}" = "false" || {
