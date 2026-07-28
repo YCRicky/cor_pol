@@ -724,7 +724,21 @@ def _run_asset_rounds(
         }
         for future in as_completed(futures):
             asset = futures[future]
-            results[asset] = future.result()
+            try:
+                results[asset] = future.result()
+            except Exception as exc:
+                if not _is_transient_transport_error(exc):
+                    raise
+                slug, _, _ = current_crypto_5m_slug(asset, round_start)
+                _audit_asset_transport_error(
+                    settings,
+                    store,
+                    asset=asset,
+                    slug=slug,
+                    phase="asset_round_unhandled",
+                    exc=exc,
+                )
+                results[asset] = [PostCloseDecision("hold", "asset_round_transport_error")]
     return results
 
 

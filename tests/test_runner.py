@@ -575,6 +575,90 @@ def test_live_asset_transport_failure_isolated_without_rebuilding_runtime(tmp_pa
         store.close()
 
 
+def test_unhandled_asset_transport_failure_isolated_without_rebuilding_runtime(tmp_path, monkeypatch):
+    class PolyApiExceptionLike(Exception):
+        status_code = None
+        error_message = "Request exception!"
+
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        settings = Settings(
+            dry_run=False,
+            assets=("BTC", "ETH", "XRP"),
+            out_dir=tmp_path / "out",
+            state_db=tmp_path / "state.sqlite3",
+        )
+        notifier = CaptureNotifier()
+        gateway = InstantGateway()
+        runtime_calls = []
+        worker_threads = []
+        asset_result_rounds = []
+
+        def live_runtime(*_args):
+            runtime_calls.append("runtime")
+            return gateway, OrderExecutor(settings, store, gateway=gateway)
+
+        def run_round_with_eth_transport_error(*, asset, **_kwargs):
+            worker_threads.append(threading.current_thread().name)
+            if asset == "ETH":
+                raise PolyApiExceptionLike()
+            return [runner_module.PostCloseDecision("hold", "%s_complete" % asset.lower())]
+
+        original_run_asset_rounds = runner_module._run_asset_rounds
+
+        def capture_asset_results(**kwargs):
+            results = original_run_asset_rounds(**kwargs)
+            asset_result_rounds.append(results)
+            return results
+
+        round_starts = iter((900, 1200))
+        monkeypatch.setattr(runner_module, "run_round", run_round_with_eth_transport_error)
+        monkeypatch.setattr(runner_module, "_run_asset_rounds", capture_asset_results)
+        _run_round_loop(
+            settings=settings,
+            store=store,
+            public=LivePublic(),
+            notifier=notifier,
+            forever=False,
+            rounds=2,
+            live_runtime_factory=live_runtime,
+            wait_for_next_boundary=lambda: next(round_starts),
+            sleep=lambda _seconds: None,
+        )
+
+        assert runtime_calls == ["runtime"]
+        assert len(asset_result_rounds) == 2
+        assert all(sorted(results) == ["BTC", "ETH", "XRP"] for results in asset_result_rounds)
+        assert all(thread.startswith("aftertake-asset") for thread in worker_threads)
+        for results in asset_result_rounds:
+            assert results["BTC"][-1].reason == "btc_complete"
+            assert results["XRP"][-1].reason == "xrp_complete"
+            assert (results["ETH"][-1].action, results["ETH"][-1].reason) == (
+                "hold",
+                "asset_round_transport_error",
+            )
+        assert notifier.messages == []
+        assert store._conn.execute(
+            "SELECT COUNT(*) FROM audit_events WHERE kind = 'round_runtime_error'"
+        ).fetchone()[0] == 0
+        audits = store._conn.execute(
+            """SELECT slug, payload_json FROM audit_events
+               WHERE kind = 'asset_transport_error' ORDER BY id"""
+        ).fetchall()
+        assert [audit["slug"] for audit in audits] == ["eth-updown-5m-900", "eth-updown-5m-1200"]
+        for audit in audits:
+            assert json.loads(audit["payload_json"]) == {
+                "asset": "ETH",
+                "error_message": "Request exception!",
+                "error_type": "PolyApiExceptionLike",
+                "phase": "asset_round_unhandled",
+                "slug": audit["slug"],
+                "status_code": None,
+            }
+    finally:
+        store.close()
+
+
 def test_configured_assets_do_not_block_each_other_by_position_or_cooldown(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     try:
