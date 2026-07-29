@@ -67,6 +67,7 @@ class Candidate:
 class ArrivalObservation:
     latency_ms: int
     observed_at: float
+    book_age_at_target_ms: float
     ask: Optional[float]
     ask_size: float
     fully_marketable: bool
@@ -99,6 +100,7 @@ class PassiveAssetProbe:
             for profile in self.profiles
         }
         self._last_callback_at: Optional[float] = None
+        self._last_book: Optional[PairedBook] = None
         self._metadata = MarketMetadata(
             condition_id="passive-latency-probe",
             tick_size="0.01",
@@ -125,7 +127,9 @@ class PassiveAssetProbe:
             if self._last_callback_at is not None and book.observed_at <= self._last_callback_at:
                 return
             previous = self._last_callback_at
+            previous_book = self._last_book
             self._last_callback_at = book.observed_at
+            self._last_book = book
             if self.round_end - PRE_CLOSE_CAPTURE_S <= book.observed_at <= self.round_end + POST_CLOSE_CAPTURE_S:
                 self.callback_rows.append(
                     {
@@ -147,7 +151,7 @@ class PassiveAssetProbe:
                 return
             for profile in self.profiles:
                 self._capture_candidate(profile, book)
-            self._observe_arrivals(book)
+            self._observe_arrivals(previous_book, book)
 
     def _capture_candidate(self, profile: Profile, book: PairedBook) -> None:
         if profile.name in self.candidates:
@@ -200,15 +204,22 @@ class PassiveAssetProbe:
             confirmation_source_timestamps=confirmation_sources,
         )
 
-    def _observe_arrivals(self, book: PairedBook) -> None:
+    def _observe_arrivals(self, previous_book: Optional[PairedBook], book: PairedBook) -> None:
         for profile, candidate in self.candidates.items():
             profile_arrivals = self.arrivals[profile]
             for latency_ms in self.latencies_ms:
                 if latency_ms in profile_arrivals:
                     continue
-                if book.observed_at < candidate.observed_at + latency_ms / 1000.0:
+                target = candidate.observed_at + latency_ms / 1000.0
+                if book.observed_at < target:
                     continue
-                side = book.yes if candidate.side == "YES" else book.no
+                # An order reaching the venue at ``target`` sees the latest
+                # local state already known at that time, not a later callback
+                # that happened to tell us the book changed afterwards.
+                arrival_book = book if book.observed_at <= target else previous_book
+                if arrival_book is None or arrival_book.observed_at < candidate.observed_at:
+                    continue
+                side = arrival_book.yes if candidate.side == "YES" else arrival_book.no
                 ask = side.best_ask
                 marketable = bool(
                     ask is not None
@@ -217,7 +228,8 @@ class PassiveAssetProbe:
                 )
                 profile_arrivals[latency_ms] = ArrivalObservation(
                     latency_ms=latency_ms,
-                    observed_at=book.observed_at,
+                    observed_at=arrival_book.observed_at,
+                    book_age_at_target_ms=round((target - arrival_book.observed_at) * 1000.0, 3),
                     ask=ask,
                     ask_size=side.ask_size,
                     fully_marketable=marketable,

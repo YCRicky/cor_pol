@@ -34,6 +34,15 @@ def _postclose_book(ts):
     )
 
 
+def _postclose_ask_removed_book(ts):
+    return PairedBook(
+        ts,
+        SideBook(0.35, 2, 2, 0.37, 100, 2),
+        SideBook(0.58, 100, 100, 0.95, 100, 100),
+        ts - 0.01,
+    )
+
+
 def test_passive_probe_records_candidate_and_simulated_arrival_without_orders():
     module = _probe_module()
     settings = Settings(dry_run=True, assets=("BTC",), asset="BTC")
@@ -55,7 +64,7 @@ def test_passive_probe_records_candidate_and_simulated_arrival_without_orders():
         _postclose_book(1_000.055),
         _postclose_book(1_000.170),
         _postclose_book(1_000.290),
-        _postclose_book(1_000.700),
+        _postclose_ask_removed_book(1_000.700),
     ):
         probe.on_book(book)
 
@@ -66,3 +75,5 @@ def test_passive_probe_records_candidate_and_simulated_arrival_without_orders():
     assert profile["candidate"]["side"] == "NO"
     assert profile["candidate"]["offset_ms"] == 290.0
     assert profile["simulated_arrivals"]["300"]["fully_marketable"] is True
+    assert profile["simulated_arrivals"]["300"]["observed_at"] == 1_000.29
+    assert profile["simulated_arrivals"]["300"]["ask"] == 0.85
