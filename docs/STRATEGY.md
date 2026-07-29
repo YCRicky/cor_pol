@@ -1,12 +1,12 @@
 # Aftertake strategy
 
-Aftertake is a V6.6 fast-confirmation post-frontend-close CLOB classifier,
+Aftertake is a V6.7 early-start persistent post-frontend-close CLOB classifier,
 not a price feed and not a pre-close direction predictor.
 
 Current strategy version:
 
 ```text
-aftertake_v6.6_fast_50ms_confirmation
+aftertake_v6.7_start_50ms_spacing_100ms
 ```
 
 ## Scene gate
@@ -30,7 +30,7 @@ in audit, but they are not hard rejections by themselves.
 ## Winner classifier
 
 Between T+50 ms and T+1000 ms after frontend close, the classifier requires
-three valid paired CLOB observations, each at least 50 ms apart, with the same
+three valid paired CLOB observations, each at least 100 ms apart, with the same
 post-close bid leader.
 
 The winning side must pass all five bid-support checks:
@@ -75,7 +75,7 @@ entry  = winner-side residual displayed ask still executable
 reject = cheap ask on the bid-vacuum/loser side
 ```
 
-A cheap ask on its own is never winner evidence. V6.6 has no blind entry-price
+A cheap ask on its own is never winner evidence. V6.7 has no blind entry-price
 cap; ask repricing is recorded as a feature first, not used as a hard reject.
 
 ## Live sizing

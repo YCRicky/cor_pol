@@ -56,8 +56,8 @@ DEFAULT_LATENCY_S = 0.970
 METHOD_VERSION = "aftertake_pmdata_local_arrival_v2"
 PROFILE_DEFINITIONS = (
     ("legacy_100_100_3", 0.100, 0.100, 3, "previous live profile"),
-    ("start_50_spacing_100_3", 0.050, 0.100, 3, "only open the window earlier"),
-    ("requested_50_50_3", 0.050, 0.050, 3, "requested production profile"),
+    ("requested_50_100_3", 0.050, 0.100, 3, "requested production profile"),
+    ("prior_50_50_3", 0.050, 0.050, 3, "previous 50ms-spacing profile"),
     ("exploratory_10_10_3", 0.010, 0.010, 3, "research-only faster profile"),
 )
 
