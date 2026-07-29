@@ -1,5 +1,6 @@
 import json
 import threading
+from pathlib import Path
 
 import aftertake.runner as runner_module
 from aftertake.config import Settings
@@ -833,6 +834,7 @@ def test_forever_runner_retries_a_live_pm_bootstrap_failure_without_exiting(tmp_
 def test_service_main_reports_boot_before_any_live_pm_connection(monkeypatch, tmp_path):
     settings = Settings(dry_run=False, order_type="GTC", out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3")
     notifier = CaptureNotifier()
+    code_sha = "b" * 40
 
     class NoLock:
         def __init__(self, _path):
@@ -848,18 +850,71 @@ def test_service_main_reports_boot_before_any_live_pm_connection(monkeypatch, tm
         assert len(notifier.messages) == 1
         assert notifier.messages[0].startswith(
             "[Aftertake] BOOT\nmode=LIVE qty=5.0000 assets=BTC,ETH,XRP,HYPE,DOGE,SOL\n"
+            f"pid=4242 code_sha={code_sha}\n"
             "multi-asset per-asset risk gates + SQLite recovery + CLOB V2 preflight\n"
         )
         assert "notification_ts_utc=" in notifier.messages[0]
         assert "notification_ts_ms=" in notifier.messages[0]
+        audit = _kwargs["store"]._conn.execute(
+            "SELECT payload_json FROM audit_events WHERE kind = 'boot' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert json.loads(audit["payload_json"])["pid"] == 4242
+        assert json.loads(audit["payload_json"])["code_sha"] == code_sha
 
     monkeypatch.setattr(runner_module.Settings, "from_env", staticmethod(lambda: settings))
     monkeypatch.setattr(runner_module, "RuntimeLock", NoLock)
     monkeypatch.setattr(runner_module, "PolymarketPublicClient", lambda **_kwargs: object())
     monkeypatch.setattr(runner_module, "Notifier", lambda **_kwargs: notifier)
+    monkeypatch.setattr(runner_module.os, "getpid", lambda: 4242)
+    monkeypatch.setattr(runner_module, "_resolve_code_sha", lambda: code_sha)
     monkeypatch.setattr(runner_module, "_run_round_loop", assert_boot_then_stop)
 
     assert runner_module.main(["--forever"]) == 0
+
+
+def _boot_source_file(tmp_path: Path) -> Path:
+    source_file = tmp_path / "src" / "aftertake" / "runner.py"
+    source_file.parent.mkdir(parents=True)
+    source_file.touch()
+    return source_file
+
+
+def test_resolve_code_sha_reads_direct_head_metadata(tmp_path):
+    source_file = _boot_source_file(tmp_path)
+    code_sha = "c" * 40
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+    (git_dir / "HEAD").write_text(f"{code_sha}\n", encoding="ascii")
+
+    assert runner_module._resolve_code_sha(source_file) == code_sha
+
+
+def test_resolve_code_sha_reads_in_tree_head_ref_metadata(tmp_path):
+    source_file = _boot_source_file(tmp_path)
+    code_sha = "d" * 64
+    git_dir = tmp_path / ".git"
+    ref_path = git_dir / "refs" / "heads" / "main"
+    ref_path.parent.mkdir(parents=True)
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="ascii")
+    ref_path.write_text(f"{code_sha}\n", encoding="ascii")
+
+    assert runner_module._resolve_code_sha(source_file) == code_sha
+
+
+def test_resolve_code_sha_returns_unknown_for_missing_malformed_or_unsafe_metadata(tmp_path):
+    source_file = _boot_source_file(tmp_path)
+
+    assert runner_module._resolve_code_sha(source_file) == "unknown"
+
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+    (git_dir / "HEAD").write_text("not-a-sha\n", encoding="ascii")
+    assert runner_module._resolve_code_sha(source_file) == "unknown"
+
+    outside_sha = "e" * 40
+    (tmp_path / "outside-ref").write_text(f"{outside_sha}\n", encoding="ascii")
+    (git_dir / "HEAD").write_text("ref: ../outside-ref\n", encoding="ascii")
+    assert runner_module._resolve_code_sha(source_file) == "unknown"
 
 
 def test_confirmed_open_fill_is_settled_from_pm_outcome(tmp_path):

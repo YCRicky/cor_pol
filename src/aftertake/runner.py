@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, replace
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .config import Settings
@@ -51,6 +53,31 @@ RUNTIME_RETRY_S = 5.0
 # websocket observation. Classifier confirmation spacing and all thresholds
 # remain in PostCloseConfig.
 POST_CLOSE_POLL_INTERVAL_S = 0.005
+
+
+def _resolve_code_sha(source_file: Optional[Path] = None) -> str:
+    """Return the checked-out revision for this installed source, if available."""
+
+    try:
+        repo_root = (source_file or Path(__file__)).resolve().parents[2]
+        git_dir = (repo_root / ".git").resolve()
+        head = (git_dir / "HEAD").read_text(encoding="ascii").strip()
+        if re.fullmatch(r"[0-9a-f]{40,64}", head, flags=re.IGNORECASE):
+            return head
+        if not head.startswith("ref: "):
+            return "unknown"
+
+        ref_name = head.removeprefix("ref: ").strip()
+        ref_path = (git_dir / ref_name).resolve()
+        try:
+            ref_path.relative_to(git_dir)
+        except ValueError:
+            return "unknown"
+
+        code_sha = ref_path.read_text(encoding="ascii").strip()
+        return code_sha if re.fullmatch(r"[0-9a-f]{40,64}", code_sha, flags=re.IGNORECASE) else "unknown"
+    except Exception:
+        return "unknown"
 
 
 def current_crypto_5m_slug(asset: str, now: Optional[int] = None) -> Tuple[str, int, int]:
@@ -1204,13 +1231,15 @@ def main(argv: Optional[List[str]] = None) -> int:
                     raise
                 print(json.dumps(result, indent=2, sort_keys=True))
                 return 0
-            _safe_notify(
-                notifier,
-                settings,
-                store,
-                "boot",
-                {"dry_run": settings.dry_run, "qty": settings.qty, "assets": list(settings.assets)},
-            )
+            boot_payload = {
+                "dry_run": settings.dry_run,
+                "qty": settings.qty,
+                "assets": list(settings.assets),
+                "pid": os.getpid(),
+                "code_sha": _resolve_code_sha(),
+            }
+            _audit(settings, store, "boot", boot_payload)
+            _safe_notify(notifier, settings, store, "boot", boot_payload)
             _run_round_loop(
                 settings=settings,
                 store=store,

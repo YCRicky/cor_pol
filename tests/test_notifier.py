@@ -204,12 +204,21 @@ def test_alert_formatter_expands_submit_exception_diagnostics():
 
 
 def test_boot_formatter_uses_multi_asset_wording():
+    code_sha = "a" * 40
     text = format_event(
         "boot",
-        {"dry_run": False, "qty": 5, "assets": ("BTC", "ETH", "XRP", "HYPE", "SOL")},
+        {
+            "dry_run": False,
+            "qty": 5,
+            "assets": ("BTC", "ETH", "XRP", "HYPE", "SOL"),
+            "pid": 4242,
+            "code_sha": code_sha,
+        },
     )
 
     assert "assets=BTC,ETH,XRP,HYPE,SOL" in text
+    assert "pid=4242" in text
+    assert f"code_sha={code_sha}" in text
     assert "multi-asset per-asset risk gates" in text
     assert "one-entry-per-market" not in text
 
