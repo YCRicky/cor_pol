@@ -4,7 +4,7 @@ Aftertake is a standalone multi-asset 5-minute Polymarket CLOB strategy. It does
 use a pre-close price-direction model or any outside price feed.
 
 At the market frontend close, it watches the official public CLOB book for
-100--1000 ms. A side becomes a winner candidate only when its bid support stays
+50--1000 ms. A side becomes a winner candidate only when its bid support stays
 persistent and the opposite side shows enough vacuum-score evidence. It may
 then take that same side only when a displayed residual ask is still executable.
 Dry-run keeps the configured quantity. Live mode sizes dynamically from the

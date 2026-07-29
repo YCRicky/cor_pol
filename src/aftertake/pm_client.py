@@ -466,7 +466,7 @@ class V2ClobGateway:
         """Submit exactly once for a sub-second post-close opportunity.
 
         The normal path deliberately retries a matching-engine restart.  That
-        delay is correct for ordinary entries but would turn a 100--1000ms
+        delay is correct for ordinary entries but would turn a 50--1000ms
         residual-ask attempt into a stale order.  The caller decides how to
         classify submit-path infrastructure failures; current Aftertake policy
         skips only the affected market and never globally freezes new entries.

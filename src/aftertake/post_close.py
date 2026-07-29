@@ -1,4 +1,4 @@
-"""V6.5 observation-calibrated post-close order-book winner classifier.
+"""V6.6 fast-confirmation post-close order-book winner classifier.
 
 This module deliberately has no HTTP, WebSocket, wallet, or notification
 dependencies.  It accepts only timestamped, executable CLOB book observations
@@ -15,7 +15,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
-STRATEGY_VERSION = "aftertake_v6.5_observation_calibrated_vacuum_score"
+STRATEGY_VERSION = "aftertake_v6.6_fast_50ms_confirmation"
 
 
 @dataclass(frozen=True)
@@ -49,7 +49,7 @@ class PairedBook:
 
 @dataclass(frozen=True)
 class PostCloseConfig:
-    """Fixed V6.5 observation-calibrated timing and score thresholds.
+    """Fixed V6.6 fast-confirmation timing and score thresholds.
 
     These are intentionally not environment switches. The thesis gates are
     versioned code so a dry-run cannot silently loosen into another strategy.
@@ -63,10 +63,10 @@ class PostCloseConfig:
     pre_close_bid_high: float = 0.80
     pre_close_max_edge: float = 0.12
     pre_close_max_bid_range: float = 0.08
-    post_close_start_s: float = 0.100
+    post_close_start_s: float = 0.050
     post_close_end_s: float = 1.000
     confirmations: int = 3
-    confirmation_spacing_s: float = 0.100
+    confirmation_spacing_s: float = 0.050
     near_touch_band: float = 0.02
     min_winner_bid: float = 0.50
     min_near_touch_qty_multiplier: float = 2.0
@@ -96,7 +96,7 @@ class PostCloseDecision:
 
 
 class PostCloseWinnerClassifier:
-    """Classify V6.5 winner-side support and scored loser vacuum after close.
+    """Classify V6.6 winner-side support and scored loser vacuum after close.
 
     Pre-close history is only the low-vol / price-to-beat ambiguity scene gate.
     Direction is selected only from the post-close L2 repricing sequence.
@@ -250,7 +250,7 @@ class PostCloseWinnerClassifier:
         if qty <= 0:
             raise ValueError("qty must be > 0")
         # Kept as an internal compatibility argument for historical replay
-        # callers. V6.5 has no entry-price environment cap.
+        # callers. V6.6 has no entry-price environment cap.
         del max_entry_ask
         start = float(round_end_ts) + self.cfg.post_close_start_s
         end = float(round_end_ts) + self.cfg.post_close_end_s
@@ -418,7 +418,7 @@ class PostCloseWinnerClassifier:
         audit["reject_reasons"] = []
         return PostCloseDecision(
             "enter",
-            "v65_observation_calibrated_support_vacuum_score",
+            "v66_fast_50ms_confirmation_support_vacuum_score",
             side=side,
             entry_ask=winner.best_ask,
             entry_ask_size=winner.ask_size,

@@ -277,7 +277,7 @@ def _required_cash(settings: Settings, metadata: MarketMetadata) -> float:
     Dynamic live sizing happens only after the residual ask is observed.  This
     pre-close check deliberately avoids the old fixed-qty/max-ask ceiling while
     still proving the account is not empty or approval-less before the critical
-    100--1000ms post-close window.
+    50--1000ms post-close window.
     """
 
     del settings
@@ -1165,7 +1165,7 @@ def _status_payload(settings: Settings, store: StateStore) -> Dict[str, Any]:
         "live_quantity_floor_step": settings.live_quantity_floor_step,
         "dry_run_simulated_balance": settings.dry_run_simulated_balance,
         "resolve_overrides_enabled": bool(parse_resolve_overrides(settings.resolve_overrides)),
-        "entry_window_ms": [100, 1000],
+        "entry_window_ms": [50, 1000],
         "confirmations": PostCloseConfig().confirmations,
         "max_daily_loss": settings.max_daily_loss,
         "max_open_positions": settings.max_open_positions,

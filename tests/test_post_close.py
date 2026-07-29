@@ -1,4 +1,10 @@
-from aftertake.post_close import STRATEGY_VERSION, PairedBook, PostCloseWinnerClassifier, SideBook
+from aftertake.post_close import (
+    STRATEGY_VERSION,
+    PairedBook,
+    PostCloseConfig,
+    PostCloseWinnerClassifier,
+    SideBook,
+)
 
 ROUND_END = 1_000.0
 
@@ -36,13 +42,21 @@ def classifier_with_v64_scene():
     return classifier
 
 
+def test_default_post_close_profile_is_the_requested_50ms_three_confirmation_profile():
+    cfg = PostCloseConfig()
+
+    assert cfg.post_close_start_s == 0.050
+    assert cfg.confirmations == 3
+    assert cfg.confirmation_spacing_s == 0.050
+
+
 def add_no_winner_sequence(classifier, *, no_ask=0.85, loser_ask=0.37, no_near=18.0, no_size=18.0):
     classifier.record(paired(1_000.10, 0.35, loser_ask, 0.58, no_ask, yes_size=2, no_size=no_size, yes_near=2, no_near=no_near))
     classifier.record(paired(1_000.22, 0.30, loser_ask, 0.60, no_ask, yes_size=2, no_size=no_size, yes_near=2, no_near=no_near))
     classifier.record(paired(1_000.35, 0.28, loser_ask, 0.61, no_ask, yes_size=2, no_size=no_size, yes_near=2, no_near=no_near))
 
 
-def test_v65_enters_after_support_and_scored_vacuum():
+def test_v66_enters_after_support_and_scored_vacuum():
     classifier = classifier_with_v64_scene()
     add_no_winner_sequence(classifier)
 
@@ -51,7 +65,7 @@ def test_v65_enters_after_support_and_scored_vacuum():
     assert decision.action == "enter"
     assert decision.side == "NO"
     assert decision.entry_ask == 0.85
-    assert decision.reason == "v65_observation_calibrated_support_vacuum_score"
+    assert decision.reason == "v66_fast_50ms_confirmation_support_vacuum_score"
     assert decision.audit["strategy_version"] == STRATEGY_VERSION
     assert decision.audit["support_score"] == decision.audit["support_required"] == 5
     assert decision.audit["vacuum_score"] >= decision.audit["vacuum_required"] == 3
@@ -94,7 +108,7 @@ def test_rejects_burst_quotes_without_persistence_spacing():
 def test_high_frequency_ticks_can_confirm_when_spaced_observations_exist():
     classifier = classifier_with_v64_scene()
     # Dense websocket ticks: the last three raw ticks are only 10ms apart, but
-    # there are valid observations spaced by >=100ms inside the post-close window.
+    # there are valid observations spaced by >=50ms inside the post-close window.
     for ts in (1_000.10, 1_000.11, 1_000.12, 1_000.22, 1_000.23, 1_000.24, 1_000.35, 1_000.36):
         classifier.record(paired(ts, 0.35, 0.37, 0.60, 0.85, yes_size=2, no_size=18, yes_near=2, no_near=18))
 
@@ -102,7 +116,7 @@ def test_high_frequency_ticks_can_confirm_when_spaced_observations_exist():
 
     assert decision.action == "enter"
     assert decision.audit["confirmation_timestamps"] == [1_000.12, 1_000.24, 1_000.36]
-    assert min(decision.audit["confirmation_spacing_s"]) >= 0.10
+    assert min(decision.audit["confirmation_spacing_s"]) >= 0.05
 
 
 def test_clean_terminal_preclose_is_observed_not_hard_rejected():
@@ -115,7 +129,7 @@ def test_clean_terminal_preclose_is_observed_not_hard_rejected():
     decision = classifier.evaluate(round_end_ts=ROUND_END, now_ts=1_000.35, qty=5.0, max_entry_ask=0.90)
 
     assert decision.action == "enter"
-    assert decision.reason == "v65_observation_calibrated_support_vacuum_score"
+    assert decision.reason == "v66_fast_50ms_confirmation_support_vacuum_score"
     assert decision.audit["preclose_scene_gate"] == "audit_only"
     assert decision.audit["preclose_scene_label"] == "directional_low_vol"
     assert "preclose_price_ambiguous_failed" in decision.audit["preclose_scene_warnings"]
@@ -133,7 +147,7 @@ def test_preclose_volatility_excessive_is_observed_not_hard_rejected():
     decision = classifier.evaluate(round_end_ts=ROUND_END, now_ts=1_000.35, qty=5.0, max_entry_ask=0.90)
 
     assert decision.action == "enter"
-    assert decision.reason == "v65_observation_calibrated_support_vacuum_score"
+    assert decision.reason == "v66_fast_50ms_confirmation_support_vacuum_score"
     assert decision.audit["preclose_scene_gate"] == "audit_only"
     assert "preclose_bid_volatility_excessive" in decision.audit["preclose_scene_warnings"]
 
@@ -169,7 +183,7 @@ def test_winner_residual_ask_reprice_is_observed_not_hard_rejected():
     decision = classifier.evaluate(round_end_ts=ROUND_END, now_ts=1_000.35, qty=5.0, max_entry_ask=0.90)
 
     assert decision.action == "enter"
-    assert decision.reason == "v65_observation_calibrated_support_vacuum_score"
+    assert decision.reason == "v66_fast_50ms_confirmation_support_vacuum_score"
     assert decision.audit["ask_reprice_observed"] > 0.01
 
 
@@ -206,7 +220,7 @@ def test_loser_bid_drop_is_scored_not_individually_mandatory():
     decision = classifier.evaluate(round_end_ts=ROUND_END, now_ts=1_000.35, qty=5.0, max_entry_ask=0.90)
 
     assert decision.action == "enter"
-    assert decision.reason == "v65_observation_calibrated_support_vacuum_score"
+    assert decision.reason == "v66_fast_50ms_confirmation_support_vacuum_score"
     assert decision.audit["vacuum_score"] >= decision.audit["vacuum_required"]
     assert "loser_bid_drop_insufficient" in decision.audit["vacuum_reject_components"]
 
@@ -218,6 +232,6 @@ def test_winner_residual_ask_cap_is_disabled_by_owner_override():
     decision = classifier.evaluate(round_end_ts=ROUND_END, now_ts=1_000.35, qty=5.0, max_entry_ask=0.01)
 
     assert decision.action == "enter"
-    assert decision.reason == "v65_observation_calibrated_support_vacuum_score"
+    assert decision.reason == "v66_fast_50ms_confirmation_support_vacuum_score"
     assert decision.entry_ask == 0.91
     assert decision.audit["ask_lag"]["entry_price_cap"] == "disabled"
