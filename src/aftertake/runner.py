@@ -39,12 +39,13 @@ from .pm_client import (
 )
 from .post_close import (
     STRATEGY_VERSION,
-    PostCloseConfig,
     PostCloseDecision,
     PostCloseWinnerClassifier,
+    active_classifier_config,
 )
 from .resolver import parse_resolve_overrides
 from .risk import RiskRejected, check_entry_risk
+from .rounds import CRYPTO_5M_WINDOW_S
 from .settlement import builder_fee_total, fee_total, settle_trade
 from .state import RuntimeLock, StateStore
 
@@ -84,11 +85,15 @@ def current_crypto_5m_slug(asset: str, now: Optional[int] = None) -> Tuple[str, 
     """Return the official current crypto 5m Gamma slug and its UTC boundaries."""
 
     timestamp = int(now if now is not None else time.time())
-    start = timestamp - timestamp % 300
+    start = timestamp - timestamp % CRYPTO_5M_WINDOW_S
     normalized = str(asset).lower().strip()
     if not normalized:
         raise ValueError("asset is required")
-    return "%s-updown-5m-%s" % (normalized, start), start, start + 300
+    return (
+        "%s-updown-5m-%s" % (normalized, start),
+        start,
+        start + CRYPTO_5M_WINDOW_S,
+    )
 
 
 def current_btc_5m_slug(now: Optional[int] = None) -> Tuple[str, int, int]:
@@ -181,7 +186,7 @@ def _audit_decision(
             "winner_bid": decision.winner_bid,
             "loser_bid": decision.loser_bid,
             "confirmations": decision.confirmations,
-            "strategy": STRATEGY_VERSION,
+            "strategy": (decision.audit or {}).get("strategy_version", STRATEGY_VERSION),
             "audit": decision.audit,
         },
         slug,
@@ -460,7 +465,7 @@ def run_round(
     yes_token = market.token_for_side("YES")
     no_token = market.token_for_side("NO")
     metadata = _build_dry_metadata(market)
-    classifier_cfg = PostCloseConfig()
+    classifier_cfg = active_classifier_config()
     classifier = PostCloseWinnerClassifier(classifier_cfg)
     notifier = notifier or Notifier(token=settings.telegram_token, chat_id=settings.telegram_chat_id)
     stream = stream_factory(
@@ -543,7 +548,7 @@ def run_round(
                     break
                 preflight_done = True
                 continue
-            if now > round_end + 1.0:
+            if now > round_end + classifier_cfg.post_close_end_s:
                 if not decisions:
                     decisions.append(PostCloseDecision("hold", "post_close_window_expired"))
                 break
@@ -650,7 +655,9 @@ def run_round(
                     "entry_result",
                     {
                         **asdict(result),
-                        "strategy": STRATEGY_VERSION,
+                        "strategy": (decision.audit or {}).get(
+                            "strategy_version", STRATEGY_VERSION
+                        ),
                         "winner_bid": decision.winner_bid,
                         "loser_bid": decision.loser_bid,
                         "confirmations": decision.confirmations,
@@ -795,7 +802,11 @@ def _select_next_round_start(
     current = int(now)
     active_start = current - current % 300
     active_end = active_start + 300
-    minimum_lead_s = PostCloseConfig().pre_close_window_s + PostCloseConfig().pre_close_latest_max_age_s
+    classifier_cfg = active_classifier_config()
+    minimum_lead_s = (
+        classifier_cfg.pre_close_window_s
+        + classifier_cfg.pre_close_latest_max_age_s
+    )
     if active_start not in processed_round_starts and active_end - float(now) >= minimum_lead_s:
         return active_start
     next_start = active_start + 300
@@ -1156,8 +1167,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _status_payload(settings: Settings, store: StateStore) -> Dict[str, Any]:
+    classifier_cfg = active_classifier_config()
     return {
-        "strategy": STRATEGY_VERSION,
+        "strategy": classifier_cfg.strategy_version,
         "dry_run": settings.dry_run,
         "qty": settings.qty,
         "assets": list(settings.assets),
@@ -1165,8 +1177,16 @@ def _status_payload(settings: Settings, store: StateStore) -> Dict[str, Any]:
         "live_quantity_floor_step": settings.live_quantity_floor_step,
         "dry_run_simulated_balance": settings.dry_run_simulated_balance,
         "resolve_overrides_enabled": bool(parse_resolve_overrides(settings.resolve_overrides)),
-        "entry_window_ms": [50, 1000],
-        "confirmations": PostCloseConfig().confirmations,
+        "entry_window_ms": [
+            int(classifier_cfg.post_close_start_s * 1000),
+            int(classifier_cfg.post_close_end_s * 1000),
+        ],
+        "confirmations": classifier_cfg.confirmations,
+        "confirmation_spacing_ms": int(
+            classifier_cfg.confirmation_spacing_s * 1000
+        ),
+        "require_loser_refill_failure": classifier_cfg.require_loser_refill_failure,
+        "require_stable_post_close_leader": classifier_cfg.require_stable_post_close_leader,
         "max_daily_loss": settings.max_daily_loss,
         "max_open_positions": settings.max_open_positions,
         "max_consecutive_losses": settings.max_consecutive_losses,

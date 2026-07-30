@@ -49,12 +49,13 @@ from aftertake.post_close import (
     SideBook,
     classifier_family_config,
 )
+from aftertake.rounds import crypto_5m_bounds_from_slug
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BASE_ROUND = 1_784_332_800
 DEFAULT_COUNT = 100
 DEFAULT_LATENCY_S = 0.970
-METHOD_VERSION = "aftertake_pmdata_local_arrival_v3_v67_vs_v7"
+METHOD_VERSION = "aftertake_pmdata_local_arrival_v4_close_boundary"
 PROFILE_DEFINITIONS = (
     (
         "v67_current_50_100_3",
@@ -82,6 +83,15 @@ PROFILE_DEFINITIONS = (
         2,
         "v7",
         "research sensitivity with weaker vacuum score",
+    ),
+    (
+        "v8_clob_refill_guard_250ms",
+        0.050,
+        0.0,
+        2,
+        3,
+        "v8",
+        "CLOB-only hard loser-refill guard inside the first 250 ms",
     ),
 )
 
@@ -412,7 +422,7 @@ def _market_record(
     sizing_cfg: ReplaySizing,
     fingerprint: str,
 ) -> dict[str, Any]:
-    round_end = int(slug.rsplit("-", 1)[1])
+    round_start, round_end = crypto_5m_bounds_from_slug(slug)
     source = _download(slug, cache, key)
     frame = pd.read_parquet(source)
     required = {"timestamp", "local_timestamp", "event_type", "winning_outcome"}
@@ -431,12 +441,15 @@ def _market_record(
             previous = book.observed_at
     records: list[dict[str, Any]] = []
     for profile in _profiles():
+        profile_cfg = _profile_config(profile)
         signal = _run_profile(profile, monotonic_books, round_end, sizing_cfg)
         row: dict[str, Any] = {
             "slug": slug,
+            "round_start": round_start,
             "round_end": round_end,
             "profile": profile.name,
             "profile_start_ms": int(profile.start_s * 1000),
+            "profile_end_ms": int(profile_cfg.post_close_end_s * 1000),
             "profile_spacing_ms": int(profile.spacing_s * 1000),
             "profile_confirmations": profile.confirmations,
             "profile_vacuum_required": profile.vacuum_required,
@@ -498,14 +511,29 @@ def _summary(rows: list[dict[str, Any]], latency_s: float, sizing_cfg: ReplaySiz
         signals = [row for row in subset if row.get("signal")]
         complete = [row for row in signals if row.get("arrival_complete")]
         fillable = [row for row in complete if row.get("fillable_proxy")]
+        labelled_signals = [row for row in signals if row.get("outcome_labelled")]
         settled = [row for row in fillable if row.get("outcome_labelled")]
         pnl = [float(row["pnl_proxy_usd"]) for row in settled if row.get("pnl_proxy_usd") is not None]
+        direction_hits = sum(
+            row.get("signal_side") == row.get("winning_side")
+            for row in labelled_signals
+        )
         profiles[profile.name] = {
             **asdict(profile),
+            "post_close_end_ms": int(
+                _profile_config(profile).post_close_end_s * 1000
+            ),
             "markets": len(subset),
             "signals": len(signals),
             "median_signal_offset_ms": round(float(pd.Series([row["signal_offset_ms"] for row in signals]).median()), 3) if signals else None,
             "arrival_horizon_complete": len(complete),
+            "outcome_labelled_signals": len(labelled_signals),
+            "direction_hits_of_signals": direction_hits,
+            "direction_hit_rate_of_signals": (
+                round(direction_hits / len(labelled_signals), 6)
+                if labelled_signals
+                else None
+            ),
             "displayed_marketable_proxies": len(fillable),
             "displayed_marketable_rate_of_signals": round(len(fillable) / len(signals), 6) if signals else None,
             "outcome_labelled_marketable_proxies": len(settled),

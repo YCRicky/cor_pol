@@ -24,6 +24,7 @@ from typing import Any
 import pandas as pd
 
 from aftertake.post_close import PairedBook, PostCloseWinnerClassifier, SideBook
+from aftertake.rounds import crypto_5m_bounds_from_slug
 
 ROOT = Path("/Users/fatsolerc/.local/share/aftertake")
 CACHE = ROOT / "pmdata_cache"
@@ -250,7 +251,7 @@ def replay_slice(df: pd.DataFrame, round_end: int) -> pd.DataFrame:
 def analyze_market(slug: str, key: str, qty: float) -> dict[str, Any]:
     parquet = download_l2(slug, key)
     df = pd.read_parquet(parquet)
-    round_end = int(slug.rsplit("-", 1)[1])
+    round_start, round_end = crypto_5m_bounds_from_slug(slug)
     winning_side = outcome_to_side([str(v) for v in df["winning_outcome"].dropna().unique().tolist()])
     df_slice = replay_slice(df, round_end)
     reconstructed = list(iter_reconstructed_books(df_slice))
@@ -310,6 +311,7 @@ def analyze_market(slug: str, key: str, qty: float) -> dict[str, Any]:
 
     return {
         "slug": slug,
+        "round_start_utc": pd.to_datetime(round_start, unit="s").isoformat(),
         "round_end_utc": pd.to_datetime(round_end, unit="s").isoformat(),
         "rows_total": int(len(df)),
         "reconstructed_events": len(reconstructed),

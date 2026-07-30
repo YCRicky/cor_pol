@@ -41,6 +41,7 @@ PROFILE_DEFINITIONS = (
     ("v67_current_50_100_3", 0.050, 0.100, 3, "v67"),
     ("v67_prior_50_050_3", 0.050, 0.050, 3, "v67"),
     ("v7_event_vacuum3", 0.050, 0.0, 2, "v7"),
+    ("v8_clob_refill_guard_250ms", 0.050, 0.0, 2, "v8"),
 )
 
 

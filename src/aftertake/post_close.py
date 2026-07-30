@@ -1,4 +1,4 @@
-"""V7 event-driven post-close residual-liquidity classifier.
+"""Event-driven post-close residual-liquidity classifiers.
 
 This module deliberately has no HTTP, WebSocket, wallet, or notification
 dependencies.  It accepts only timestamped, executable CLOB book observations
@@ -15,7 +15,10 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
-STRATEGY_VERSION = "aftertake_v7_event_driven_one_sided_vacuum"
+V7_STRATEGY_VERSION = "aftertake_v7_event_driven_one_sided_vacuum"
+V8_STRATEGY_VERSION = "aftertake_v8_clob_refill_guard_250ms"
+ACTIVE_CLASSIFIER_FAMILY = "v8"
+STRATEGY_VERSION = V8_STRATEGY_VERSION
 
 
 @dataclass(frozen=True)
@@ -91,11 +94,13 @@ class PostCloseConfig:
     support_score_required: int = 5
     vacuum_score_required: int = 3
     history_size: int = 4096
-    strategy_version: str = STRATEGY_VERSION
+    strategy_version: str = V7_STRATEGY_VERSION
     entry_reason: str = "v7_event_driven_one_sided_vacuum"
     allow_one_sided_loser_bid: bool = True
     distinct_evidence_confirmations: bool = True
     require_fresh_paired_post_close: bool = True
+    require_loser_refill_failure: bool = False
+    require_stable_post_close_leader: bool = False
 
 
 def legacy_v67_config() -> PostCloseConfig:
@@ -119,7 +124,21 @@ def classifier_family_config(family: str) -> PostCloseConfig:
         return legacy_v67_config()
     if family == "v7":
         return PostCloseConfig()
+    if family == "v8":
+        return PostCloseConfig(
+            post_close_end_s=0.250,
+            strategy_version=V8_STRATEGY_VERSION,
+            entry_reason="v8_clob_refill_guard_250ms",
+            require_loser_refill_failure=True,
+            require_stable_post_close_leader=True,
+        )
     raise ValueError(f"unknown Aftertake classifier family: {family!r}")
+
+
+def active_classifier_config() -> PostCloseConfig:
+    """Return the immutable classifier profile selected for the live runner."""
+
+    return classifier_family_config(ACTIVE_CLASSIFIER_FAMILY)
 
 
 @dataclass(frozen=True)
@@ -386,6 +405,23 @@ class PostCloseWinnerClassifier:
             return self._hold("bid_support_not_persistent", audit, confirmations=len(confirmed))
 
         side = leaders[-1]
+        leader_path = []
+        for book in post:
+            leader = self._leader(book)
+            if leader:
+                leader_path.append(leader)
+        audit["postclose_leader_path"] = leader_path
+        if (
+            self.cfg.require_stable_post_close_leader
+            and leader_path
+            and any(leader != leader_path[0] for leader in leader_path)
+        ):
+            return self._hold(
+                "post_close_leader_reversed",
+                audit,
+                side=side,
+                confirmations=len(confirmed),
+            )
         opposite = "NO" if side == "YES" else "YES"
         latest = confirmed[-1]
         winner, loser = self._side(latest, side)
@@ -480,6 +516,13 @@ class PostCloseWinnerClassifier:
             if not ok
         ]
         audit["vacuum_reject_components"] = vacuum_reject_components
+        if self.cfg.require_loser_refill_failure and not loser_refill_failure_ok:
+            return self._hold(
+                "loser_bid_refilled",
+                audit,
+                side=side,
+                confirmations=len(confirmed),
+            )
         if vacuum_score < self.cfg.vacuum_score_required:
             reason = vacuum_reject_components[0] if vacuum_reject_components else "loser_vacuum_score_insufficient"
             return self._hold(reason, audit, side=side, confirmations=len(confirmed))

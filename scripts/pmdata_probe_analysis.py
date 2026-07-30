@@ -6,6 +6,7 @@ from pathlib import Path
 import pandas as pd
 
 from aftertake.post_close import PairedBook, PostCloseWinnerClassifier, SideBook
+from aftertake.rounds import crypto_5m_bounds_from_slug
 
 
 def load_pmdata_key() -> str:
@@ -123,7 +124,7 @@ def analyze_slug(slug: str) -> dict:
     parquet_path = download_l2(slug, key)
     df = pd.read_parquet(parquet_path)
     books = df[df["event_type"].eq("book")].copy()
-    round_end = int(slug.rsplit("-", 1)[1])
+    round_start, round_end = crypto_5m_bounds_from_slug(slug)
     start = pd.to_datetime(round_end - 10, unit="s")
     end = pd.to_datetime(round_end + 1, unit="s")
     window = books[(books["timestamp"] >= start) & (books["timestamp"] <= end)]
@@ -144,6 +145,7 @@ def analyze_slug(slug: str) -> dict:
         "reconstructed_book_events_total": int(len(all_books)),
         "window_book_snapshots": int(len(window)),
         "window_reconstructed_events": int(len(window_books)),
+        "round_start_utc": pd.to_datetime(round_start, unit="s").isoformat(),
         "round_end_utc": pd.to_datetime(round_end, unit="s").isoformat(),
         "time_min": str(df["timestamp"].min()),
         "time_max": str(df["timestamp"].max()),

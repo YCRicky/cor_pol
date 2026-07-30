@@ -1,12 +1,12 @@
 # Aftertake strategy
 
-Aftertake is a V7 event-driven post-frontend-close CLOB classifier,
+Aftertake is a V8 event-driven post-frontend-close CLOB classifier,
 not a price feed and not a pre-close direction predictor.
 
 Current strategy version:
 
 ```text
-aftertake_v7_event_driven_one_sided_vacuum
+aftertake_v8_clob_refill_guard_250ms
 ```
 
 ## Scene gate
@@ -29,11 +29,15 @@ in audit, but they are not hard rejections by themselves.
 
 ## Winner classifier
 
-Between T+50 ms and T+1000 ms after frontend close, both outcome-token books
+Between T+50 ms and T+250 ms after frontend close, both outcome-token books
 must first have a fresh post-close update. The classifier then requires two
 distinct executable top/depth states with the same post-close leader. There is
 no fixed 100 ms sleep: identical repeated snapshots do not count, but a real
 book transition can confirm immediately.
+
+V8 locks to the first observable post-close leader. If the leader reverses at
+any time inside the decision sequence, the round is permanently rejected. This
+prevents a later reversal from being mistaken for the initial close reaction.
 
 If exactly one side still has a bid, that supported side is the leader and the
 missing opposite bid is strong vacuum evidence. If both bids are absent or
@@ -48,8 +52,8 @@ The winning side must pass all five bid-support checks:
 4. Winner bid does not materially decay.
 5. Winner near-touch depth is retained or refilled.
 
-The opposite side is now scored instead of requiring all vacuum components as
-hard gates. Vacuum evidence includes:
+The opposite side retains a four-component vacuum score. Vacuum evidence
+includes:
 
 1. Bid drops from the latest pre-close ambiguous book.
 2. Near-touch depth decays from the latest pre-close baseline.
@@ -62,11 +66,15 @@ Runtime thresholds:
 ```text
 winner_support_score = 5 required
 loser_vacuum_score >= 3 allows dry-run/live entry evaluation
+loser_refill_failure = mandatory
+post_close_leader_reversal = mandatory rejection
 ```
 
-The vacuum>=2 variant remains research-only. On the 100-market V7 replay it
-raised signal count but reduced direction hit rate to 69.8%, versus 80.0% for
-vacuum>=3.
+The vacuum>=2 variant remains research-only. In the corrected 100-market
+close-boundary replay it produced 10 signals with 9 correct directions. V7
+vacuum>=3 produced 7 signals with 6 correct directions. V8 removed the one V7
+error and produced 6/6 observed directions, but six signals are not enough to
+claim future 100% accuracy.
 
 The archived PMData replay reconstructs one token from the binary complement of
 the other. It therefore cannot show a missing loser bid while preserving an
@@ -85,7 +93,7 @@ entry  = winner-side residual displayed ask still executable
 reject = cheap ask on the bid-vacuum/loser side
 ```
 
-A cheap ask on its own is never winner evidence. V7 has no blind entry-price
+A cheap ask on its own is never winner evidence. V8 has no blind entry-price
 cap; ask repricing is recorded as a feature first, not used as a hard reject.
 
 ## Live sizing

@@ -2,10 +2,12 @@ import pytest
 
 from aftertake.post_close import (
     STRATEGY_VERSION,
+    V7_STRATEGY_VERSION,
     PairedBook,
     PostCloseConfig,
     PostCloseWinnerClassifier,
     SideBook,
+    active_classifier_config,
     classifier_family_config,
     legacy_v67_config,
 )
@@ -58,6 +60,18 @@ def test_default_post_close_profile_is_v7_event_driven_two_confirmation_profile(
     assert cfg.confirmation_spacing_s == 0.0
 
 
+def test_active_post_close_profile_is_v8_clob_refill_guard():
+    cfg = active_classifier_config()
+
+    assert cfg.strategy_version == STRATEGY_VERSION
+    assert cfg.post_close_start_s == 0.050
+    assert cfg.post_close_end_s == 0.250
+    assert cfg.confirmations == 2
+    assert cfg.confirmation_spacing_s == 0.0
+    assert cfg.require_loser_refill_failure is True
+    assert cfg.require_stable_post_close_leader is True
+
+
 def test_classifier_family_config_rejects_unknown_family():
     with pytest.raises(ValueError, match="unknown Aftertake classifier family"):
         classifier_family_config("v77")
@@ -96,9 +110,94 @@ def test_v7_enters_after_support_and_scored_vacuum():
     assert decision.side == "NO"
     assert decision.entry_ask == 0.85
     assert decision.reason == "v7_event_driven_one_sided_vacuum"
-    assert decision.audit["strategy_version"] == STRATEGY_VERSION
+    assert decision.audit["strategy_version"] == V7_STRATEGY_VERSION
     assert decision.audit["support_score"] == decision.audit["support_required"] == 5
     assert decision.audit["vacuum_score"] >= decision.audit["vacuum_required"] == 3
+
+
+def test_v8_hard_blocks_candidate_while_loser_side_is_still_refilling():
+    books = (
+        paired(999.70, 0.47, 0.50, 0.51, 0.54, yes_near=100, no_near=100),
+        paired(999.82, 0.48, 0.51, 0.50, 0.53, yes_near=100, no_near=100),
+        paired(999.95, 0.50, 0.52, 0.48, 0.50, yes_near=100, no_near=100),
+        paired(
+            1_000.10,
+            0.34,
+            0.36,
+            0.64,
+            0.68,
+            yes_size=10,
+            no_size=15,
+            yes_near=113,
+            no_near=15,
+        ),
+        paired(
+            1_000.12,
+            0.32,
+            0.36,
+            0.64,
+            0.68,
+            yes_size=10,
+            no_size=15,
+            yes_near=37,
+            no_near=15,
+        ),
+    )
+    v7 = PostCloseWinnerClassifier(classifier_family_config("v7"))
+    v8 = PostCloseWinnerClassifier(classifier_family_config("v8"))
+    for book in books:
+        v7.record(book)
+        v8.record(book)
+
+    v7_decision = v7.evaluate(round_end_ts=ROUND_END, now_ts=1_000.12, qty=5.0)
+    v8_decision = v8.evaluate(round_end_ts=ROUND_END, now_ts=1_000.12, qty=5.0)
+
+    assert v7_decision.action == "enter"
+    assert v7_decision.audit["vacuum_score"] == 3
+    assert v7_decision.audit["vacuum_components"]["loser_refill_failure_ok"] is False
+    assert v8_decision.action == "hold"
+    assert v8_decision.reason == "loser_bid_refilled"
+
+
+def test_v8_does_not_classify_a_new_candidate_after_250ms():
+    classifier = PostCloseWinnerClassifier(classifier_family_config("v8"))
+    for book in (
+        paired(999.70, 0.47, 0.50, 0.51, 0.54, yes_near=18, no_near=18),
+        paired(999.82, 0.48, 0.51, 0.50, 0.53, yes_near=18, no_near=18),
+        paired(999.95, 0.49, 0.52, 0.50, 0.53, yes_near=18, no_near=18),
+        paired(1_000.30, 0.28, 0.37, 0.61, 0.85, yes_size=2, no_size=18, yes_near=2, no_near=18),
+        paired(1_000.32, 0.27, 0.37, 0.62, 0.85, yes_size=2, no_size=18, yes_near=2, no_near=18),
+    ):
+        classifier.record(book)
+
+    decision = classifier.evaluate(round_end_ts=ROUND_END, now_ts=1_000.32, qty=5.0)
+
+    assert decision.action == "hold"
+    assert decision.reason == "post_close_window_expired"
+
+
+def test_v8_abstains_after_the_initial_post_close_leader_reverses():
+    books = (
+        paired(999.70, 0.47, 0.50, 0.51, 0.54, yes_near=100, no_near=100),
+        paired(999.82, 0.48, 0.51, 0.50, 0.53, yes_near=100, no_near=100),
+        paired(999.95, 0.50, 0.52, 0.48, 0.50, yes_near=100, no_near=100),
+        paired(1_000.06, 0.64, 0.66, 0.30, 0.32, yes_near=100, no_near=10),
+        paired(1_000.10, 0.20, 0.22, 0.70, 0.75, yes_near=10, no_near=100),
+        paired(1_000.12, 0.18, 0.20, 0.72, 0.75, yes_near=8, no_near=100),
+    )
+    v7 = PostCloseWinnerClassifier(classifier_family_config("v7"))
+    v8 = PostCloseWinnerClassifier(classifier_family_config("v8"))
+    for book in books:
+        v7.record(book)
+        v8.record(book)
+
+    v7_decision = v7.evaluate(round_end_ts=ROUND_END, now_ts=1_000.12, qty=5.0)
+    v8_decision = v8.evaluate(round_end_ts=ROUND_END, now_ts=1_000.12, qty=5.0)
+
+    assert v7_decision.action == "enter"
+    assert v8_decision.action == "hold"
+    assert v8_decision.reason == "post_close_leader_reversed"
+    assert v8_decision.audit["postclose_leader_path"] == ["YES", "NO", "NO"]
 
 
 def test_one_sided_loser_bid_disappearance_is_strong_vacuum_evidence():

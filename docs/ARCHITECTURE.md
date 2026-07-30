@@ -8,7 +8,7 @@ Official public CLOB WebSocket (YES + NO paired books)
         |
         +--> pre-close contested/reversal scene gate
         |
-        +--> T+50..1000ms fresh-pair event-driven support / vacuum classifier
+        +--> T+50..250ms stable-leader + loser-refill-failure classifier
                               |
                               v
                winner-side residual ask + local risk check
