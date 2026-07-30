@@ -32,7 +32,7 @@ import os
 import time
 import urllib.error
 import urllib.request
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
@@ -47,18 +47,42 @@ from aftertake.post_close import (
     PostCloseDecision,
     PostCloseWinnerClassifier,
     SideBook,
+    classifier_family_config,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BASE_ROUND = 1_784_332_800
 DEFAULT_COUNT = 100
 DEFAULT_LATENCY_S = 0.970
-METHOD_VERSION = "aftertake_pmdata_local_arrival_v2"
+METHOD_VERSION = "aftertake_pmdata_local_arrival_v3_v67_vs_v7"
 PROFILE_DEFINITIONS = (
-    ("legacy_100_100_3", 0.100, 0.100, 3, "previous live profile"),
-    ("requested_50_100_3", 0.050, 0.100, 3, "requested production profile"),
-    ("prior_50_50_3", 0.050, 0.050, 3, "previous 50ms-spacing profile"),
-    ("exploratory_10_10_3", 0.010, 0.010, 3, "research-only faster profile"),
+    (
+        "v67_current_50_100_3",
+        0.050,
+        0.100,
+        3,
+        3,
+        "v67",
+        "current production classifier baseline",
+    ),
+    (
+        "v7_event_vacuum3",
+        0.050,
+        0.0,
+        2,
+        3,
+        "v7",
+        "event-driven one-sided-vacuum production candidate",
+    ),
+    (
+        "v7_event_vacuum2",
+        0.050,
+        0.0,
+        2,
+        2,
+        "v7",
+        "research sensitivity with weaker vacuum score",
+    ),
 )
 
 
@@ -68,6 +92,8 @@ class TimingProfile:
     start_s: float
     spacing_s: float
     confirmations: int
+    vacuum_required: int
+    classifier: str
     description: str
 
 
@@ -92,6 +118,16 @@ class ReplaySizing:
 
 def _profiles() -> tuple[TimingProfile, ...]:
     return tuple(TimingProfile(*values) for values in PROFILE_DEFINITIONS)
+
+
+def _profile_config(profile: TimingProfile) -> PostCloseConfig:
+    return replace(
+        classifier_family_config(profile.classifier),
+        post_close_start_s=profile.start_s,
+        confirmation_spacing_s=profile.spacing_s,
+        confirmations=profile.confirmations,
+        vacuum_score_required=profile.vacuum_required,
+    )
 
 
 def _finite_float(value: Any) -> Optional[float]:
@@ -146,7 +182,7 @@ def _paired_book(row: Any, yes_bids: dict[float, float], yes_asks: dict[float, f
     no_asks = {round(1.0 - price, 12): size for price, size in yes_bids.items()}
     yes = _side_book(yes_bids, yes_asks)
     no = _side_book(no_bids, no_asks)
-    if yes.best_bid is None or yes.best_ask is None or no.best_bid is None or no.best_ask is None:
+    if yes.best_bid is None and yes.best_ask is None:
         return None
     return PairedBook(observed_at=observed_at, source_timestamp=source_timestamp, yes=yes, no=no)
 
@@ -279,11 +315,7 @@ def _run_profile(
     round_end: int,
     sizing_cfg: ReplaySizing,
 ) -> Optional[Signal]:
-    cfg = PostCloseConfig(
-        post_close_start_s=profile.start_s,
-        confirmation_spacing_s=profile.spacing_s,
-        confirmations=profile.confirmations,
-    )
+    cfg = _profile_config(profile)
     classifier = PostCloseWinnerClassifier(cfg)
     for book in books:
         classifier.record(book)
@@ -346,18 +378,15 @@ def _pnl_proxy(signal: Signal, arrival: dict[str, Any], winning_side: str) -> tu
     return hit, (1.0 - price) * signal.qty if hit else -price * signal.qty
 
 
-def _load_key() -> str:
-    key = os.environ.get("PMDATA_API_KEY", "").strip()
-    if not key:
-        raise RuntimeError("PMDATA_API_KEY must be supplied only through this process environment")
-    return key
-
-
 def _download(slug: str, cache: Path, key: str) -> Path:
     cache.mkdir(parents=True, exist_ok=True)
     destination = cache / f"{slug}.parquet"
     if destination.exists() and destination.stat().st_size > 4:
         return destination
+    if not key:
+        raise RuntimeError(
+            f"{slug} is not cached; PMDATA_API_KEY must be supplied only through this process environment"
+        )
     request = urllib.request.Request(
         f"https://api.pmdata.dev/download/poly_l2/{slug}.parquet",
         headers={"User-Agent": "aftertake-profile-replay/1.0", "api_key": key},
@@ -410,6 +439,8 @@ def _market_record(
             "profile_start_ms": int(profile.start_s * 1000),
             "profile_spacing_ms": int(profile.spacing_s * 1000),
             "profile_confirmations": profile.confirmations,
+            "profile_vacuum_required": profile.vacuum_required,
+            "profile_classifier": profile.classifier,
             "winning_side": winning_side or None,
             "outcome_labelled": bool(winning_side),
             "reconstructed_callbacks": len(monotonic_books),
@@ -498,6 +529,7 @@ def _summary(rows: list[dict[str, Any]], latency_s: float, sizing_cfg: ReplaySiz
         "limitations": [
             "PMData local_timestamp is its collector receive time, not this EC2's receive time.",
             "NO depth is inferred from a single PMData book using the observed live top-of-book complement; it is not a raw second-token archive.",
+            "The complement reconstruction cannot simultaneously represent a missing loser bid and an executable winner ask; V7's one-sided-vacuum path is unit-tested but requires native two-token forward shadow validation.",
             "A displayed-marketability proxy is not an exchange acknowledgement, queue position, or fill.",
             "Unlabelled outcomes are excluded from hit and PnL proxy totals.",
             "Results cover BTC 5-minute slugs only unless the script is extended deliberately.",
@@ -520,8 +552,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--count", type=int, default=DEFAULT_COUNT)
     parser.add_argument("--latency-ms", type=float, default=DEFAULT_LATENCY_S * 1000)
     parser.add_argument("--cache-dir", type=Path, default=ROOT / "out" / "pmdata_profile_replay_cache")
-    parser.add_argument("--checkpoint", type=Path, default=ROOT / "out" / "aftertake_profile_replay_v2_100.checkpoint.jsonl")
-    parser.add_argument("--report-prefix", type=Path, default=ROOT / "out" / "aftertake_profile_replay_v2_100")
+    parser.add_argument("--checkpoint", type=Path, default=ROOT / "out" / "aftertake_v7_replay_100.checkpoint.jsonl")
+    parser.add_argument("--report-prefix", type=Path, default=ROOT / "out" / "aftertake_v7_replay_100")
     return parser.parse_args()
 
 
@@ -531,7 +563,7 @@ def main() -> int:
         raise SystemExit("--count must be > 0")
     if args.latency_ms < 0:
         raise SystemExit("--latency-ms must be >= 0")
-    key = _load_key()
+    key = os.environ.get("PMDATA_API_KEY", "").strip()
     latency_s = args.latency_ms / 1000.0
     settings = Settings.from_env()
     sizing_cfg = ReplaySizing(
@@ -543,6 +575,12 @@ def main() -> int:
     fingerprint_payload = {
         "method_version": METHOD_VERSION,
         "profiles": [asdict(profile) for profile in _profiles()],
+        "classifier_configs": {
+            profile.name: asdict(_profile_config(profile)) for profile in _profiles()
+        },
+        "classifier_source_sha256": hashlib.sha256(
+            (ROOT / "src" / "aftertake" / "post_close.py").read_bytes()
+        ).hexdigest(),
         "latency_s": latency_s,
         "sizing": asdict(sizing_cfg),
     }

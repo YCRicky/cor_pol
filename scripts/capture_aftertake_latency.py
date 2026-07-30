@@ -16,7 +16,7 @@ import math
 import statistics
 import threading
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -29,6 +29,7 @@ from aftertake.post_close import (
     PostCloseConfig,
     PostCloseDecision,
     PostCloseWinnerClassifier,
+    classifier_family_config,
 )
 from aftertake.runner import current_crypto_5m_slug
 
@@ -36,10 +37,10 @@ ROOT = Path(__file__).resolve().parents[1]
 PRE_CLOSE_CAPTURE_S = 12.0
 POST_CLOSE_CAPTURE_S = 2.5
 PROFILE_DEFINITIONS = (
-    ("legacy_100_100_3", 0.100, 0.100, 3),
-    ("production_50_100_3", 0.050, 0.100, 3),
-    ("shadow_50_075_3", 0.050, 0.075, 3),
-    ("shadow_50_050_3", 0.050, 0.050, 3),
+    ("v67_legacy_100_100_3", 0.100, 0.100, 3, "v67"),
+    ("v67_current_50_100_3", 0.050, 0.100, 3, "v67"),
+    ("v67_prior_50_050_3", 0.050, 0.050, 3, "v67"),
+    ("v7_event_vacuum3", 0.050, 0.0, 2, "v7"),
 )
 
 
@@ -49,6 +50,17 @@ class Profile:
     start_s: float
     spacing_s: float
     confirmations: int
+    classifier: str
+
+
+def _profile_config(profile: Profile) -> PostCloseConfig:
+    base = classifier_family_config(profile.classifier)
+    return replace(
+        base,
+        post_close_start_s=profile.start_s,
+        confirmation_spacing_s=profile.spacing_s,
+        confirmations=profile.confirmations,
+    )
 
 
 @dataclass(frozen=True)
@@ -90,13 +102,7 @@ class PassiveAssetProbe:
     def __post_init__(self) -> None:
         self._lock = threading.Lock()
         self._classifiers = {
-            profile.name: PostCloseWinnerClassifier(
-                PostCloseConfig(
-                    post_close_start_s=profile.start_s,
-                    confirmation_spacing_s=profile.spacing_s,
-                    confirmations=profile.confirmations,
-                )
-            )
+            profile.name: PostCloseWinnerClassifier(_profile_config(profile))
             for profile in self.profiles
         }
         self._last_callback_at: Optional[float] = None

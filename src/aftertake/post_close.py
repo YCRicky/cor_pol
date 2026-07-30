@@ -1,4 +1,4 @@
-"""V6.7 early-start persistent post-close order-book winner classifier.
+"""V7 event-driven post-close residual-liquidity classifier.
 
 This module deliberately has no HTTP, WebSocket, wallet, or notification
 dependencies.  It accepts only timestamped, executable CLOB book observations
@@ -15,7 +15,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
-STRATEGY_VERSION = "aftertake_v6.7_start_50ms_spacing_100ms"
+STRATEGY_VERSION = "aftertake_v7_event_driven_one_sided_vacuum"
 
 
 @dataclass(frozen=True)
@@ -45,11 +45,22 @@ class PairedBook:
     yes: SideBook
     no: SideBook
     source_timestamp: Optional[float] = None
+    yes_updated_at: Optional[float] = None
+    no_updated_at: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        # Deterministic fixtures and single-book historical reconstructions
+        # represent an atomic paired observation.  The live stream supplies
+        # separate timestamps so V7 can reject half-fresh paired snapshots.
+        if self.yes_updated_at is None:
+            object.__setattr__(self, "yes_updated_at", float(self.observed_at))
+        if self.no_updated_at is None:
+            object.__setattr__(self, "no_updated_at", float(self.observed_at))
 
 
 @dataclass(frozen=True)
 class PostCloseConfig:
-    """Fixed V6.7 early-start persistent timing and score thresholds.
+    """Fixed V7 event-driven timing and score thresholds.
 
     These are intentionally not environment switches. The thesis gates are
     versioned code so a dry-run cannot silently loosen into another strategy.
@@ -65,8 +76,8 @@ class PostCloseConfig:
     pre_close_max_bid_range: float = 0.08
     post_close_start_s: float = 0.050
     post_close_end_s: float = 1.000
-    confirmations: int = 3
-    confirmation_spacing_s: float = 0.100
+    confirmations: int = 2
+    confirmation_spacing_s: float = 0.0
     near_touch_band: float = 0.02
     min_winner_bid: float = 0.50
     min_near_touch_qty_multiplier: float = 2.0
@@ -80,6 +91,35 @@ class PostCloseConfig:
     support_score_required: int = 5
     vacuum_score_required: int = 3
     history_size: int = 4096
+    strategy_version: str = STRATEGY_VERSION
+    entry_reason: str = "v7_event_driven_one_sided_vacuum"
+    allow_one_sided_loser_bid: bool = True
+    distinct_evidence_confirmations: bool = True
+    require_fresh_paired_post_close: bool = True
+
+
+def legacy_v67_config() -> PostCloseConfig:
+    """Return the previous live classifier contract for controlled A/B replay."""
+
+    return PostCloseConfig(
+        confirmations=3,
+        confirmation_spacing_s=0.100,
+        strategy_version="aftertake_v6.7_start_50ms_spacing_100ms",
+        entry_reason="v67_start_50ms_spacing_100ms_support_vacuum_score",
+        allow_one_sided_loser_bid=False,
+        distinct_evidence_confirmations=False,
+        require_fresh_paired_post_close=False,
+    )
+
+
+def classifier_family_config(family: str) -> PostCloseConfig:
+    """Return a validated classifier-family baseline for experiments."""
+
+    if family == "v67":
+        return legacy_v67_config()
+    if family == "v7":
+        return PostCloseConfig()
+    raise ValueError(f"unknown Aftertake classifier family: {family!r}")
 
 
 @dataclass(frozen=True)
@@ -96,7 +136,7 @@ class PostCloseDecision:
 
 
 class PostCloseWinnerClassifier:
-    """Classify V6.7 winner-side support and scored loser vacuum after close.
+    """Classify V7 winner-side support and scored loser vacuum after close.
 
     Pre-close history is only the low-vol / price-to-beat ambiguity scene gate.
     Direction is selected only from the post-close L2 repricing sequence.
@@ -132,11 +172,21 @@ class PostCloseWinnerClassifier:
     def _book_valid(cls, book: PairedBook) -> bool:
         return math.isfinite(float(book.observed_at)) and cls._side_valid(book.yes) and cls._side_valid(book.no)
 
-    @staticmethod
-    def _leader(book: PairedBook) -> str:
+    def _leader(self, book: PairedBook) -> str:
         yes_bid = book.yes.best_bid
         no_bid = book.no.best_bid
-        if yes_bid is None or no_bid is None or yes_bid == no_bid:
+        if (
+            not self.cfg.allow_one_sided_loser_bid
+            and (yes_bid is None or no_bid is None)
+        ):
+            return ""
+        if yes_bid is None and no_bid is None:
+            return ""
+        if yes_bid is None:
+            return "NO"
+        if no_bid is None:
+            return "YES"
+        if yes_bid == no_bid:
             return ""
         return "YES" if yes_bid > no_bid else "NO"
 
@@ -157,9 +207,26 @@ class PostCloseWinnerClassifier:
             values.append(float(value) if value is not None else 0.0)
         return values
 
+    @staticmethod
+    def _evidence_signature(book: PairedBook) -> Tuple[Any, ...]:
+        """Return only executable/top-depth fields that can change the thesis."""
+
+        return (
+            book.yes.best_bid,
+            book.yes.bid_size,
+            book.yes.near_touch_bid_depth,
+            book.yes.best_ask,
+            book.yes.ask_size,
+            book.no.best_bid,
+            book.no.bid_size,
+            book.no.near_touch_bid_depth,
+            book.no.best_ask,
+            book.no.ask_size,
+        )
+
     def _base_audit(self, round_end_ts: float, now_ts: float, books: Tuple[PairedBook, ...]) -> Dict[str, Any]:
         return {
-            "strategy_version": STRATEGY_VERSION,
+            "strategy_version": self.cfg.strategy_version,
             "round_end_ts": float(round_end_ts),
             "now_ts": float(now_ts),
             "observations_total": len(books),
@@ -250,7 +317,7 @@ class PostCloseWinnerClassifier:
         if qty <= 0:
             raise ValueError("qty must be > 0")
         # Kept as an internal compatibility argument for historical replay
-        # callers. V6.7 has no entry-price environment cap.
+        # callers. V7 has no blind entry-price environment cap.
         del max_entry_ask
         start = float(round_end_ts) + self.cfg.post_close_start_s
         end = float(round_end_ts) + self.cfg.post_close_end_s
@@ -268,21 +335,42 @@ class PostCloseWinnerClassifier:
         if not scene_ok or pre_latest is None:
             return self._hold(scene_reason or "preclose_scene_failed", audit)
 
-        post = [book for book in books if start <= book.observed_at <= min(end, now_ts)]
-        audit["postclose_count"] = len(post)
+        post_all = [book for book in books if start <= book.observed_at <= min(end, now_ts)]
+        post = (
+            [
+                book
+                for book in post_all
+                if float(book.yes_updated_at or 0.0) >= float(round_end_ts)
+                and float(book.no_updated_at or 0.0) >= float(round_end_ts)
+            ]
+            if self.cfg.require_fresh_paired_post_close
+            else post_all
+        )
+        audit["postclose_count"] = len(post_all)
+        audit["fresh_paired_postclose_count"] = len(post)
+        if post_all and not post:
+            return self._hold("paired_post_close_state_not_fresh", audit)
         if len(post) < self.cfg.confirmations:
             return self._hold("insufficient_post_close_observations", audit, confirmations=len(post))
-        # Websocket updates can arrive many times per 100ms. Using the last N raw
-        # ticks makes persistence impossible in active books because the final
-        # ticks are often only milliseconds apart.  Select the latest observation
-        # and walk backward to find confirmations separated by the required
-        # spacing, so high-frequency books can still prove persistence.
+        # Websocket updates can arrive many times inside a few milliseconds.
+        # Walk backward from the latest state and count only evidence-changing
+        # executable states. Legacy replay can additionally require wall-clock
+        # spacing through its explicit compatibility config.
         confirmed_desc = [post[-1]]
         anchor_ts = post[-1].observed_at
+        anchor_signature = self._evidence_signature(post[-1])
         for book in reversed(post[:-1]):
-            if anchor_ts - book.observed_at >= self.cfg.confirmation_spacing_s:
+            signature = self._evidence_signature(book)
+            if (
+                anchor_ts - book.observed_at >= self.cfg.confirmation_spacing_s
+                and (
+                    not self.cfg.distinct_evidence_confirmations
+                    or signature != anchor_signature
+                )
+            ):
                 confirmed_desc.append(book)
                 anchor_ts = book.observed_at
+                anchor_signature = signature
                 if len(confirmed_desc) == self.cfg.confirmations:
                     break
         confirmed = list(reversed(confirmed_desc))
@@ -309,8 +397,8 @@ class PostCloseWinnerClassifier:
         audit["loser_near_touch_depth_series"] = self._series(confirmed, opposite, "near_touch_bid_depth")
         audit["winner_ask_series"] = self._series(confirmed, side, "best_ask")
 
-        if winner.best_bid is None or loser.best_bid is None:
-            return self._hold("post_close_bid_missing", audit, side=side, confirmations=len(confirmed))
+        if winner.best_bid is None:
+            return self._hold("winner_post_close_bid_missing", audit, side=side, confirmations=len(confirmed))
         if winner.best_ask is None:
             return self._hold("winner_residual_ask_missing", audit, side=side, confirmations=len(confirmed))
         if winner.best_bid >= winner.best_ask:
@@ -363,7 +451,8 @@ class PostCloseWinnerClassifier:
         pre_loser_depth = float(pre_loser.near_touch_bid_depth or pre_loser.bid_size or 0.0)
         loser_bid_drop = pre_loser_bid - loser_bids[-1]
         loser_depth_retention = (loser_depths[-1] / pre_loser_depth) if pre_loser_depth > 0 else 0.0
-        loser_bid_drop_ok = loser_bid_drop >= self.cfg.min_loser_bid_drop
+        loser_bid_missing = loser.best_bid is None
+        loser_bid_drop_ok = loser_bid_missing or loser_bid_drop >= self.cfg.min_loser_bid_drop
         loser_depth_decay_ok = pre_loser_depth <= 0 or loser_depth_retention <= self.cfg.max_loser_depth_retention
         loser_refill_failure_ok = max(loser_depths) <= max(qty, pre_loser_depth * self.cfg.max_loser_recovery_ratio)
         loser_no_reclaim_ok = all(lb <= wb - self.cfg.no_reclaim_gap for lb, wb in zip(loser_bids, winner_bids))
@@ -377,6 +466,7 @@ class PostCloseWinnerClassifier:
         audit["vacuum_components"] = vacuum_components
         audit["vacuum_score"] = vacuum_score
         audit["vacuum_required"] = self.cfg.vacuum_score_required
+        audit["loser_bid_missing"] = loser_bid_missing
         audit["loser_bid_drop"] = loser_bid_drop
         audit["loser_depth_retention"] = loser_depth_retention
         vacuum_reject_components = [
@@ -418,7 +508,7 @@ class PostCloseWinnerClassifier:
         audit["reject_reasons"] = []
         return PostCloseDecision(
             "enter",
-            "v67_start_50ms_spacing_100ms_support_vacuum_score",
+            self.cfg.entry_reason,
             side=side,
             entry_ask=winner.best_ask,
             entry_ask_size=winner.ask_size,

@@ -50,8 +50,8 @@ from .state import RuntimeLock, StateStore
 
 RUNTIME_RETRY_S = 5.0
 # This only bounds how long the runner waits to re-check an already-recorded
-# websocket observation. Classifier confirmation spacing and all thresholds
-# remain in PostCloseConfig.
+# websocket observation. Event confirmation and all thresholds remain in
+# PostCloseConfig.
 POST_CLOSE_POLL_INTERVAL_S = 0.005
 
 

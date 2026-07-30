@@ -31,6 +31,8 @@ def test_market_stream_builds_a_paired_book_from_official_book_and_price_change_
     assert len(snapshots) == 1
     assert snapshots[-1].yes.best_bid == 0.48
     assert snapshots[-1].no.best_ask == 0.52
+    assert snapshots[-1].yes_updated_at == 1_000.10
+    assert snapshots[-1].no_updated_at == 1_000.11
 
     stream.process_message(
         {
@@ -50,6 +52,8 @@ def test_market_stream_builds_a_paired_book_from_official_book_and_price_change_
     assert snapshots[-1].no.bid_depth == 40.0
     assert snapshots[-1].no.near_touch_bid_depth == 15.0
     assert snapshots[-1].source_timestamp == 1_780_000_250.0
+    assert snapshots[-1].yes_updated_at == 1_000.10
+    assert snapshots[-1].no_updated_at == 1_000.25
 
 
 def test_market_stream_removes_zero_sized_level_and_accepts_legacy_message_shape():

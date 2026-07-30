@@ -69,7 +69,7 @@ def test_passive_probe_records_candidate_and_simulated_arrival_without_orders():
         probe.on_book(book)
 
     report = probe.report()
-    profile = report["profiles"]["production_50_100_3"]
+    profile = report["profiles"]["v67_current_50_100_3"]
 
     assert report["capture"]["callbacks_total"] == 7
     assert profile["candidate"]["side"] == "NO"

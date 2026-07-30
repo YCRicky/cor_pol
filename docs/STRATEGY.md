@@ -1,12 +1,12 @@
 # Aftertake strategy
 
-Aftertake is a V6.7 early-start persistent post-frontend-close CLOB classifier,
+Aftertake is a V7 event-driven post-frontend-close CLOB classifier,
 not a price feed and not a pre-close direction predictor.
 
 Current strategy version:
 
 ```text
-aftertake_v6.7_start_50ms_spacing_100ms
+aftertake_v7_event_driven_one_sided_vacuum
 ```
 
 ## Scene gate
@@ -29,9 +29,15 @@ in audit, but they are not hard rejections by themselves.
 
 ## Winner classifier
 
-Between T+50 ms and T+1000 ms after frontend close, the classifier requires
-three valid paired CLOB observations, each at least 100 ms apart, with the same
-post-close bid leader.
+Between T+50 ms and T+1000 ms after frontend close, both outcome-token books
+must first have a fresh post-close update. The classifier then requires two
+distinct executable top/depth states with the same post-close leader. There is
+no fixed 100 ms sleep: identical repeated snapshots do not count, but a real
+book transition can confirm immediately.
+
+If exactly one side still has a bid, that supported side is the leader and the
+missing opposite bid is strong vacuum evidence. If both bids are absent or
+equal, direction remains unresolved and entry is rejected.
 
 The winning side must pass all five bid-support checks:
 
@@ -55,13 +61,17 @@ Runtime thresholds:
 
 ```text
 winner_support_score = 5 required
-loser_vacuum_score >= 2 records an observation candidate
 loser_vacuum_score >= 3 allows dry-run/live entry evaluation
 ```
 
-This reflects PMData replay: requiring vacuum 4/4 was too sparse and caused the
-strategy to miss the transition phase where residual winner-side asks still
-exist.
+The vacuum>=2 variant remains research-only. On the 100-market V7 replay it
+raised signal count but reduced direction hit rate to 69.8%, versus 80.0% for
+vacuum>=3.
+
+The archived PMData replay reconstructs one token from the binary complement of
+the other. It therefore cannot show a missing loser bid while preserving an
+executable winner ask. The one-sided-vacuum branch is covered by deterministic
+tests but still requires native paired-token forward shadow evidence.
 
 ## Entry
 
@@ -75,7 +85,7 @@ entry  = winner-side residual displayed ask still executable
 reject = cheap ask on the bid-vacuum/loser side
 ```
 
-A cheap ask on its own is never winner evidence. V6.7 has no blind entry-price
+A cheap ask on its own is never winner evidence. V7 has no blind entry-price
 cap; ask repricing is recorded as a feature first, not used as a hard reject.
 
 ## Live sizing
@@ -117,9 +127,9 @@ collateral allowance.
 Every classifier decision records a structured audit payload containing the
 strategy version, timing, pre-close scene features, post-close leader sequence,
 winner/loser bid series, near-touch depth series, support/vacuum scores,
-ask-lag measurements, thresholds, and reject reasons. Entry results additionally
-record displayed available size and the live sizing calculation when live mode is
-used.
+per-token freshness, missing-loser-bid evidence, ask-lag measurements,
+thresholds, and reject reasons. Entry results additionally record displayed
+available size and the live sizing calculation when live mode is used.
 
 The critical path deliberately has no REST book request and no Telegram call.
 Before close it has already completed market/account preflight. After

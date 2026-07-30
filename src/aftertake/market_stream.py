@@ -47,6 +47,7 @@ class _TokenBook:
     bids: Dict[float, float] = field(default_factory=dict)
     asks: Dict[float, float] = field(default_factory=dict)
     initialized: bool = False
+    updated_at: Optional[float] = None
 
     @staticmethod
     def _levels(rows: Iterable[Any]) -> Dict[float, float]:
@@ -61,21 +62,24 @@ class _TokenBook:
             levels[price] = size
         return levels
 
-    def replace(self, bids: Iterable[Any], asks: Iterable[Any]) -> None:
+    def replace(self, bids: Iterable[Any], asks: Iterable[Any], *, observed_at: float) -> None:
         self.bids = self._levels(bids)
         self.asks = self._levels(asks)
         self.initialized = True
+        self.updated_at = float(observed_at)
 
-    def change(self, side: str, price: Any, size: Any) -> None:
+    def change(self, side: str, price: Any, size: Any, *, observed_at: float) -> bool:
         parsed_price = _float(price)
         parsed_size = _float(size)
         if parsed_price is None or parsed_price <= 0 or parsed_size is None:
-            return
+            return False
         target = self.bids if str(side).upper() == "BUY" else self.asks
         if parsed_size <= 0:
             target.pop(parsed_price, None)
         else:
             target[parsed_price] = parsed_size
+        self.updated_at = float(observed_at)
+        return True
 
     def as_side_book(self, *, near_touch_band: float = 0.02) -> SideBook:
         best_bid = max(self.bids) if self.bids else None
@@ -232,7 +236,11 @@ class MarketBookStream:
             if event_type == "book":
                 token_id = _token_id(payload)
                 if token_id in self._books:
-                    self._books[token_id].replace(payload.get("bids") or [], payload.get("asks") or [])
+                    self._books[token_id].replace(
+                        payload.get("bids") or [],
+                        payload.get("asks") or [],
+                        observed_at=observed_at,
+                    )
                     changed = True
             elif event_type == "price_change":
                 default_token = _token_id(payload)
@@ -250,10 +258,15 @@ class MarketBookStream:
                     token_id = _token_id(change) or default_token
                     if token_id not in self._books:
                         continue
-                    self._books[token_id].change(
-                        str(change.get("side") or ""), change.get("price"), change.get("size")
+                    changed = (
+                        self._books[token_id].change(
+                            str(change.get("side") or ""),
+                            change.get("price"),
+                            change.get("size"),
+                            observed_at=observed_at,
+                        )
+                        or changed
                     )
-                    changed = True
             if not changed:
                 return
             yes = self._books[self.yes_token_id]
@@ -266,5 +279,7 @@ class MarketBookStream:
                 yes=yes.as_side_book(near_touch_band=self._near_touch_band),
                 no=no.as_side_book(near_touch_band=self._near_touch_band),
                 source_timestamp=timestamp,
+                yes_updated_at=yes.updated_at,
+                no_updated_at=no.updated_at,
             )
         self._on_book(snapshot)
