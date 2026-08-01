@@ -3,6 +3,7 @@ import time
 
 import pytest
 
+import aftertake.execution as execution_module
 from aftertake.config import Settings
 from aftertake.execution import HeartbeatLoop, OrderExecutor
 from aftertake.pm_client import MarketMetadata
@@ -115,6 +116,41 @@ def test_heartbeat_loop_keeps_delayed_success_and_adopts_returned_id():
     assert calls
     assert loop.heartbeat_id == "delayed-heartbeat-id"
     assert loop.last_success_at > 0
+
+
+def test_heartbeat_consumes_done_request_before_worker_thread_fully_exits(monkeypatch):
+    release_thread_exit = threading.Event()
+    request_threads = []
+    real_thread = threading.Thread
+
+    class SlowExitThread(real_thread):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            if self.name == "aftertake-heartbeat-request":
+                request_threads.append(self)
+
+        def run(self):
+            super().run()
+            if self.name == "aftertake-heartbeat-request":
+                release_thread_exit.wait(timeout=1.0)
+
+    class ThreadingProxy:
+        Event = threading.Event
+        Lock = threading.Lock
+        Thread = SlowExitThread
+
+    class Gateway:
+        def post_heartbeat(self, heartbeat_id=""):
+            return {"heartbeat_id": heartbeat_id or "completed-id"}
+
+    monkeypatch.setattr(execution_module, "threading", ThreadingProxy)
+    loop = HeartbeatLoop(Gateway(), 4.0)
+    try:
+        assert loop._post_heartbeat_bounded() == {"heartbeat_id": "completed-id"}
+    finally:
+        release_thread_exit.set()
+        for request_thread in request_threads:
+            request_thread.join(timeout=1.0)
 
 
 def test_heartbeat_hung_request_requests_one_process_restart_without_waiting_for_status(tmp_path):

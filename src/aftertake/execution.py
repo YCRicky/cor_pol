@@ -174,7 +174,7 @@ class HeartbeatLoop:
 
         with self._request_lock:
             if self._request_thread is not None:
-                if self._request_thread.is_alive():
+                if self._request_done is None or not self._request_done.is_set():
                     raise TimeoutError("previous heartbeat request is still in flight")
                 return self._consume_request_locked()
             done = threading.Event()
@@ -210,7 +210,16 @@ class HeartbeatLoop:
     def _consume_request_locked(self) -> Dict[str, Any]:
         """Consume exactly one completed request while ``_request_lock`` is held."""
 
-        if self._request_thread is None or self._request_thread.is_alive():
+        # ``done`` is published only after the request result/failure has been
+        # stored.  The worker Thread can remain ``is_alive()`` for a tiny
+        # scheduler window after setting the event; requiring full thread exit
+        # here falsely classified a completed heartbeat as a hung SDK call and
+        # restarted the entire service.
+        if (
+            self._request_thread is None
+            or self._request_done is None
+            or not self._request_done.is_set()
+        ):
             raise TimeoutError("previous heartbeat request is still in flight")
         failure = list(self._request_failure)
         result = dict(self._request_result)
