@@ -772,6 +772,44 @@ def test_asset_supervisor_returns_timeout_without_waiting_for_hung_worker(tmp_pa
         store.close()
 
 
+def test_asset_supervisor_budget_covers_remaining_active_round(tmp_path, monkeypatch):
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        settings = Settings(
+            dry_run=True,
+            assets=("BTC",),
+            out_dir=tmp_path / "out",
+            state_db=tmp_path / "state.sqlite3",
+        )
+        notifier = CaptureNotifier()
+        completed = threading.Event()
+
+        def round_that_reaches_close(*_args, **_kwargs):
+            # Simulate a service joining the 5m market 140s before its close.
+            time.sleep(0.08)
+            completed.set()
+            return [runner_module.PostCloseDecision("hold", "clean_round")]
+
+        monkeypatch.setattr(runner_module, "run_round", round_that_reaches_close)
+        monkeypatch.setattr(runner_module.time, "time", lambda: 1060.0)
+        results = _run_asset_rounds(
+            settings=settings,
+            store=store,
+            public=FakePublic(),
+            executor=OrderExecutor(settings, store),
+            live_gateway=None,
+            round_start=900,
+            timeout_s=0.02,
+            notifier=notifier,
+        )
+
+        assert completed.is_set()
+        assert results["BTC"][-1].reason == "clean_round"
+        assert notifier.messages == []
+    finally:
+        store.close()
+
+
 def test_runtime_watchdog_requests_process_restart_after_active_stall():
     exits = []
     watchdog = RuntimeWatchdog(stale_after_s=0.01, interval_s=0.001, exit_fn=exits.append)
@@ -789,6 +827,18 @@ def test_runtime_watchdog_does_not_restart_while_waiting_for_boundary():
     exits = []
     watchdog = RuntimeWatchdog(stale_after_s=0.01, interval_s=0.001, exit_fn=exits.append)
     watchdog.beat("waiting_for_round")
+    watchdog.start()
+    try:
+        time.sleep(0.03)
+        assert exits == []
+    finally:
+        watchdog.stop()
+
+
+def test_runtime_watchdog_does_not_restart_while_active_round_is_waiting():
+    exits = []
+    watchdog = RuntimeWatchdog(stale_after_s=0.01, interval_s=0.001, exit_fn=exits.append)
+    watchdog.beat("active_round")
     watchdog.start()
     try:
         time.sleep(0.03)

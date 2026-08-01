@@ -55,6 +55,10 @@ RUNTIME_RETRY_S = 5.0
 # resort for an SDK/socket call that ignores its own timeout; it must never
 # turn one asset into a permanently waiting multi-asset round.
 ASSET_ROUND_TIMEOUT_S = 90.0
+# Allow the active round to reach its close plus stream shutdown/reconciliation
+# even when the process joins it after the five-minute boundary.  The fixed
+# timeout remains the minimum bound for a worker that is already past its close.
+ASSET_ROUND_COMPLETION_GRACE_S = 10.0
 RUNTIME_STALL_TIMEOUT_S = 180.0
 RUNTIME_WATCHDOG_INTERVAL_S = 5.0
 # This only bounds how long the runner waits to re-check an already-recorded
@@ -117,9 +121,10 @@ class RuntimeWatchdog:
                 age = self._monotonic() - self._last_progress
                 stage = self._stage
             # The scheduler can legitimately sleep until the next five-minute
-            # boundary.  It is not a stalled external operation and therefore
-            # is explicitly exempt; active round/runtime stages are bounded.
-            if stage == "waiting_for_round":
+            # boundary, and an active round can legitimately wait for its
+            # post-close window. Both are bounded by their own round/asset
+            # supervisor; they are not proof of a process stall here.
+            if stage in {"waiting_for_round", "active_round"}:
                 continue
             if age >= self.stale_after_s:
                 self._exit_fn(1)
@@ -949,7 +954,21 @@ def _run_asset_rounds(
         for asset in assets
     }
     pending = set(futures)
-    deadline = time.monotonic() + max(0.01, float(timeout_s))
+    # ``_select_next_round_start`` intentionally joins an active market when
+    # enough pre-close lead remains.  A fixed 90-second deadline would then
+    # kill a perfectly healthy worker before that market closes (the exact
+    # failure mode seen after a mid-round service restart).  Budget through
+    # the round close plus a small cleanup margin, while retaining the fixed
+    # timeout as the minimum for already-expired/stuck rounds.
+    round_completion_s = (
+        float(round_start)
+        + CRYPTO_5M_WINDOW_S
+        + float(active_classifier_config().post_close_end_s)
+        + ASSET_ROUND_COMPLETION_GRACE_S
+        - time.time()
+    )
+    effective_timeout_s = max(0.01, float(timeout_s), round_completion_s)
+    deadline = time.monotonic() + effective_timeout_s
     try:
         while pending:
             remaining = max(0.0, deadline - time.monotonic())
@@ -959,7 +978,7 @@ def _run_asset_rounds(
                     asset = futures[future]
                     slug, _, _ = current_crypto_5m_slug(asset, round_start)
                     timeout_error = TimeoutError(
-                        "asset round exceeded supervisor timeout %.1fs" % float(timeout_s)
+                        "asset round exceeded supervisor timeout %.1fs" % effective_timeout_s
                     )
                     _audit_asset_transport_error(
                         settings,
