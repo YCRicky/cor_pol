@@ -18,6 +18,11 @@ from .resolver import ResolveOverrides, scoped_getaddrinfo
 MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 CONNECT_TIMEOUT_S = 2.0
 RECEIVE_TIMEOUT_S = 0.25
+PING_INTERVAL_S = 5.0
+PONG_TIMEOUT_S = 12.0
+RECONNECT_INITIAL_S = 0.5
+RECONNECT_MAX_S = 10.0
+RECONNECT_STABLE_S = 2.0
 
 
 def _float(value: Any) -> Optional[float]:
@@ -132,10 +137,20 @@ class MarketBookStream:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.last_error = ""
+        self.last_message_at = 0.0
+        self.reconnect_count = 0
+        self._generation = 0
 
     @property
     def ready(self) -> bool:
         return self._ready.is_set()
+
+    @property
+    def generation(self) -> int:
+        """Return the book generation; it changes whenever a reconnect resets state."""
+
+        with self._lock:
+            return self._generation
 
     def start(self) -> None:
         if self._thread is not None:
@@ -155,6 +170,7 @@ class MarketBookStream:
                 self.no_token_id: _TokenBook(),
             }
             self._ready.clear()
+            self._generation += 1
 
     def _run(self) -> None:
         try:
@@ -163,9 +179,11 @@ class MarketBookStream:
             self.last_error = "websocket-client dependency is not installed"
             return
 
+        reconnect_delay = RECONNECT_INITIAL_S
         while not self._stop.is_set():
             ws = None
             self._reset_books()
+            connection_started = time.monotonic()
             try:
                 # Use the official hostname and normal resolver/TLS path.
                 # A hard-coded CDN IP can drift and is not an acceptable
@@ -185,23 +203,41 @@ class MarketBookStream:
                         }
                     )
                 )
-                next_ping = time.monotonic() + 10.0
+                next_ping = time.monotonic() + PING_INTERVAL_S
+                pong_deadline: Optional[float] = None
                 while not self._stop.is_set():
-                    if time.monotonic() >= next_ping:
+                    now = time.monotonic()
+                    if pong_deadline is not None and now >= pong_deadline:
+                        raise RuntimeError("market stream heartbeat timeout")
+                    # Keep one outstanding keepalive deadline. Replacing it
+                    # on every 5-second tick would let a silent socket renew
+                    # its own deadline forever and defeat the watchdog.
+                    if pong_deadline is None and now >= next_ping:
                         ws.send("PING")
-                        next_ping = time.monotonic() + 10.0
+                        pong_deadline = now + PONG_TIMEOUT_S
+                        next_ping = now + PING_INTERVAL_S
                     try:
                         raw = ws.recv()
                     except websocket.WebSocketTimeoutException:
                         continue
                     if raw in (None, ""):
                         raise RuntimeError("market stream closed")
-                    if raw == "PONG":
+                    self.last_message_at = float(self._clock())
+                    self.last_error = ""
+                    # The provider may answer with a text PONG rather than a
+                    # WebSocket control frame. Any valid market message also
+                    # proves the TCP path is alive, so clear the watchdog.
+                    pong_deadline = None
+                    if isinstance(raw, str) and raw.upper() == "PONG":
                         continue
                     self.process_message(raw, received_at=float(self._clock()))
+                    if time.monotonic() - connection_started >= RECONNECT_STABLE_S:
+                        reconnect_delay = RECONNECT_INITIAL_S
             except Exception as exc:
                 self.last_error = "%s: %s" % (type(exc).__name__, str(exc))
-                self._stop.wait(0.20)
+                self.reconnect_count += 1
+                self._stop.wait(reconnect_delay)
+                reconnect_delay = min(RECONNECT_MAX_S, reconnect_delay * 2.0)
             finally:
                 if ws is not None:
                     try:

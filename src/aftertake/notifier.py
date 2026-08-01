@@ -169,6 +169,16 @@ def _format_event(kind: str, payload: Dict[str, Any], slug: str = "") -> str:
             "operator attached an order ID; authenticated identity check pending\n"
             f"order={payload['order_id']} intent={payload['intent_id']} slug={slug or 'unknown'}"
         )
+    if kind == "recovery_success":
+        lines = [
+            "[Aftertake] RECOVERY_SUCCESS",
+            f"component={_text(payload.get('component'), 'runtime')}",
+            f"reason={_text(payload.get('reason'), 'recovered')}",
+        ]
+        if payload.get("details") not in (None, ""):
+            lines.append(f"details={payload['details']}")
+        lines.append(f"slug={slug or 'runtime'}")
+        return "\n".join(lines)
     if kind == "entry":
         if payload.get("dry_run"):
             headline = "DRY_RUN_SIMULATED_TAKE"
@@ -243,7 +253,20 @@ def _format_event(kind: str, payload: Dict[str, Any], slug: str = "") -> str:
         )
     if kind == "alert":
         lines = ["[Aftertake] ALERT", f"reason={payload['reason']}"]
-        for key in ("error_type", "status_code", "error_hint", "order_type", "submission_state", "order_id"):
+        for key in (
+            "component",
+            "asset",
+            "phase",
+            "generation",
+            "reconnect_count",
+            "consecutive_failures",
+            "error_type",
+            "status_code",
+            "error_hint",
+            "order_type",
+            "submission_state",
+            "order_id",
+        ):
             value = payload.get(key)
             if value not in (None, ""):
                 lines.append(f"{key}={value}")

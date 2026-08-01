@@ -174,6 +174,17 @@ class PostCloseWinnerClassifier:
                 return
             self._books.append(book)
 
+    def reset(self) -> None:
+        """Discard observations from a dead WebSocket generation.
+
+        A reconnect starts from a fresh paired snapshot. Keeping the previous
+        generation in the deque would mix stale pre-close evidence with the
+        new stream and could make a later book look like a valid confirmation.
+        """
+
+        with self._lock:
+            self._books.clear()
+
     @staticmethod
     def _finite(value: Optional[float]) -> bool:
         return value is not None and math.isfinite(float(value))

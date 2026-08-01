@@ -3,7 +3,7 @@ import threading
 import pytest
 
 from aftertake.config import Settings
-from aftertake.execution import OrderExecutor
+from aftertake.execution import HeartbeatLoop, OrderExecutor
 from aftertake.pm_client import MarketMetadata
 from aftertake.state import StateStore
 
@@ -28,6 +28,67 @@ class NoopHeartbeat:
 
     def stop(self):
         return None
+
+
+def test_heartbeat_loop_adopts_replacement_id_from_invalid_id_response():
+    calls = []
+    recovered = threading.Event()
+    statuses = []
+
+    class InvalidHeartbeat(Exception):
+        status_code = 400
+        error_msg = {"heartbeat_id": "replacement-id", "error_msg": "Invalid Heartbeat ID"}
+
+    class Gateway:
+        def post_heartbeat(self, heartbeat_id=""):
+            calls.append(heartbeat_id)
+            if not heartbeat_id:
+                raise InvalidHeartbeat("request error")
+            recovered.set()
+            return {"heartbeat_id": heartbeat_id}
+
+    loop = HeartbeatLoop(Gateway(), 0.01)
+    loop.status_callback = lambda kind, payload: statuses.append((kind, payload))
+    loop.start()
+    try:
+        assert recovered.wait(1.0)
+    finally:
+        loop.stop()
+
+    assert calls[0] == ""
+    assert "replacement-id" in calls
+    assert loop.heartbeat_id == "replacement-id"
+    assert loop.last_error == ""
+    assert statuses[0][0] == "heartbeat_error"
+    assert statuses[0][1]["consecutive_failures"] == 1
+    assert statuses[0][1]["heartbeat_id"] == "replacement-id"
+    assert statuses[-1][0] == "heartbeat_recovered"
+
+
+def test_heartbeat_loop_bounds_and_does_not_overlap_a_hung_sdk_call():
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    class Gateway:
+        def post_heartbeat(self, heartbeat_id=""):
+            calls.append(heartbeat_id)
+            started.set()
+            release.wait(timeout=1.0)
+            return {"heartbeat_id": "h"}
+
+    loop = HeartbeatLoop(Gateway(), 0.01)
+    loop.start()
+    try:
+        assert started.wait(1.0)
+        # The first request is still in flight; a second call must not be
+        # started on every short interval and create an unbounded client pile.
+        threading.Event().wait(0.25)
+        assert len(calls) == 1
+        assert "timed out" in loop.last_error or "in flight" in loop.last_error
+    finally:
+        release.set()
+        loop.stop()
 
 
 class ConfirmingGateway:

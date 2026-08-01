@@ -1,6 +1,8 @@
 import sys
+import time
 from types import SimpleNamespace
 
+import aftertake.market_stream as market_stream_module
 from aftertake.market_stream import MarketBookStream
 
 
@@ -131,6 +133,55 @@ def test_market_stream_allows_a_realistic_handshake_then_restores_fast_receive_t
     stream._run()
 
     assert calls == {"connect_timeout": 2.0, "receive_timeout": 0.25}
+
+
+def test_market_stream_reconnects_after_a_silent_socket_heartbeat_timeout(monkeypatch):
+    stream = MarketBookStream(
+        yes_token_id="yes-token", no_token_id="no-token", on_book=lambda _snapshot: None
+    )
+    observed = []
+
+    class Timeout(Exception):
+        pass
+
+    class Socket:
+        def settimeout(self, _timeout):
+            return None
+
+        def send(self, payload):
+            observed.append(payload)
+
+        def recv(self):
+            raise Timeout("receive timeout")
+
+        def close(self):
+            return None
+
+    def create_connection(_url, timeout):
+        assert timeout == 2.0
+        return Socket()
+
+    # Non-zero intervals are important here: a buggy implementation that
+    # renews the deadline on every ping would otherwise appear healthy when
+    # both values are zero.
+    monkeypatch.setattr(market_stream_module, "PING_INTERVAL_S", 0.01)
+    monkeypatch.setattr(market_stream_module, "PONG_TIMEOUT_S", 0.03)
+    monkeypatch.setitem(
+        sys.modules,
+        "websocket",
+        SimpleNamespace(create_connection=create_connection, WebSocketTimeoutException=Timeout),
+    )
+
+    stream.start()
+    deadline = time.monotonic() + 1.5
+    while stream.generation < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    stream.close(timeout_s=1.0)
+
+    assert "market stream heartbeat timeout" in stream.last_error
+    assert stream.reconnect_count >= 1
+    assert stream.generation >= 2
+    assert "PING" in observed
 
 
 def test_market_stream_counts_only_near_touch_bid_depth():

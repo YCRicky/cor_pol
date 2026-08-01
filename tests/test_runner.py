@@ -1,5 +1,6 @@
 import json
 import threading
+import time
 from pathlib import Path
 
 import aftertake.runner as runner_module
@@ -16,6 +17,7 @@ from aftertake.pm_client import (
 from aftertake.post_close import PairedBook, SideBook
 from aftertake.risk import RiskRejected, check_entry_risk
 from aftertake.runner import (
+    RuntimeWatchdog,
     _probe_stream,
     _reconcile_startup,
     _run_asset_rounds,
@@ -578,7 +580,8 @@ def test_live_asset_transport_failure_isolated_without_rebuilding_runtime(tmp_pa
         assert sorted(asset_results) == ["BTC", "ETH", "XRP"]
         assert asset_results["ETH"][-1].reason == "market_metadata_transport_error"
         assert all(asset_results[asset] for asset in ("BTC", "XRP"))
-        assert notifier.messages == []
+        assert len(notifier.messages) == 1
+        assert all(message.startswith("[Aftertake] ALERT") for message in notifier.messages)
         audit = store._conn.execute(
             """SELECT slug, payload_json FROM audit_events
                WHERE kind = 'asset_transport_error' ORDER BY id DESC LIMIT 1"""
@@ -659,7 +662,8 @@ def test_unhandled_asset_transport_failure_isolated_without_rebuilding_runtime(t
                 "hold",
                 "asset_round_transport_error",
             )
-        assert notifier.messages == []
+        assert len(notifier.messages) == 2
+        assert all(message.startswith("[Aftertake] ALERT") for message in notifier.messages)
         assert store._conn.execute(
             "SELECT COUNT(*) FROM audit_events WHERE kind = 'round_runtime_error'"
         ).fetchone()[0] == 0
@@ -679,6 +683,118 @@ def test_unhandled_asset_transport_failure_isolated_without_rebuilding_runtime(t
             }
     finally:
         store.close()
+
+
+def test_asset_transport_error_sends_recovery_success_on_next_clean_round(tmp_path, monkeypatch):
+    class PolyApiExceptionLike(Exception):
+        status_code = None
+        error_message = "Request exception!"
+
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        settings = Settings(
+            dry_run=True,
+            assets=("ETH",),
+            out_dir=tmp_path / "out",
+            state_db=tmp_path / "state.sqlite3",
+        )
+        notifier = CaptureNotifier()
+        calls = {"count": 0}
+
+        def flaky_round(**_kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise PolyApiExceptionLike()
+            return [runner_module.PostCloseDecision("hold", "clean_round")]
+
+        monkeypatch.setattr(runner_module, "run_round", flaky_round)
+        error_state = set()
+        for round_start in (900, 1200):
+            _run_asset_rounds(
+                settings=settings,
+                store=store,
+                public=FakePublic(),
+                executor=OrderExecutor(settings, store),
+                live_gateway=None,
+                round_start=round_start,
+                notifier=notifier,
+                error_state=error_state,
+                timeout_s=1.0,
+            )
+
+        assert len(notifier.messages) == 2
+        assert notifier.messages[0].startswith("[Aftertake] ALERT")
+        assert notifier.messages[1].startswith("[Aftertake] RECOVERY_SUCCESS")
+        assert "component=asset:ETH" in notifier.messages[1]
+        assert error_state == set()
+    finally:
+        store.close()
+
+
+def test_asset_supervisor_returns_timeout_without_waiting_for_hung_worker(tmp_path, monkeypatch):
+    release = threading.Event()
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        settings = Settings(
+            dry_run=True,
+            assets=("BTC", "ETH"),
+            out_dir=tmp_path / "out",
+            state_db=tmp_path / "state.sqlite3",
+        )
+
+        def hung_round(*, asset, **_kwargs):
+            if asset == "BTC":
+                release.wait(timeout=2.0)
+            return [runner_module.PostCloseDecision("hold", "%s_complete" % asset.lower())]
+
+        monkeypatch.setattr(runner_module, "run_round", hung_round)
+        started = time.monotonic()
+        results = _run_asset_rounds(
+            settings=settings,
+            store=store,
+            public=FakePublic(),
+            executor=OrderExecutor(settings, store),
+            live_gateway=None,
+            round_start=900,
+            timeout_s=0.02,
+        )
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.5
+        assert results["BTC"][-1].reason == "asset_round_timeout"
+        assert results["ETH"][-1].reason == "eth_complete"
+        timeout_audit = store._conn.execute(
+            "SELECT payload_json FROM audit_events WHERE kind = 'asset_transport_error' AND slug = 'btc-updown-5m-900'"
+        ).fetchone()
+        assert timeout_audit is not None
+        assert json.loads(timeout_audit["payload_json"])["phase"] == "asset_round_timeout"
+    finally:
+        release.set()
+        store.close()
+
+
+def test_runtime_watchdog_requests_process_restart_after_active_stall():
+    exits = []
+    watchdog = RuntimeWatchdog(stale_after_s=0.01, interval_s=0.001, exit_fn=exits.append)
+    watchdog.start()
+    try:
+        deadline = time.monotonic() + 0.5
+        while not exits and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert exits == [1]
+    finally:
+        watchdog.stop()
+
+
+def test_runtime_watchdog_does_not_restart_while_waiting_for_boundary():
+    exits = []
+    watchdog = RuntimeWatchdog(stale_after_s=0.01, interval_s=0.001, exit_fn=exits.append)
+    watchdog.beat("waiting_for_round")
+    watchdog.start()
+    try:
+        time.sleep(0.03)
+        assert exits == []
+    finally:
+        watchdog.stop()
 
 
 def test_configured_assets_do_not_block_each_other_by_position_or_cooldown(tmp_path):
@@ -848,6 +964,7 @@ def test_forever_runner_retries_a_live_pm_bootstrap_failure_without_exiting(tmp_
 
         assert attempts == ["attempt", "attempt"]
         assert any("temporary Polymarket transport outage" in message for message in notifier.messages)
+        assert any(message.startswith("[Aftertake] RECOVERY_SUCCESS") for message in notifier.messages)
     finally:
         store.close()
 

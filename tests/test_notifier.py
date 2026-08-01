@@ -108,6 +108,7 @@ def test_operator_lifecycle_messages_are_stable(kind, payload, headline):
             "btc-updown-5m-0",
         ),
         ("recovery", {"order_id": "order-1", "intent_id": "intent-1"}, "btc-updown-5m-0"),
+        ("recovery_success", {"component": "clob_heartbeat", "reason": "heartbeat restored"}, ""),
         (
             "entry",
             {
@@ -201,6 +202,29 @@ def test_alert_formatter_expands_submit_exception_diagnostics():
     assert "order_type=FAK" in text
     assert "order_id=n/a" in text
     assert "error_message=invalid order type FAK" in text
+
+
+def test_alert_formatter_keeps_component_and_transport_context():
+    text = format_event(
+        "alert",
+        {
+            "reason": "asset transport error",
+            "component": "market_stream",
+            "asset": "BTC",
+            "phase": "asset_round_timeout",
+            "generation": 4,
+            "reconnect_count": 2,
+            "error_message": "market stream heartbeat timeout",
+        },
+        "btc-updown-5m-1",
+    )
+
+    assert "component=market_stream" in text
+    assert "asset=BTC" in text
+    assert "phase=asset_round_timeout" in text
+    assert "generation=4" in text
+    assert "reconnect_count=2" in text
+    assert "error_message=market stream heartbeat timeout" in text
 
 
 def test_boot_formatter_uses_multi_asset_wording():

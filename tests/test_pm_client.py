@@ -219,6 +219,36 @@ def test_market_metadata_keeps_fee_exponent_and_builder_specific_rate():
     assert metadata.accepting_orders is True
 
 
+def test_market_metadata_retries_one_transient_provider_error_without_looping():
+    sleeps = []
+
+    class ProviderError(Exception):
+        status_code = 500
+
+    class Client:
+        calls = 0
+
+        def get_clob_market_info(self, condition_id):
+            self.calls += 1
+            if self.calls == 1:
+                raise ProviderError("pq: sorry, too many clients already")
+            return {
+                "mts": "0.01",
+                "mos": 5,
+                "ao": True,
+                "nr": False,
+                "fd": {"r": 0.0, "e": 1},
+                "t": [{"t": "up-token", "o": "Up"}, {"t": "down-token", "o": "Down"}],
+            }
+
+    client = Client()
+    metadata = V2ClobGateway(client, {}, sleep=sleeps.append).market_metadata("condition")
+
+    assert metadata.condition_id == "condition"
+    assert client.calls == 2
+    assert sleeps == [0.20]
+
+
 def test_market_metadata_parses_official_itode_taker_delay_flag():
     class Client:
         def get_clob_market_info(self, condition_id):

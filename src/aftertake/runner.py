@@ -15,7 +15,7 @@ import os
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -50,10 +50,90 @@ from .settlement import builder_fee_total, fee_total, settle_trade
 from .state import RuntimeLock, StateStore
 
 RUNTIME_RETRY_S = 5.0
+# A normal round's external work is bounded by the public HTTP timeout and the
+# order reconciliation deadline.  This larger supervisor bound is a last
+# resort for an SDK/socket call that ignores its own timeout; it must never
+# turn one asset into a permanently waiting multi-asset round.
+ASSET_ROUND_TIMEOUT_S = 90.0
+RUNTIME_STALL_TIMEOUT_S = 180.0
+RUNTIME_WATCHDOG_INTERVAL_S = 5.0
 # This only bounds how long the runner waits to re-check an already-recorded
 # websocket observation. Event confirmation and all thresholds remain in
 # PostCloseConfig.
 POST_CLOSE_POLL_INTERVAL_S = 0.005
+
+
+class RuntimeWatchdog:
+    """Exit a genuinely stalled live loop so systemd can recreate it.
+
+    The watchdog is intentionally process-level rather than a retry loop.  A
+    thread blocked inside an SDK call cannot be safely killed in Python; an
+    exit is the only deterministic way to release it.  The state store already
+    reserves an intent before submit, so startup recovery remains fail-closed
+    and cannot duplicate an ambiguous order.
+    """
+
+    def __init__(
+        self,
+        *,
+        stale_after_s: float = RUNTIME_STALL_TIMEOUT_S,
+        interval_s: float = RUNTIME_WATCHDOG_INTERVAL_S,
+        monotonic: Callable[[], float] = time.monotonic,
+        exit_fn: Callable[[int], None] = os._exit,
+    ):
+        self.stale_after_s = max(0.01, float(stale_after_s))
+        self.interval_s = max(0.1, float(interval_s))
+        self._monotonic = monotonic
+        self._exit_fn = exit_fn
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._last_progress = self._monotonic()
+        self._stage = "boot"
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="aftertake-runtime-watchdog",
+        )
+        self._thread.start()
+
+    def beat(self, stage: str) -> None:
+        with self._lock:
+            self._last_progress = self._monotonic()
+            self._stage = str(stage or "unknown")
+
+    @property
+    def stage(self) -> str:
+        with self._lock:
+            return self._stage
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_s):
+            with self._lock:
+                age = self._monotonic() - self._last_progress
+                stage = self._stage
+            # The scheduler can legitimately sleep until the next five-minute
+            # boundary.  It is not a stalled external operation and therefore
+            # is explicitly exempt; active round/runtime stages are bounded.
+            if stage == "waiting_for_round":
+                continue
+            if age >= self.stale_after_s:
+                self._exit_fn(1)
+                return
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(1.0, self.interval_s + 1.0))
+
+    def request_restart(self) -> None:
+        """Fail closed immediately when a worker cannot be cancelled safely."""
+
+        self._exit_fn(1)
 
 
 def _resolve_code_sha(source_file: Optional[Path] = None) -> str:
@@ -371,24 +451,66 @@ def _audit_asset_transport_error(
     slug: str,
     phase: str,
     exc: BaseException,
+    notifier: Optional[Notifier] = None,
 ) -> None:
     status_code = getattr(exc, "status_code", None)
     if status_code is not None and not isinstance(status_code, (bool, float, int, str)):
         status_code = str(status_code)
+    payload = {
+        "asset": asset,
+        "slug": slug,
+        "phase": phase,
+        "error_type": type(exc).__name__,
+        "status_code": status_code,
+        "error_message": _safe_transport_message(exc),
+    }
     _audit(
         settings,
         store,
         "asset_transport_error",
-        {
-            "asset": asset,
-            "slug": slug,
-            "phase": phase,
-            "error_type": type(exc).__name__,
-            "status_code": status_code,
-            "error_message": _safe_transport_message(exc),
-        },
+        payload,
         slug,
     )
+    if notifier is not None:
+        _safe_notify(
+            notifier,
+            settings,
+            store,
+            "alert",
+            {"reason": "asset transport error", **payload},
+            slug,
+        )
+
+
+def _update_asset_error_state(
+    *,
+    settings: Settings,
+    store: StateStore,
+    notifier: Optional[Notifier],
+    asset: str,
+    decisions: List[PostCloseDecision],
+    error_state: Optional[set[str]],
+) -> None:
+    if error_state is None:
+        return
+    key = "asset:%s" % asset
+    failed = any(
+        "transport_error" in str(decision.reason)
+        or str(decision.reason) == "asset_round_timeout"
+        for decision in decisions
+    )
+    if failed:
+        error_state.add(key)
+    elif key in error_state:
+        error_state.remove(key)
+        if notifier is not None:
+            _safe_notify(
+                notifier,
+                settings,
+                store,
+                "recovery_success",
+                {"component": "asset:%s" % asset, "reason": "asset round recovered"},
+            )
 
 
 def _entry_qty_for_decision(
@@ -481,35 +603,105 @@ def run_round(
     preflight_done = settings.dry_run
     live_preflight: Optional[LivePreflight] = None
     preflight_at = float(round_end) - 10.0
+    stream_recovery_pending = False
 
     stream.start()
+    stream_generation = int(getattr(stream, "generation", 0))
     try:
         while True:
             now = float(clock())
+            current_generation = int(getattr(stream, "generation", stream_generation))
+            if current_generation != stream_generation:
+                # A reconnect clears the stream's paired books. Do not let the
+                # classifier combine the old generation's pre-close evidence
+                # with a fresh snapshot from the new TCP connection.
+                classifier.reset()
+                stream_generation = current_generation
+                _audit(
+                    settings,
+                    store,
+                    "market_stream_reconnected",
+                    {
+                        "generation": stream_generation,
+                        "last_error": str(getattr(stream, "last_error", "") or ""),
+                    },
+                    slug,
+                )
+                if int(getattr(stream, "reconnect_count", 0)) > 0:
+                    stream_recovery_pending = True
+                    _safe_notify(
+                        notifier,
+                        settings,
+                        store,
+                        "alert",
+                        {
+                            "reason": "market stream reconnecting",
+                            "component": "market_stream",
+                            "generation": stream_generation,
+                            "reconnect_count": int(getattr(stream, "reconnect_count", 0)),
+                            "error_message": str(getattr(stream, "last_error", "") or ""),
+                        },
+                        slug,
+                    )
+            if stream_recovery_pending and stream.ready:
+                stream_recovery_pending = False
+                _safe_notify(
+                    notifier,
+                    settings,
+                    store,
+                    "recovery_success",
+                    {
+                        "component": "market_stream",
+                        "reason": "fresh paired book restored",
+                        "details": "generation=%s reconnect_count=%s"
+                        % (
+                            current_generation,
+                            int(getattr(stream, "reconnect_count", 0)),
+                        ),
+                    },
+                    slug,
+                )
             if now < preflight_at:
                 # Stay subscribed for the complete scene-gate history without polling.
                 sleep(min(0.5, max(0.0, preflight_at - now)))
                 continue
             if not stream.ready:
-                reason = "CLOB market stream not ready before close"
-                if stream.last_error:
-                    reason += ": " + stream.last_error
-                decisions.append(PostCloseDecision("hold", "market_stream_not_ready"))
-                _audit(settings, store, "data_guard", {"reason": reason}, slug)
-                _safe_notify(notifier, settings, store, "alert", {"reason": reason}, slug)
-                break
+                # A transient reconnect at the preflight boundary is not a
+                # reason to abandon the round immediately. Wait until close
+                # for a fresh paired snapshot; the classifier's pre-close
+                # gate will still fail closed if the recovery came too late.
+                if now >= round_end:
+                    reason = "CLOB market stream not ready before close"
+                    if stream.last_error:
+                        reason += ": " + stream.last_error
+                    decisions.append(PostCloseDecision("hold", "market_stream_not_ready"))
+                    _audit(settings, store, "data_guard", {"reason": reason}, slug)
+                    _safe_notify(notifier, settings, store, "alert", {"reason": reason}, slug)
+                    break
+                sleep(min(0.05, max(0.0, round_end - now)))
+                continue
             if not preflight_done:
                 if now >= round_end:
                     decisions.append(PostCloseDecision("hold", "post_close_preflight_missed"))
+                    _safe_notify(
+                        notifier,
+                        settings,
+                        store,
+                        "alert",
+                        {"reason": "post-close preflight missed", "component": "account_preflight"},
+                        slug,
+                    )
                     break
                 if live_gateway is None:
                     raise RuntimeError("live Aftertake requires a CLOB V2 gateway")
-                if round_preflight is not None:
-                    # A shared account snapshot failure applies to every asset,
-                    # so it must remain a daemon-visible runtime failure.
-                    live_preflight = round_preflight.snapshot()
-                phase = "market_metadata"
+                phase = "account_preflight" if round_preflight is not None else "market_metadata"
                 try:
+                    if round_preflight is not None:
+                        # A shared account snapshot failure applies to every
+                        # asset, but it is still reported with this asset's
+                        # slug so the operator can identify the blocked round.
+                        live_preflight = round_preflight.snapshot()
+                        phase = "market_metadata"
                     metadata = live_gateway.market_metadata(market.condition_id)
                     _metadata_token_matches(market, metadata, "YES")
                     _metadata_token_matches(market, metadata, "NO")
@@ -517,15 +709,12 @@ def run_round(
                     if round_preflight is not None:
                         _check_preflight_collateral(live_preflight, required_cash)
                     else:
-                        phase = "account_preflight"
                         geo = public.geoblock_status(settings.geo_endpoint)
                         live_preflight = live_gateway.preflight(geo, required_cash)
                 except Exception as exc:
-                    if not _is_transient_transport_error(exc):
-                        raise
-                    # This is intentionally audit-only: a single CLOB request
-                    # failure has a concrete asset/slug and must not be promoted
-                    # to the daemon-wide slug=runtime alert or rebuild its gateway.
+                    # A single CLOB request failure has a concrete asset/slug;
+                    # report it immediately without rebuilding the gateway for
+                    # a transient asset-local fault.
                     _audit_asset_transport_error(
                         settings,
                         store,
@@ -533,7 +722,10 @@ def run_round(
                         slug=slug,
                         phase=phase,
                         exc=exc,
+                        notifier=notifier,
                     )
+                    if not _is_transient_transport_error(exc):
+                        raise
                     decisions.append(PostCloseDecision("hold", "%s_transport_error" % phase))
                     break
                 if float(clock()) >= round_end:
@@ -543,6 +735,17 @@ def run_round(
                         store,
                         "data_guard",
                         {"reason": "live preflight crossed frontend close"},
+                        slug,
+                    )
+                    _safe_notify(
+                        notifier,
+                        settings,
+                        store,
+                        "alert",
+                        {
+                            "reason": "live preflight crossed frontend close",
+                            "component": "account_preflight",
+                        },
                         slug,
                     )
                     break
@@ -709,6 +912,8 @@ def _run_asset_rounds(
     stream_factory: Callable[..., MarketBookStream] = MarketBookStream,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
+    timeout_s: float = ASSET_ROUND_TIMEOUT_S,
+    error_state: Optional[set[str]] = None,
 ) -> Dict[str, List[PostCloseDecision]]:
     """Run all configured assets for the same 5-minute round concurrently."""
 
@@ -718,61 +923,99 @@ def _run_asset_rounds(
         if settings.is_live and live_gateway is not None
         else None
     )
-    if len(assets) == 1:
-        return {
-            assets[0]: run_round(
-                settings=settings,
-                store=store,
-                public=public,
-                executor=executor,
-                live_gateway=live_gateway,
-                round_start=round_start,
-                asset=assets[0],
-                round_preflight=round_preflight,
-                notifier=notifier,
-                stream_factory=stream_factory,
-                clock=clock,
-                sleep=sleep,
-            )
-        }
-
     results: Dict[str, List[PostCloseDecision]] = {}
-    with ThreadPoolExecutor(max_workers=len(assets), thread_name_prefix="aftertake-asset") as pool:
-        futures = {
-            pool.submit(
-                run_round,
-                settings=settings,
-                store=store,
-                public=public,
-                executor=executor,
-                live_gateway=live_gateway,
-                round_start=round_start,
-                asset=asset,
-                round_preflight=round_preflight,
-                notifier=notifier,
-                stream_factory=stream_factory,
-                clock=clock,
-                sleep=sleep,
-            ): asset
-            for asset in assets
-        }
-        for future in as_completed(futures):
-            asset = futures[future]
-            try:
-                results[asset] = future.result()
-            except Exception as exc:
-                if not _is_transient_transport_error(exc):
-                    raise
-                slug, _, _ = current_crypto_5m_slug(asset, round_start)
-                _audit_asset_transport_error(
-                    settings,
-                    store,
+    # Do not use the executor as a context manager here: __exit__ waits for
+    # every worker, which recreates the old silent-freeze when one SDK call
+    # ignores its socket timeout.  Workers are bounded by the supervisor and
+    # are explicitly detached on timeout; the process watchdog is the final
+    # backstop for a truly wedged native/network call.
+    pool = ThreadPoolExecutor(max_workers=len(assets), thread_name_prefix="aftertake-asset")
+    futures = {
+        pool.submit(
+            run_round,
+            settings=settings,
+            store=store,
+            public=public,
+            executor=executor,
+            live_gateway=live_gateway,
+            round_start=round_start,
+            asset=asset,
+            round_preflight=round_preflight,
+            notifier=notifier,
+            stream_factory=stream_factory,
+            clock=clock,
+            sleep=sleep,
+        ): asset
+        for asset in assets
+    }
+    pending = set(futures)
+    deadline = time.monotonic() + max(0.01, float(timeout_s))
+    try:
+        while pending:
+            remaining = max(0.0, deadline - time.monotonic())
+            done, pending = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
+            if not done:
+                for future in pending:
+                    asset = futures[future]
+                    slug, _, _ = current_crypto_5m_slug(asset, round_start)
+                    timeout_error = TimeoutError(
+                        "asset round exceeded supervisor timeout %.1fs" % float(timeout_s)
+                    )
+                    _audit_asset_transport_error(
+                        settings,
+                        store,
+                        asset=asset,
+                        slug=slug,
+                        phase="asset_round_timeout",
+                        exc=timeout_error,
+                        notifier=notifier,
+                    )
+                    results[asset] = [PostCloseDecision("hold", "asset_round_timeout")]
+                    _update_asset_error_state(
+                        settings=settings,
+                        store=store,
+                        notifier=notifier,
+                        asset=asset,
+                        decisions=results[asset],
+                        error_state=error_state,
+                    )
+                break
+            for future in done:
+                asset = futures[future]
+                try:
+                    results[asset] = future.result()
+                except Exception as exc:
+                    slug, _, _ = current_crypto_5m_slug(asset, round_start)
+                    _audit_asset_transport_error(
+                        settings,
+                        store,
+                        asset=asset,
+                        slug=slug,
+                        phase="asset_round_unhandled",
+                        exc=exc,
+                        notifier=notifier,
+                    )
+                    results[asset] = [PostCloseDecision("hold", "asset_round_transport_error")]
+                    if not _is_transient_transport_error(exc):
+                        raise
+                _update_asset_error_state(
+                    settings=settings,
+                    store=store,
+                    notifier=notifier,
                     asset=asset,
-                    slug=slug,
-                    phase="asset_round_unhandled",
-                    exc=exc,
+                    decisions=results[asset],
+                    error_state=error_state,
                 )
-                results[asset] = [PostCloseDecision("hold", "asset_round_transport_error")]
+    finally:
+        for future in pending:
+            future.cancel()
+        # Never wait for a worker that has already crossed the external
+        # timeout.  ``cancel_futures`` is available on supported Python 3.9+
+        # runtimes; retain a compatibility fallback for older deployments.
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            pool.shutdown(wait=False)
     return results
 
 
@@ -838,7 +1081,39 @@ def _reconcile_startup(
                 record.slug,
             )
             continue
-        result = executor.reconcile_existing(record)
+        try:
+            result = executor.reconcile_existing(record)
+        except Exception as exc:
+            # One stale/temporarily unreachable order must not prevent the
+            # daemon from scanning fresh markets.  The intent remains in the
+            # durable unresolved state and will be retried on the next boot;
+            # risk checks continue to count it fail-closed in the meantime.
+            _audit(
+                settings,
+                store,
+                "startup_reconciliation_error",
+                {
+                    "reason": _safe_transport_message(exc),
+                    "error_type": type(exc).__name__,
+                    "order_id": record.order_id or "n/a",
+                },
+                record.slug,
+            )
+            _safe_notify(
+                notifier,
+                settings,
+                store,
+                "alert",
+                {
+                    "reason": "startup reconciliation error",
+                    "component": "startup_reconciliation",
+                    "error_type": type(exc).__name__,
+                    "error_message": _safe_transport_message(exc),
+                    "order_id": record.order_id or "n/a",
+                },
+                record.slug,
+            )
+            continue
         if result.terminal:
             _notify_order_result(notifier, settings, store, result, record.slug)
             continue
@@ -868,7 +1143,37 @@ def reconcile_submitted_orders(
     for record in store.unresolved_orders():
         if record.state != "submitted" or not record.order_id:
             continue
-        result = executor.reconcile_existing(record)
+        try:
+            result = executor.reconcile_existing(record)
+        except Exception as exc:
+            # Reconciliation is best-effort and must not hold the next market
+            # boundary hostage to one order or one provider outage.
+            _audit(
+                settings,
+                store,
+                "submitted_reconcile_error",
+                {
+                    "reason": _safe_transport_message(exc),
+                    "error_type": type(exc).__name__,
+                    "order_id": record.order_id,
+                },
+                record.slug,
+            )
+            _safe_notify(
+                notifier,
+                settings,
+                store,
+                "alert",
+                {
+                    "reason": "submitted order reconciliation error",
+                    "component": "submitted_reconciliation",
+                    "error_type": type(exc).__name__,
+                    "error_message": _safe_transport_message(exc),
+                    "order_id": record.order_id,
+                },
+                record.slug,
+            )
+            continue
         results.append(result)
         if result.terminal:
             _notify_order_result(notifier, settings, store, result, record.slug)
@@ -887,6 +1192,13 @@ def _live_runtime(
     def report_submission(kind: str, payload: Dict[str, Any]) -> None:
         if kind == "submitted":
             _safe_notify(notifier, settings, store, "submitted", payload, str(payload["slug"]))
+        elif kind == "heartbeat_error":
+            _safe_notify(notifier, settings, store, "alert", payload)
+        elif kind == "heartbeat_recovered":
+            _safe_notify(notifier, settings, store, "recovery_success", {
+                **payload,
+                "component": "clob_heartbeat",
+            })
 
     executor = OrderExecutor(
         settings=settings, store=store, gateway=gateway, event_callback=report_submission
@@ -908,6 +1220,7 @@ def _run_round_loop(
     ] = _live_runtime,
     wait_for_next_boundary: Callable[[], int] = _wait_for_next_boundary,
     sleep: Callable[[float], None] = time.sleep,
+    runtime_watchdog: Optional[RuntimeWatchdog] = None,
 ) -> None:
     """Keep the daemon alive while PM transport/account checks recover.
 
@@ -920,9 +1233,12 @@ def _run_round_loop(
     executor = OrderExecutor(settings=settings, store=store)
     completed = 0
     last_runtime_error = ""
+    active_error_components: set[str] = set()
     processed_round_starts: set[int] = set()
 
     while forever or completed < max(1, rounds):
+        if runtime_watchdog is not None:
+            runtime_watchdog.beat("runtime_connect" if settings.is_live and gateway is None else "waiting_for_round")
         if settings.is_live and gateway is None:
             try:
                 gateway, executor = live_runtime_factory(settings, store, public, notifier)
@@ -931,17 +1247,32 @@ def _run_round_loop(
             except Exception as exc:
                 reason = "PM runtime unavailable; retrying: %s: %s" % (type(exc).__name__, str(exc))
                 _audit(settings, store, "runtime_connect_retry", {"reason": reason})
-                # Notify only when the failure state changes.  A multi-minute
-                # maintenance window must not flood Telegram every five seconds.
-                if reason != last_runtime_error:
-                    _safe_notify(notifier, settings, store, "alert", {"reason": reason})
+                # Every occurrence is intentional operator evidence. Telegram
+                # noise is preferable to another silent runtime freeze.
+                _safe_notify(
+                    notifier,
+                    settings,
+                    store,
+                    "alert",
+                    {"reason": reason, "component": "pm_runtime"},
+                )
                 last_runtime_error = reason
+                if runtime_watchdog is not None:
+                    runtime_watchdog.beat("runtime_retry_wait")
                 sleep(RUNTIME_RETRY_S)
                 continue
             if last_runtime_error:
                 _audit(settings, store, "runtime_recovered", {"previous_error": last_runtime_error})
-                _safe_notify(notifier, settings, store, "alert", {"reason": "PM runtime recovered"})
+                _safe_notify(
+                    notifier,
+                    settings,
+                    store,
+                    "recovery_success",
+                    {"component": "pm_runtime", "reason": "PM runtime recovered"},
+                )
                 last_runtime_error = ""
+            if runtime_watchdog is not None:
+                runtime_watchdog.beat("waiting_for_round")
 
         if wait_for_next_boundary is not _wait_for_next_boundary:
             start = wait_for_next_boundary()
@@ -952,8 +1283,10 @@ def _run_round_loop(
                 sleep=time.sleep,
             )
         processed_round_starts.add(start)
+        if runtime_watchdog is not None:
+            runtime_watchdog.beat("active_round")
         try:
-            _run_asset_rounds(
+            round_results = _run_asset_rounds(
                 settings=settings,
                 store=store,
                 public=public,
@@ -961,7 +1294,28 @@ def _run_round_loop(
                 live_gateway=gateway,
                 round_start=start,
                 notifier=notifier,
+                error_state=active_error_components,
             )
+            timed_out_assets = [
+                asset
+                for asset, decisions in round_results.items()
+                if any(item.reason == "asset_round_timeout" for item in decisions)
+            ]
+            if timed_out_assets:
+                _audit(
+                    settings,
+                    store,
+                    "asset_supervisor_restart",
+                    {"assets": timed_out_assets, "reason": "worker_timeout_uncancellable"},
+                )
+                if runtime_watchdog is not None:
+                    # A Python worker cannot be force-killed. Restart the
+                    # process instead of allowing a late SDK return to submit
+                    # against the next round; SQLite recovery handles any
+                    # reserved intent conservatively on the fresh boot.
+                    runtime_watchdog.request_restart()
+            if runtime_watchdog is not None:
+                runtime_watchdog.beat("round_complete")
         except Exception as exc:
             _audit(settings, store, "round_runtime_error", {"error": str(exc)})
             _safe_notify(notifier, settings, store, "alert", {"reason": str(exc)})
@@ -970,6 +1324,11 @@ def _run_round_loop(
             if settings.is_live:
                 gateway = None
                 executor = OrderExecutor(settings=settings, store=store)
+            if runtime_watchdog is not None:
+                # The asset supervisor may have detached a worker that raised
+                # a non-transport exception. Do not keep running alongside an
+                # uncancellable worker with shared state/client objects.
+                runtime_watchdog.request_restart()
         finally:
             # Post-round only: pending GTC reconciliation and official settlement
             # must never delay market discovery for the next 5-minute boundary.
@@ -978,7 +1337,39 @@ def _run_round_loop(
                     reconcile_submitted_orders(settings=settings, store=store, executor=executor, notifier=notifier)
                 except Exception as exc:
                     _audit(settings, store, "submitted_reconcile_error", {"error": str(exc)})
-            settle_open_positions(settings=settings, store=store, public=public, notifier=notifier)
+                    _safe_notify(
+                        notifier,
+                        settings,
+                        store,
+                        "alert",
+                        {
+                            "reason": "submitted reconciliation sweep error",
+                            "component": "submitted_reconciliation_sweep",
+                            "error_type": type(exc).__name__,
+                            "error_message": _safe_transport_message(exc),
+                        },
+                    )
+            try:
+                settle_open_positions(settings=settings, store=store, public=public, notifier=notifier)
+            except Exception as exc:
+                # Settlement is informational and per-position fail-closed. A
+                # database/provider fault in the sweep must not stop discovery
+                # of the next round.
+                _audit(settings, store, "settlement_sweep_error", {"error": str(exc)})
+                _safe_notify(
+                    notifier,
+                    settings,
+                    store,
+                    "alert",
+                    {
+                        "reason": "settlement sweep error",
+                        "component": "settlement_sweep",
+                        "error_type": type(exc).__name__,
+                        "error_message": _safe_transport_message(exc),
+                    },
+                )
+            if runtime_watchdog is not None:
+                runtime_watchdog.beat("finalize_complete")
         completed += 1
 
 
@@ -1149,6 +1540,20 @@ def settle_open_positions(
             settled.append(payload)
         except Exception as exc:
             store.append_event("settlement_pending", {"reason": str(exc)}, record.slug)
+            if notifier is not None:
+                _safe_notify(
+                    notifier,
+                    settings,
+                    store,
+                    "alert",
+                    {
+                        "reason": "settlement position error",
+                        "component": "settlement_position",
+                        "error_type": type(exc).__name__,
+                        "error_message": _safe_transport_message(exc),
+                    },
+                    record.slug,
+                )
     return settled
 
 
@@ -1260,14 +1665,20 @@ def main(argv: Optional[List[str]] = None) -> int:
             }
             _audit(settings, store, "boot", boot_payload)
             _safe_notify(notifier, settings, store, "boot", boot_payload)
-            _run_round_loop(
-                settings=settings,
-                store=store,
-                public=public,
-                notifier=notifier,
-                forever=args.forever,
-                rounds=args.rounds,
-            )
+            runtime_watchdog = RuntimeWatchdog()
+            runtime_watchdog.start()
+            try:
+                _run_round_loop(
+                    settings=settings,
+                    store=store,
+                    public=public,
+                    notifier=notifier,
+                    forever=args.forever,
+                    rounds=args.rounds,
+                    runtime_watchdog=runtime_watchdog,
+                )
+            finally:
+                runtime_watchdog.stop()
     finally:
         store.close()
     return 0

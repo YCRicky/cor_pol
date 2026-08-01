@@ -15,8 +15,8 @@ EnvironmentFile=/opt/cor_pol/.env
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=/opt/cor_pol/src
 ExecStart=/opt/cor_pol/.venv/bin/python -m aftertake.runner --forever
-Restart=on-failure
-RestartSec=10
+Restart=always
+RestartSec=5
 TimeoutStopSec=20
 KillSignal=SIGTERM
 NoNewPrivileges=true

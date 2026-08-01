@@ -163,6 +163,22 @@ def _as_float(value: Any, label: str) -> float:
         raise LivePreflightError("invalid %s returned by Polymarket" % label) from exc
 
 
+def _is_retryable_clob_error(exc: BaseException) -> bool:
+    """Identify one bounded retryable CLOB transport/provider failure."""
+
+    status_code = getattr(exc, "status_code", None)
+    try:
+        status_code = int(status_code) if status_code is not None else None
+    except (TypeError, ValueError):
+        status_code = None
+    if status_code in {408, 429, 500, 502, 503, 504}:
+        return True
+    text = str(exc).lower()
+    if isinstance(exc, (ConnectionError, OSError, TimeoutError)):
+        return True
+    return any(phrase in text for phrase in ("request exception", "timed out", "timeout", "too many clients"))
+
+
 PUSD_BASE_UNITS = Decimal("1000000")
 
 
@@ -410,7 +426,19 @@ class V2ClobGateway:
 
     def market_metadata(self, condition_id: str) -> MarketMetadata:
         with self._client_lock:
-            raw = self._client.get_clob_market_info(condition_id)
+            raw = None
+            for attempt in range(2):
+                try:
+                    raw = self._client.get_clob_market_info(condition_id)
+                    break
+                except Exception as exc:
+                    # A single short retry covers the transient 500/timeout
+                    # responses seen during provider connection-pool pressure.
+                    # It is deliberately bounded so metadata failure cannot
+                    # hold the close path in an unbounded retry loop.
+                    if attempt or not _is_retryable_clob_error(exc):
+                        raise
+                    self._sleep(0.20)
             if not isinstance(raw, dict):
                 raise LivePreflightError("invalid CLOB market metadata")
             accepting_orders = raw.get("ao", raw.get("accepting_orders"))

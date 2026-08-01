@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 import threading
 import time
 import uuid
@@ -64,16 +66,75 @@ class OrderResult:
         return self.filled_qty
 
 
+def _heartbeat_id_from_value(value: Any) -> str:
+    """Extract a server-issued heartbeat id from success or SDK error data.
+
+    ``py-clob-client-v2`` exposes failed HTTP bodies through different shapes
+    across releases (a dict, a JSON string, or an exception's ``error_msg``).
+    The CLOB heartbeat contract includes a replacement id in an invalid-id
+    response, so parsing all of these shapes is necessary for recovery.
+    """
+
+    if isinstance(value, BaseException):
+        for attribute in ("error_msg", "error_message", "response", "body"):
+            nested = getattr(value, attribute, None)
+            heartbeat_id = _heartbeat_id_from_value(nested)
+            if heartbeat_id:
+                return heartbeat_id
+        value = str(value)
+    if isinstance(value, dict):
+        for key in ("heartbeat_id", "heartbeatId", "heartbeatID"):
+            candidate = value.get(key)
+            if candidate is not None and str(candidate).strip():
+                return str(candidate).strip()
+        for key in ("error", "error_msg", "message", "detail", "body", "response"):
+            heartbeat_id = _heartbeat_id_from_value(value.get(key))
+            if heartbeat_id:
+                return heartbeat_id
+        return ""
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8", errors="replace")
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError):
+        parsed = None
+    if parsed is not None and parsed is not value:
+        heartbeat_id = _heartbeat_id_from_value(parsed)
+        if heartbeat_id:
+            return heartbeat_id
+    match = re.search(
+        r"[\"']heartbeat[_-]?id[\"']\s*:\s*[\"']([^\"']+)[\"']",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return match.group(1).strip() if match else ""
+
+
 class HeartbeatLoop:
     """CLOB order heartbeat, separate from WebSocket ping/keepalive."""
 
     def __init__(self, gateway: OrderGateway, interval_s: float):
         self.gateway = gateway
         self.interval_s = float(interval_s)
+        self.call_timeout_s = max(0.1, min(2.0, self.interval_s * 0.5))
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._request_thread: Optional[threading.Thread] = None
+        self._request_lock = threading.Lock()
         self.last_error = ""
         self._heartbeat_id = ""
+        self.last_success_at = 0.0
+        self.consecutive_failures = 0
+        self.status_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None
+
+    @property
+    def heartbeat_id(self) -> str:
+        """Return the most recent server-issued heartbeat id."""
+
+        return self._heartbeat_id
 
     def start(self) -> None:
         if self._thread is not None:
@@ -81,19 +142,102 @@ class HeartbeatLoop:
         self._thread = threading.Thread(target=self._run, daemon=True, name="aftertake-heartbeat")
         self._thread.start()
 
+    def _post_heartbeat_bounded(self) -> Dict[str, Any]:
+        """Bound one SDK call and prevent overlapping hung request threads."""
+
+        with self._request_lock:
+            if self._request_thread is not None and self._request_thread.is_alive():
+                raise TimeoutError("previous heartbeat request is still in flight")
+            done = threading.Event()
+            result: Dict[str, Any] = {}
+            failure: List[BaseException] = []
+
+            def call() -> None:
+                try:
+                    response = self.gateway.post_heartbeat(self._heartbeat_id)
+                    if isinstance(response, dict):
+                        result.update(response)
+                    else:
+                        result["raw"] = response
+                except Exception as exc:  # propagate SDK failures to the loop
+                    failure.append(exc)
+                finally:
+                    done.set()
+
+            request_thread = threading.Thread(
+                target=call,
+                daemon=True,
+                name="aftertake-heartbeat-request",
+            )
+            self._request_thread = request_thread
+            request_thread.start()
+
+        if not done.wait(self.call_timeout_s):
+            raise TimeoutError("heartbeat request timed out")
+        with self._request_lock:
+            self._request_thread = None
+        if failure:
+            raise failure[0]
+        return result
+
+    def _notify_status(self, kind: str, payload: Dict[str, Any]) -> None:
+        callback = self.status_callback
+        if callback is None:
+            return
+        try:
+            callback(kind, payload)
+        except Exception:
+            # Diagnostics must never terminate the heartbeat loop.
+            return
+
     def _run(self) -> None:
+        had_error = False
         while not self._stop.is_set():
+            wait_s = self.interval_s
             try:
-                response = self.gateway.post_heartbeat(self._heartbeat_id)
-                heartbeat_id = str(response.get("heartbeat_id") or "")
+                response = self._post_heartbeat_bounded()
+                heartbeat_id = _heartbeat_id_from_value(response)
                 if heartbeat_id:
                     self._heartbeat_id = heartbeat_id
+                self.last_error = ""
+                self.last_success_at = time.time()
+                self.consecutive_failures = 0
+                if had_error:
+                    self._notify_status(
+                        "heartbeat_recovered",
+                        {"reason": "CLOB heartbeat restored", "heartbeat_id": self._heartbeat_id},
+                    )
+                had_error = False
             except Exception as exc:  # execution reconciliation will fail closed
-                self.last_error = str(exc)
-            self._stop.wait(self.interval_s)
+                # Polymarket returns the replacement heartbeat_id alongside a
+                # 400 when the previous id expired.  Keeping the old id here
+                # creates the exact infinite-invalid-heartbeat loop seen in
+                # production and can leave the order lifecycle without a live
+                # heartbeat.  Recover the replacement id and retry promptly.
+                self.consecutive_failures += 1
+                replacement_id = _heartbeat_id_from_value(exc)
+                if replacement_id:
+                    self._heartbeat_id = replacement_id
+                    wait_s = min(0.25, self.interval_s)
+                error_value = getattr(exc, "error_msg", None)
+                self.last_error = _safe_error_message(error_value if error_value is not None else exc)
+                had_error = True
+                self._notify_status(
+                    "heartbeat_error",
+                    {
+                        "reason": "CLOB heartbeat failed",
+                        "error_message": self.last_error,
+                        "heartbeat_id": self._heartbeat_id,
+                        "consecutive_failures": self.consecutive_failures,
+                    },
+                )
+            self._stop.wait(max(0.01, wait_s))
 
     def stop(self) -> None:
         self._stop.set()
+        request_thread = self._request_thread
+        if request_thread is not None:
+            request_thread.join(timeout=self.call_timeout_s + 0.25)
         if self._thread is not None:
             self._thread.join(timeout=max(1.0, self.interval_s + 1.0))
 
@@ -230,6 +374,12 @@ class OrderExecutor:
         self._event_threads: List[tuple] = []
         self._event_threads_lock = threading.Lock()
 
+    def _new_heartbeat(self) -> HeartbeatLoop:
+        heartbeat = self._heartbeat_factory(self.gateway, self.settings.heartbeat_interval_s)
+        if hasattr(heartbeat, "status_callback"):
+            heartbeat.status_callback = lambda kind, payload: self._emit(kind, payload)
+        return heartbeat
+
     def _emit(self, kind: str, payload: Dict[str, Any]) -> None:
         if self._event_callback is None:
             return
@@ -319,7 +469,7 @@ class OrderExecutor:
         if self.gateway is None:
             raise RuntimeError("live order executor requires a V2 CLOB gateway")
 
-        heartbeat = self._heartbeat_factory(self.gateway, self.settings.heartbeat_interval_s)
+        heartbeat = self._new_heartbeat()
         heartbeat.start()
         try:
             submit_start_wall = 0.0
@@ -450,7 +600,7 @@ class OrderExecutor:
             return self._result_from_record(
                 record, "execution_unknown", 0.0, 0.0, False, "unknown", reason, {}
             )
-        heartbeat = self._heartbeat_factory(self.gateway, self.settings.heartbeat_interval_s)
+        heartbeat = self._new_heartbeat()
         heartbeat.start()
         try:
             return self._reconcile(record, record.order_id, {"recovery": True})

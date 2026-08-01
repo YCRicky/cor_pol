@@ -26,6 +26,25 @@ without an `ExecStartPre` network gate, and keeps mutable state in
 `/var/lib/cor-pol/out`. Polymarket interruptions retry inside the running
 process and do not print secret values.
 
+The multi-asset supervisor gives each same-boundary scan a 90-second upper
+bound. A timed-out asset is recorded as `asset_round_timeout`; the service
+then exits deliberately because Python cannot safely kill a worker blocked in
+an SDK call. The checked-in systemd unit uses `Restart=always`, so the process
+is recreated and SQLite recovery handles any reserved intent without replaying
+an ambiguous order. An active main-loop stall is likewise terminated by the
+180-second runtime watchdog. Normal waiting for the next five-minute boundary
+is explicitly exempt from that watchdog.
+
+The market WebSocket has a 5-second keepalive and a 12-second silence
+watchdog. A dead socket is closed and reconnected with bounded backoff; the
+affected round is fail-closed until a fresh paired book is available. For live
+orders, the CLOB heartbeat is sent every 5 seconds. If Polymarket returns a
+400 invalid/expired heartbeat id, the replacement id in that response is
+adopted and retried immediately instead of repeating the stale id. Each
+heartbeat SDK call is bounded and overlapping hung heartbeat requests are
+suppressed, so a transient client stall cannot create an unbounded heartbeat
+thread pile-up.
+
 ## Live promotion
 
 Set `AFTERTAKE_DRY_RUN=false` plus the required CLOB V2 account identity in
@@ -41,3 +60,6 @@ an operator manually runs `--deployment-check`; it is not a service gate.
 For an actual entry expect `ORDER_SUBMITTED` followed by either
 `ENTRY_CONFIRMED`, `ORDER_RESULT`, or `ALERT`; the acknowledgement alone is
 not considered a fill. Settlements use only a resolved official Gamma outcome.
+Every runtime/transport/heartbeat error now emits an `ALERT` immediately;
+when the same component returns to a healthy state it emits
+`RECOVERY_SUCCESS`. A process restart is visible as a fresh `BOOT` message.
