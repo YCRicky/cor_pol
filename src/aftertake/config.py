@@ -104,7 +104,7 @@ class Settings:
     order_type: str = "GTC"
     order_ttl_s: float = 5.0
     reconcile_timeout_s: float = 45.0
-    heartbeat_interval_s: float = 5.0
+    heartbeat_interval_s: float = 4.0
     builder_code: str = ""
 
     # Official CLOB V2 account fields.

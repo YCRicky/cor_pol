@@ -21,14 +21,18 @@ Official public CLOB WebSocket (YES + NO paired books)
 ```
 
 `aftertake.market_stream` consumes only the public official market WebSocket.
-It sends the provider keepalive, detects a silent socket when neither PONG nor
-market data arrives, and reconnects with bounded exponential backoff. Each
-reconnect clears the paired book generation; the classifier also clears its
-history so stale pre-close evidence cannot cross a dead connection.
+It sends the provider keepalive, detects both transport silence and a frozen
+market-data book (PONG alone is not freshness), and reconnects with bounded
+exponential backoff. Each reconnect clears the paired book generation; the
+classifier also clears its history so stale pre-close evidence cannot cross a
+dead connection.
 `aftertake.pm_client` handles Gamma discovery and, only in live mode, the
 authenticated `py-clob-client-v2` gateway. `aftertake.state` is the durable
-source of entry, order, recovery and settlement state. `aftertake.execution`
-does not retry ambiguous submissions and freezes later entries through state.
+source of entry, order, recovery, settlement, component-health and
+notification-outbox state. `aftertake.execution` does not retry ambiguous
+submissions and freezes later entries through state. A single notifier worker
+drains the outbox in predecessor order, so an alert or recovery message is not
+lost merely because Telegram is slow or temporarily down.
 The authenticated order heartbeat adopts the replacement id returned by an
 expired/invalid-id response, so a stale heartbeat id cannot loop forever.
 

@@ -1,4 +1,5 @@
 import threading
+import time
 
 import pytest
 
@@ -91,6 +92,64 @@ def test_heartbeat_loop_bounds_and_does_not_overlap_a_hung_sdk_call():
         loop.stop()
 
 
+def test_heartbeat_loop_keeps_delayed_success_and_adopts_returned_id():
+    calls = []
+
+    class DelayedGateway:
+        def post_heartbeat(self, heartbeat_id=""):
+            calls.append(heartbeat_id)
+            # This is slower than the current 100ms wrapper floor, but far
+            # below the pinned SDK's legitimate request timeout.
+            time.sleep(0.15)
+            return {"heartbeat_id": "delayed-heartbeat-id"}
+
+    loop = HeartbeatLoop(DelayedGateway(), 0.01)
+    loop.start()
+    try:
+        deadline = time.monotonic() + 1.0
+        while not loop.heartbeat_id and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        loop.stop()
+
+    assert calls
+    assert loop.heartbeat_id == "delayed-heartbeat-id"
+    assert loop.last_success_at > 0
+
+
+def test_heartbeat_hung_request_requests_one_process_restart_without_waiting_for_status(tmp_path):
+    release = threading.Event()
+    restarted = threading.Event()
+    status_started = threading.Event()
+
+    class Gateway:
+        def post_heartbeat(self, heartbeat_id=""):
+            release.wait(timeout=2.0)
+            return {"heartbeat_id": "h"}
+
+    def blocked_status(_kind, _payload):
+        status_started.set()
+        release.wait(timeout=2.0)
+
+    loop = HeartbeatLoop(
+        Gateway(),
+        0.01,
+        fatal_callback=lambda _reason, _payload: restarted.set(),
+    )
+    loop.status_callback = blocked_status
+    loop.start()
+    try:
+        assert restarted.wait(1.0)
+        assert loop.fatal_requested is True
+        # The core heartbeat thread must not wait for diagnostics. Depending
+        # on timing the first error may still be queued behind the blocked
+        # callback, but fatal restart must already be requested.
+        assert loop._thread is not None and loop._thread.is_alive()
+    finally:
+        release.set()
+        loop.stop()
+
+
 class ConfirmingGateway:
     def __init__(self):
         self.cancelled = False
@@ -153,6 +212,16 @@ class SubmittedThenMatchedGateway(ConfirmingGateway):
 class TimeoutGateway(ConfirmingGateway):
     def submit_limit_buy(self, token_id, price, qty, metadata, order_type="GTC"):
         raise TimeoutError("request timed out after send")
+
+
+class ConnectionFailureGateway(ConfirmingGateway):
+    def submit_limit_buy(self, token_id, price, qty, metadata, order_type="GTC"):
+        raise ConnectionError("connection reset after request body was sent")
+
+
+class MissingOrderIdGateway(ConfirmingGateway):
+    def submit_limit_buy(self, token_id, price, qty, metadata, order_type="GTC"):
+        return {"status": "live", "success": True}
 
 
 class FastGateway(ConfirmingGateway):
@@ -400,7 +469,12 @@ def test_gtc_pending_order_can_reconcile_later_to_confirmed_fill(tmp_path):
         store.close()
 
 
-def test_submit_timeout_skips_only_current_market_without_global_freeze(tmp_path):
+@pytest.mark.parametrize(
+    "gateway",
+    [TimeoutGateway(), ConnectionFailureGateway()],
+    ids=["timeout-after-send", "connection-reset-after-send"],
+)
+def test_ambiguous_submit_transport_failure_remains_unknown_and_preserves_risk(tmp_path, gateway):
     store = StateStore(tmp_path / "state.sqlite3")
     try:
         record = _reserve(store)
@@ -409,20 +483,46 @@ def test_submit_timeout_skips_only_current_market_without_global_freeze(tmp_path
         result = OrderExecutor(
             settings,
             store,
-            gateway=TimeoutGateway(),
+            gateway=gateway,
             sleep=clock.sleep,
             monotonic=clock,
             heartbeat_factory=NoopHeartbeat,
         ).execute_reserved(record, _metadata())
 
-        assert result.terminal is True
-        assert result.status == "submit_skipped"
-        assert result.submission_state == "skipped"
+        assert result.terminal is False
+        assert result.status == "execution_unknown"
+        assert result.submission_state == "unknown"
         assert result.error == "submit_exception"
-        assert result.raw["terminal_skip"] is True
-        assert store.has_execution_unknown() is False
+        assert result.raw.get("terminal_skip") is not True
+        assert store.has_execution_unknown() is True
+        assert store.market_state(record.slug) == "execution_unknown"
+        assert store.total_risk_exposure() == pytest.approx(record.requested_notional)
+        assert [item.intent_id for item in store.unresolved_orders()] == [record.intent_id]
         assert _reserve(store) is None  # same slug still cannot be retried
-        assert store.reserve_entry("eth-updown-5m-300", "condition", 300, "token", "YES", 5, 0.51) is not None
+    finally:
+        store.close()
+
+
+def test_success_response_without_order_id_remains_unknown_and_preserves_risk(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        record = _reserve(store)
+        result = OrderExecutor(
+            Settings(dry_run=False, order_type="GTC", reconcile_timeout_s=1),
+            store,
+            gateway=MissingOrderIdGateway(),
+            heartbeat_factory=NoopHeartbeat,
+        ).execute_reserved(record, _metadata())
+
+        assert result.terminal is False
+        assert result.status == "execution_unknown"
+        assert result.submission_state == "unknown"
+        assert result.error == "missing_order_id_after_submit"
+        assert result.raw.get("terminal_skip") is not True
+        assert store.has_execution_unknown() is True
+        assert store.market_state(record.slug) == "execution_unknown"
+        assert store.total_risk_exposure() == pytest.approx(record.requested_notional)
+        assert [item.intent_id for item in store.unresolved_orders()] == [record.intent_id]
     finally:
         store.close()
 
@@ -536,6 +636,33 @@ def test_confirmed_fill_without_execution_price_remains_unknown(tmp_path):
         assert result.filled_qty == 2
         assert store.has_execution_unknown() is True
     finally:
+        store.close()
+
+
+def test_reconcile_trade_lookup_is_bounded_and_keeps_fill_unknown(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    release = threading.Event()
+
+    class HungTradeGateway(FillWithoutPriceGateway):
+        def order_trades(self, token_id, order_id):
+            release.wait(timeout=2.0)
+            return []
+
+    try:
+        record = _reserve(store)
+        result = OrderExecutor(
+            Settings(dry_run=False, order_type="GTC", reconcile_timeout_s=0.05),
+            store,
+            gateway=HungTradeGateway(),
+            heartbeat_factory=NoopHeartbeat,
+        ).execute_reserved(record, _metadata())
+
+        assert result.status == "execution_unknown"
+        assert result.error == "reconcile_transport_timeout"
+        assert result.raw["ambiguous_submission"] is True
+        assert store.has_execution_unknown() is True
+    finally:
+        release.set()
         store.close()
 
 

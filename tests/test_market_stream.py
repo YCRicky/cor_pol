@@ -1,6 +1,9 @@
 import sys
+import threading
 import time
 from types import SimpleNamespace
+
+import pytest
 
 import aftertake.market_stream as market_stream_module
 from aftertake.market_stream import MarketBookStream
@@ -132,7 +135,7 @@ def test_market_stream_allows_a_realistic_handshake_then_restores_fast_receive_t
 
     stream._run()
 
-    assert calls == {"connect_timeout": 2.0, "receive_timeout": 0.25}
+    assert calls == {"connect_timeout": 2.0, "receive_timeout": 0.05}
 
 
 def test_market_stream_reconnects_after_a_silent_socket_heartbeat_timeout(monkeypatch):
@@ -182,6 +185,147 @@ def test_market_stream_reconnects_after_a_silent_socket_heartbeat_timeout(monkey
     assert stream.reconnect_count >= 1
     assert stream.generation >= 2
     assert "PING" in observed
+
+
+def test_market_stream_invalidates_ready_book_before_reconnect_backoff(monkeypatch):
+    """A disconnected feed must stop advertising its old paired book immediately."""
+
+    allow_disconnect = threading.Event()
+    stream = MarketBookStream(
+        yes_token_id="yes-token", no_token_id="no-token", on_book=lambda _snapshot: None
+    )
+
+    class Timeout(Exception):
+        pass
+
+    class Disconnect(Exception):
+        pass
+
+    class Socket:
+        def __init__(self):
+            self._messages = [
+                _book(
+                    "yes-token",
+                    [{"price": "0.60", "size": "10"}],
+                    [{"price": "0.61", "size": "10"}],
+                ),
+                _book(
+                    "no-token",
+                    [{"price": "0.30", "size": "10"}],
+                    [{"price": "0.31", "size": "10"}],
+                ),
+            ]
+
+        def settimeout(self, _timeout):
+            return None
+
+        def send(self, _payload):
+            return None
+
+        def recv(self):
+            if self._messages:
+                return self._messages.pop(0)
+            assert allow_disconnect.wait(timeout=1.0)
+            raise Disconnect("injected connection reset")
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(market_stream_module, "RECONNECT_INITIAL_S", 5.0)
+    monkeypatch.setitem(
+        sys.modules,
+        "websocket",
+        SimpleNamespace(
+            create_connection=lambda _url, timeout: Socket(),
+            WebSocketTimeoutException=Timeout,
+        ),
+    )
+
+    stream.start()
+    try:
+        ready_deadline = time.monotonic() + 1.0
+        while not stream.ready and time.monotonic() < ready_deadline:
+            time.sleep(0.005)
+        assert stream.ready is True
+        connected_generation = stream.generation
+
+        allow_disconnect.set()
+        disconnect_deadline = time.monotonic() + 1.0
+        while stream.reconnect_count < 1 and time.monotonic() < disconnect_deadline:
+            time.sleep(0.005)
+
+        assert stream.reconnect_count == 1
+        assert stream.ready is False
+        assert stream.generation > connected_generation
+    finally:
+        stream.close(timeout_s=1.0)
+
+
+def test_market_stream_watchdog_interrupts_recv_that_ignores_socket_timeout(monkeypatch):
+    release_recv = threading.Event()
+    close_called = threading.Event()
+    stream = MarketBookStream(
+        yes_token_id="yes-token",
+        no_token_id="no-token",
+        on_book=lambda _snapshot: None,
+    )
+
+    class Timeout(Exception):
+        pass
+
+    class Socket:
+        def __init__(self):
+            self.messages = [
+                _book("yes-token", [{"price": "0.60", "size": "5"}], [{"price": "0.61", "size": "5"}]),
+                _book("no-token", [{"price": "0.30", "size": "5"}], [{"price": "0.31", "size": "5"}]),
+            ]
+
+        def settimeout(self, _timeout):
+            return None
+
+        def send(self, _payload):
+            return None
+
+        def recv(self):
+            if self.messages:
+                return self.messages.pop(0)
+            release_recv.wait(timeout=2.0)
+            return None
+
+        def close(self):
+            close_called.set()
+
+    socket = Socket()
+    monkeypatch.setitem(
+        sys.modules,
+        "websocket",
+        SimpleNamespace(
+            create_connection=lambda _url, timeout: socket,
+            WebSocketTimeoutException=Timeout,
+        ),
+    )
+
+    stream.start()
+    try:
+        deadline = time.monotonic() + 1.0
+        while not stream.ready and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert stream.ready is True
+        stream.arm_market_data_watchdog(0.05)
+        deadline = time.monotonic() + 1.0
+        while stream.ready and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert stream.ready is False
+        assert close_called.wait(0.2)
+        with pytest.raises(RuntimeError, match="did not stop"):
+            stream.close(timeout_s=0.01)
+    finally:
+        release_recv.set()
+        if stream._thread is not None:
+            stream._thread.join(timeout=1.0)
+        stream._watchdog_stop.set()
+        if stream._watchdog_thread is not None:
+            stream._watchdog_thread.join(timeout=1.0)
 
 
 def test_market_stream_counts_only_near_touch_bid_depth():

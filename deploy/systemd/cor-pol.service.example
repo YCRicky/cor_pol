@@ -1,9 +1,10 @@
 [Unit]
 Description=cor_pol Aftertake Polymarket CLOB service
-After=network-online.target
-Wants=network-online.target
-StartLimitIntervalSec=60
-StartLimitBurst=6
+After=network-online.target time-sync.target
+Wants=network-online.target time-sync.target
+# Runtime watchdog exits are recoverable by design. Never let a burst of
+# provider failures leave the service permanently stopped at start-limit-hit.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -14,9 +15,11 @@ WorkingDirectory=/var/lib/cor-pol
 EnvironmentFile=/opt/cor_pol/.env
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=/opt/cor_pol/src
+Environment=AFTERTAKE_OUT_DIR=/var/lib/cor-pol/out
+ReadWritePaths=/var/lib/cor-pol/out
 ExecStart=/opt/cor_pol/.venv/bin/python -m aftertake.runner --forever
 Restart=always
-RestartSec=5
+RestartSec=1
 TimeoutStopSec=20
 KillSignal=SIGTERM
 NoNewPrivileges=true

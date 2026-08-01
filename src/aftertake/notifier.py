@@ -151,6 +151,18 @@ def _format_event(kind: str, payload: Dict[str, Any], slug: str = "") -> str:
             f"qty={_number(payload['qty'])} assets={','.join(payload.get('assets', []))}\n"
             f"slug={payload['slug']} Gamma + CLOB WebSocket + Telegram ready"
         )
+    if kind == "ready":
+        reason = (
+            "account preflight passed; scheduler armed"
+            if not payload.get("dry_run")
+            else "scheduler armed"
+        )
+        return (
+            "[Aftertake] RUNTIME_READY\n"
+            f"mode={'SHADOW' if payload['dry_run'] else 'LIVE'} "
+            f"assets={','.join(payload.get('assets', []))}\n"
+            f"component=pm_runtime reason={reason}"
+        )
     if kind == "submitted":
         return "\n".join(
             [

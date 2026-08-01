@@ -9,6 +9,7 @@ VENV_PIP="${VENV_DIR}/bin/pip"
 ENV_FILE="${REPO_DIR}/.env"
 UNIT_SOURCE="${REPO_DIR}/deploy/systemd/cor-pol.service.example"
 UNIT_TARGET="/etc/systemd/system/cor-pol.service"
+OUT_DIR="/var/lib/cor-pol/out"
 
 test "$(id -u)" -eq 0 || { echo "run this script with sudo" >&2; exit 1; }
 if [[ "$(pwd -P)" != "${REPO_DIR}" ]]; then
@@ -72,6 +73,9 @@ require_env() {
 
 normalize_runtime_env
 
+install -d -o ubuntu -g ubuntu -m 0750 "${OUT_DIR}"
+test -w "${OUT_DIR}" || { echo "runtime output directory is not writable: ${OUT_DIR}" >&2; exit 2; }
+
 dry_run="$(read_env AFTERTAKE_DRY_RUN)"
 test "${dry_run}" = "true" || test "${dry_run}" = "false" || {
   echo "AFTERTAKE_DRY_RUN must be true or false" >&2; exit 2;
@@ -84,11 +88,49 @@ if test "${dry_run}" = "false"; then
   done
 fi
 
+if command -v timedatectl >/dev/null 2>&1; then
+  ntp_synchronized="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
+  test "${ntp_synchronized}" = "yes" || {
+    echo "system clock is not NTP-synchronized; refusing close-timestamp deployment" >&2
+    exit 3
+  }
+fi
+
 python3 -m venv "${VENV_DIR}"
-"${VENV_PIP}" install -e "${REPO_DIR}[live]"
+"${VENV_PIP}" install -e "${REPO_DIR}[dev,live]"
+"${VENV_PYTHON}" -m compileall -q "${REPO_DIR}/src"
+"${VENV_PYTHON}" -m ruff check "${REPO_DIR}/src" "${REPO_DIR}/tests"
+"${VENV_PYTHON}" -m pytest -q "${REPO_DIR}/tests"
 install -m 0644 "${UNIT_SOURCE}" "${UNIT_TARGET}"
 systemctl daemon-reload
 systemctl reset-failed cor-pol
 systemctl enable cor-pol
 systemctl restart cor-pol
+initial_pid="$(systemctl show cor-pol -p MainPID --value)"
+test "${initial_pid}" -gt 0 || { echo "cor-pol did not acquire a MainPID" >&2; exit 4; }
+ready_seen=0
+for _attempt in $(seq 1 120); do
+  sleep 1
+  systemctl is-active --quiet cor-pol || {
+    journalctl -u cor-pol -n 100 --no-pager >&2
+    exit 4
+  }
+  current_pid="$(systemctl show cor-pol -p MainPID --value)"
+  test "${current_pid}" = "${initial_pid}" || {
+    echo "cor-pol restarted during the deployment readiness gate" >&2
+    journalctl -u cor-pol -n 100 --no-pager >&2
+    exit 4
+  }
+  if test -f "${OUT_DIR}/runtime.jsonl" \
+    && grep -Eq '"kind"[[:space:]]*:[[:space:]]*"runtime_ready"' "${OUT_DIR}/runtime.jsonl" \
+    && grep -Eq "\"pid\"[[:space:]]*:[[:space:]]*${initial_pid}([[:space:],}]|$)" "${OUT_DIR}/runtime.jsonl"; then
+    ready_seen=1
+    break
+  fi
+done
+test "${ready_seen}" -eq 1 || {
+  echo "cor-pol did not reach RUNTIME_READY within 120 seconds" >&2
+  journalctl -u cor-pol -n 200 --no-pager >&2
+  exit 4
+}
 systemctl --no-pager --full status cor-pol

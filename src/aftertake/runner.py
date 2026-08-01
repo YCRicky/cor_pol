@@ -12,7 +12,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import re
+import sys
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -21,7 +23,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .config import Settings
-from .execution import OrderExecutor, OrderResult
+from .execution import HeartbeatLoop, OrderExecutor, OrderResult
 from .ledger import append_jsonl, rebuild_ledger
 from .live_sizing import LiveSizingDecision, compute_live_entry_size
 from .market_stream import MarketBookStream
@@ -49,6 +51,8 @@ from .rounds import CRYPTO_5M_WINDOW_S
 from .settlement import builder_fee_total, fee_total, settle_trade
 from .state import RuntimeLock, StateStore
 
+_TELEGRAM_NOTIFIER_TYPE = Notifier
+
 RUNTIME_RETRY_S = 5.0
 # A normal round's external work is bounded by the public HTTP timeout and the
 # order reconciliation deadline.  This larger supervisor bound is a last
@@ -58,13 +62,31 @@ ASSET_ROUND_TIMEOUT_S = 90.0
 # Allow the active round to reach its close plus stream shutdown/reconciliation
 # even when the process joins it after the five-minute boundary.  The fixed
 # timeout remains the minimum bound for a worker that is already past its close.
-ASSET_ROUND_COMPLETION_GRACE_S = 10.0
+ASSET_ROUND_COMPLETION_GRACE_S = 30.0
 RUNTIME_STALL_TIMEOUT_S = 180.0
 RUNTIME_WATCHDOG_INTERVAL_S = 5.0
+RUNTIME_WAITING_STAGE_TIMEOUT_S = 360.0
+RUNTIME_ACTIVE_STAGE_TIMEOUT_S = 600.0
+MAINTENANCE_TIMEOUT_S = 240.0
 # This only bounds how long the runner waits to re-check an already-recorded
 # websocket observation. Event confirmation and all thresholds remain in
 # PostCloseConfig.
 POST_CLOSE_POLL_INTERVAL_S = 0.005
+# Six assets share one conservative SDK client. Account preflight plus bounded
+# sequential metadata retries can consume roughly 75 seconds at their documented
+# socket limits; finish that I/O well before the ten-second scene gate.
+LIVE_PREFLIGHT_LEAD_S = 150.0
+_AUDIT_QUEUE: "queue.Queue[tuple]" = queue.Queue(maxsize=4096)
+_AUDIT_THREAD: Optional[threading.Thread] = None
+_AUDIT_THREAD_LOCK = threading.Lock()
+_NOTIFY_QUEUE: "queue.Queue[tuple]" = queue.Queue(maxsize=512)
+_NOTIFY_THREAD: Optional[threading.Thread] = None
+_NOTIFY_THREAD_LOCK = threading.Lock()
+_NOTIFY_REGISTRY: Dict[str, tuple] = {}
+_NOTIFY_REGISTRY_LOCK = threading.Lock()
+_NOTIFY_QUEUED: set[str] = set()
+_NOTIFY_QUEUED_LOCK = threading.Lock()
+_NOTIFY_RETRY_CAP_S = 60.0
 
 
 class RuntimeWatchdog:
@@ -120,13 +142,15 @@ class RuntimeWatchdog:
             with self._lock:
                 age = self._monotonic() - self._last_progress
                 stage = self._stage
-            # The scheduler can legitimately sleep until the next five-minute
-            # boundary, and an active round can legitimately wait for its
-            # post-close window. Both are bounded by their own round/asset
-            # supervisor; they are not proof of a process stall here.
-            if stage in {"waiting_for_round", "active_round"}:
-                continue
-            if age >= self.stale_after_s:
+            # These stages legitimately outlive the default 180-second stall
+            # threshold, but they are not exempt forever. A broken scheduler or
+            # supervisor must still be recreated by systemd.
+            limit = self.stale_after_s
+            if stage == "waiting_for_round":
+                limit = max(limit, RUNTIME_WAITING_STAGE_TIMEOUT_S)
+            elif stage == "active_round":
+                limit = max(limit, RUNTIME_ACTIVE_STAGE_TIMEOUT_S)
+            if age >= limit:
                 self._exit_fn(1)
                 return
 
@@ -187,6 +211,80 @@ def current_btc_5m_slug(now: Optional[int] = None) -> Tuple[str, int, int]:
     return current_crypto_5m_slug("BTC", now)
 
 
+def _write_audit_now(
+    settings: Settings,
+    store: StateStore,
+    kind: str,
+    payload: Dict[str, Any],
+    slug: str = "",
+) -> None:
+    if getattr(store, "closed", False):
+        return
+    failures: List[str] = []
+    try:
+        store.append_event(kind, payload, slug=slug)
+    except Exception as exc:
+        failures.append("sqlite:%s" % _safe_transport_message(exc))
+    target = settings.out_dir / ("aftertake_%s.jsonl" % slug if slug else "runtime.jsonl")
+    try:
+        append_jsonl(target, {"kind": kind, **payload})
+    except Exception as exc:
+        failures.append("jsonl:%s" % _safe_transport_message(exc))
+    if failures:
+        # stderr is captured by journald under systemd. Diagnostic persistence
+        # failures must be visible, but must never suppress Telegram or turn a
+        # qualified order into a retry.
+        print(
+            json.dumps(
+                {
+                    "kind": "audit_persistence_failed",
+                    "event": kind,
+                    "slug": slug,
+                    "errors": failures,
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _audit_worker() -> None:
+    while True:
+        settings, store, kind, payload, slug = _AUDIT_QUEUE.get()
+        try:
+            try:
+                _write_audit_now(settings, store, kind, payload, slug)
+            except Exception as exc:
+                print(
+                    json.dumps(
+                        {
+                            "kind": "audit_worker_error",
+                            "event": kind,
+                            "slug": slug,
+                            "error": _safe_transport_message(exc),
+                        },
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
+        finally:
+            _AUDIT_QUEUE.task_done()
+
+
+def _ensure_audit_worker() -> None:
+    global _AUDIT_THREAD
+    with _AUDIT_THREAD_LOCK:
+        if _AUDIT_THREAD is None or not _AUDIT_THREAD.is_alive():
+            _AUDIT_THREAD = threading.Thread(
+                target=_audit_worker,
+                daemon=True,
+                name="aftertake-audit-writer",
+            )
+            _AUDIT_THREAD.start()
+
+
 def _audit(
     settings: Settings,
     store: StateStore,
@@ -194,9 +292,86 @@ def _audit(
     payload: Dict[str, Any],
     slug: str = "",
 ) -> None:
-    store.append_event(kind, payload, slug=slug)
-    target = settings.out_dir / ("aftertake_%s.jsonl" % slug if slug else "runtime.jsonl")
-    append_jsonl(target, {"kind": kind, **payload})
+    # Asset/notification/maintenance workers must never block on diagnostic
+    # SQLite or disk I/O.  One bounded writer replaces unbounded per-event
+    # threads and keeps authoritative reservation state on the caller thread.
+    background_names = (
+        "aftertake-asset",
+        "aftertake-notifier",
+        "aftertake-maintenance",
+        "aftertake-order-event",
+    )
+    if threading.current_thread().name.startswith(background_names):
+        _ensure_audit_worker()
+        try:
+            _AUDIT_QUEUE.put_nowait((settings, store, kind, dict(payload), slug))
+        except queue.Full:
+            print(
+                json.dumps(
+                    {"kind": "audit_queue_full", "event": kind, "slug": slug},
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+        return
+    _write_audit_now(settings, store, kind, payload, slug)
+
+
+def _mark_component_unhealthy(store: StateStore, component: str, detail: str) -> bool:
+    try:
+        return store.mark_component_unhealthy(component, detail)
+    except Exception as exc:
+        print(
+            json.dumps(
+                {
+                    "kind": "component_health_persistence_failed",
+                    "component": component,
+                    "target_status": "unhealthy",
+                    "error": str(exc),
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+
+
+def _mark_component_healthy(store: StateStore, component: str, detail: str) -> bool:
+    try:
+        return store.mark_component_healthy(component, detail)
+    except Exception as exc:
+        print(
+            json.dumps(
+                {
+                    "kind": "component_health_persistence_failed",
+                    "component": component,
+                    "target_status": "healthy",
+                    "error": str(exc),
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+
+
+def _notification_component(kind: str, payload: Dict[str, Any], slug: str) -> str:
+    component = str(payload.get("component") or "").strip()
+    asset = str(payload.get("asset") or "").strip().upper()
+    if component.startswith("asset:"):
+        return component
+    if not component and asset:
+        return "asset:%s" % asset
+    if component and slug:
+        return "%s:%s" % (component, slug)
+    if component:
+        return component
+    if kind in {"alert", "recovery_success"} and slug:
+        return "market:%s" % slug
+    return ""
 
 
 def _safe_notify(
@@ -209,11 +384,56 @@ def _safe_notify(
 ) -> None:
     if not notifier.enabled:
         return
+
+    message = format_event(kind, payload, slug)
+    component = _notification_component(kind, payload, slug)
+
+    # Production Telegram delivery is durable and at-least-once. Persist first
+    # even for an asset/heartbeat callback, then let one bounded sender perform
+    # network I/O outside the strategy and heartbeat threads. A failed send
+    # remains pending across process restarts.
+    # Injected test notifiers stay synchronous for deterministic assertions.
+    if isinstance(notifier, _TELEGRAM_NOTIFIER_TYPE):
+        notification_id = ""
+        try:
+            notification_id = store.enqueue_notification(
+                kind, message, slug, component
+            )
+        except Exception as exc:
+            # Journald remains the final observability channel if even the
+            # durable state volume is unavailable. Still attempt one queued
+            # TG delivery, but never perform Telegram I/O on this caller.
+            print(
+                json.dumps(
+                    {
+                        "kind": "notification_persistence_failed",
+                        "event": kind,
+                        "slug": slug,
+                        "error": _safe_transport_message(exc),
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+        _register_notification_context(notifier, settings, store)
+        _queue_notification_delivery(
+            notifier,
+            settings,
+            store,
+            notification_id,
+            message,
+            kind,
+            slug,
+            component,
+            persist_before_send=False,
+        )
+        return
+
     try:
-        notifier.send(format_event(kind, payload, slug))
+        notifier.send(message)
         _audit(settings, store, "notification_sent", {"event": kind}, slug)
     except Exception as exc:
-        # Operator I/O must never create an order retry or process restart.
         _audit(
             settings,
             store,
@@ -221,6 +441,335 @@ def _safe_notify(
             {"event": kind, "error": str(exc)},
             slug,
         )
+
+
+def _transition_component_and_notify(
+    *,
+    store: StateStore,
+    component: str,
+    status: str,
+    detail: str,
+    notifier: Optional[Notifier],
+    settings: Settings,
+    kind: str,
+    payload: Dict[str, Any],
+    slug: str = "",
+    notify_on_no_transition: bool = False,
+) -> bool:
+    """Atomically persist a health edge and its Telegram outbox row."""
+
+    enabled = notifier is not None and notifier.enabled
+    if not enabled or not isinstance(notifier, _TELEGRAM_NOTIFIER_TYPE):
+        transitioned = (
+            _mark_component_healthy(store, component, detail)
+            if status == "healthy"
+            else _mark_component_unhealthy(store, component, detail)
+        )
+        if enabled and (transitioned or notify_on_no_transition):
+            _safe_notify(notifier, settings, store, kind, payload, slug)
+        return transitioned
+
+    message = format_event(kind, payload, slug)
+    try:
+        transitioned, notification_id = store.transition_component_and_enqueue_notification(
+            component=component,
+            status=status,
+            detail=detail,
+            kind=kind,
+            message=message,
+            slug=slug,
+            enqueue_on_no_transition=notify_on_no_transition,
+        )
+    except Exception as exc:
+        print(
+            json.dumps(
+                {
+                    "kind": "component_notification_transaction_failed",
+                    "component": component,
+                    "target_status": status,
+                    "error": _safe_transport_message(exc),
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+        transitioned = (
+            _mark_component_healthy(store, component, detail)
+            if status == "healthy"
+            else _mark_component_unhealthy(store, component, detail)
+        )
+        if transitioned or notify_on_no_transition:
+            _safe_notify(notifier, settings, store, kind, payload, slug)
+        return transitioned
+
+    if notification_id:
+        _register_notification_context(notifier, settings, store)
+        _queue_notification_delivery(
+            notifier,
+            settings,
+            store,
+            notification_id,
+            message,
+            kind,
+            slug,
+            component,
+        )
+    return transitioned
+
+
+def _register_notification_context(
+    notifier: Notifier,
+    settings: Settings,
+    store: StateStore,
+) -> None:
+    key = str(store.path.resolve())
+    with _NOTIFY_REGISTRY_LOCK:
+        _NOTIFY_REGISTRY[key] = (notifier, settings, store)
+    _ensure_notification_worker()
+
+
+def _queue_notification_delivery(
+    notifier: Notifier,
+    settings: Settings,
+    store: StateStore,
+    notification_id: str,
+    message: str,
+    kind: str,
+    slug: str,
+    component: str = "",
+    *,
+    persist_before_send: bool = False,
+) -> bool:
+    dedupe_id = str(notification_id or "")
+    if dedupe_id:
+        with _NOTIFY_QUEUED_LOCK:
+            if dedupe_id in _NOTIFY_QUEUED:
+                return True
+            _NOTIFY_QUEUED.add(dedupe_id)
+    try:
+        _NOTIFY_QUEUE.put_nowait(
+            (
+                notifier,
+                settings,
+                store,
+                dedupe_id,
+                str(message),
+                str(kind),
+                str(slug),
+                str(component),
+                bool(persist_before_send),
+            )
+        )
+        return True
+    except queue.Full:
+        if dedupe_id:
+            with _NOTIFY_QUEUED_LOCK:
+                _NOTIFY_QUEUED.discard(dedupe_id)
+        if persist_before_send and not dedupe_id:
+            try:
+                store.enqueue_notification(kind, message, slug, component)
+            except Exception as exc:
+                print(
+                    json.dumps(
+                        {
+                            "kind": "notification_persistence_failed",
+                            "event": kind,
+                            "slug": slug,
+                            "error": _safe_transport_message(exc),
+                        },
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
+        print(
+            json.dumps(
+                {
+                    "kind": "notification_queue_full",
+                    "event": kind,
+                    "slug": slug,
+                    "message": str(message)[:1000],
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+        # Persisted rows are recovered by the worker's periodic outbox scan.
+        return False
+
+
+def _notification_retry_delay(attempts: int) -> float:
+    return min(_NOTIFY_RETRY_CAP_S, float(2 ** min(max(0, int(attempts)), 6)))
+
+
+def _deliver_notification_task(task: tuple) -> None:
+    (
+        notifier,
+        settings,
+        store,
+        notification_id,
+        fallback_message,
+        fallback_kind,
+        fallback_slug,
+        fallback_component,
+        persist_before_send,
+    ) = task
+    if getattr(store, "closed", False):
+        return
+    row: Optional[Dict[str, Any]] = None
+    if persist_before_send and not notification_id:
+        try:
+            notification_id = store.enqueue_notification(
+                fallback_kind,
+                fallback_message,
+                fallback_slug,
+                fallback_component,
+            )
+        except Exception as exc:
+            print(
+                json.dumps(
+                    {
+                        "kind": "notification_persistence_failed",
+                        "event": fallback_kind,
+                        "slug": fallback_slug,
+                        "error": _safe_transport_message(exc),
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+    if notification_id:
+        try:
+            row = store.deliverable_notification(
+                notification_id, ready_at=time.time()
+            )
+        except Exception as exc:
+            print(
+                json.dumps(
+                    {
+                        "kind": "notification_outbox_read_failed",
+                        "notification_id": notification_id,
+                        "error": _safe_transport_message(exc),
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+        if row is None:
+            return
+    message = str((row or {}).get("message") or fallback_message)
+    kind = str((row or {}).get("kind") or fallback_kind)
+    slug = str((row or {}).get("slug") or fallback_slug)
+    attempts = int((row or {}).get("attempts") or 0)
+    try:
+        notifier.send(message)
+        if notification_id:
+            store.mark_notification_sent(notification_id)
+        _audit(settings, store, "notification_sent", {"event": kind}, slug)
+    except Exception as exc:
+        if notification_id:
+            try:
+                store.mark_notification_failed(
+                    notification_id,
+                    _safe_transport_message(exc),
+                    retry_at=time.time() + _notification_retry_delay(attempts),
+                )
+            except Exception as persistence_exc:
+                print(
+                    json.dumps(
+                        {
+                            "kind": "notification_outbox_ack_failed",
+                            "notification_id": notification_id,
+                            "error": _safe_transport_message(persistence_exc),
+                        },
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
+        _audit(
+            settings,
+            store,
+            "notification_failed",
+            {"event": kind, "error": _safe_transport_message(exc)},
+            slug,
+        )
+
+
+def _queue_pending_notifications() -> None:
+    with _NOTIFY_REGISTRY_LOCK:
+        contexts = list(_NOTIFY_REGISTRY.values())
+    ready_at = time.time()
+    for notifier, settings, store in contexts:
+        if getattr(store, "closed", False):
+            with _NOTIFY_REGISTRY_LOCK:
+                _NOTIFY_REGISTRY.pop(str(store.path.resolve()), None)
+            continue
+        try:
+            rows = store.pending_notifications(ready_at=ready_at, limit=100)
+        except Exception:
+            continue
+        for row in rows:
+            _queue_notification_delivery(
+                notifier,
+                settings,
+                store,
+                str(row["notification_id"]),
+                str(row["message"]),
+                str(row["kind"]),
+                str(row["slug"]),
+                str(row.get("component") or ""),
+            )
+
+
+def _notification_worker() -> None:
+    while True:
+        try:
+            task = _NOTIFY_QUEUE.get(timeout=0.5)
+        except queue.Empty:
+            _queue_pending_notifications()
+            continue
+        notification_id = str(task[3] or "")
+        try:
+            _deliver_notification_task(task)
+        except Exception as exc:
+            # One malformed row or closed test store must never kill the sole
+            # sender and strand every later production notification.
+            print(
+                json.dumps(
+                    {
+                        "kind": "notification_worker_error",
+                        "error": _safe_transport_message(exc),
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+        finally:
+            if notification_id:
+                with _NOTIFY_QUEUED_LOCK:
+                    _NOTIFY_QUEUED.discard(notification_id)
+            _NOTIFY_QUEUE.task_done()
+        if _NOTIFY_QUEUE.empty():
+            _queue_pending_notifications()
+
+
+def _ensure_notification_worker() -> None:
+    global _NOTIFY_THREAD
+    with _NOTIFY_THREAD_LOCK:
+        if _NOTIFY_THREAD is None or not _NOTIFY_THREAD.is_alive():
+            _NOTIFY_THREAD = threading.Thread(
+                target=_notification_worker,
+                daemon=True,
+                name="aftertake-notifier",
+            )
+            _NOTIFY_THREAD.start()
 
 
 
@@ -381,15 +930,25 @@ def _required_cash(settings: Settings, metadata: MarketMetadata) -> float:
 
 
 class _RoundAccountPreflight:
-    """Share one live account snapshot across the configured assets in a round."""
+    """Share one snapshot and one atomic spend budget across all round assets."""
 
-    def __init__(self, settings: Settings, public: PolymarketPublicClient, gateway: V2ClobGateway):
+    def __init__(
+        self,
+        settings: Settings,
+        store: StateStore,
+        public: PolymarketPublicClient,
+        gateway: V2ClobGateway,
+    ):
         self._settings = settings
+        self._store = store
         self._public = public
         self._gateway = gateway
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._snapshot: Optional[LivePreflight] = None
         self._error: Optional[BaseException] = None
+        self._existing_exposure = 0.0
+        self._claimed_costs: Dict[int, float] = {}
+        self._next_claim_id = 1
 
     def snapshot(self) -> LivePreflight:
         with self._lock:
@@ -401,10 +960,76 @@ class _RoundAccountPreflight:
                     # Per-market metadata determines the minimum order requirement.
                     # It is checked against this one fresh account snapshot below.
                     self._snapshot = self._gateway.preflight(geo, 0.0)
+                    # Freeze pre-existing durable risk once. New reservations in
+                    # this same round are represented by ``_claimed_costs`` so
+                    # they are never double-counted while workers race.
+                    self._existing_exposure = max(0.0, self._store.total_risk_exposure())
                 except Exception as exc:
                     self._error = exc
                     raise
             return self._snapshot
+
+    def claim_entry_size(
+        self,
+        *,
+        price: float,
+        available_size: float,
+        metadata: MarketMetadata,
+    ) -> tuple[LiveSizingDecision, int]:
+        """Floor-size and atomically reserve cash for one candidate."""
+
+        with self._lock:
+            preflight = self.snapshot()
+            collateral = preflight.collateral
+            total_budget = (
+                min(float(collateral.balance), float(collateral.allowance))
+                * float(self._settings.live_max_account_risk_fraction)
+            )
+            remaining = max(
+                0.0,
+                total_budget
+                - self._existing_exposure
+                - sum(self._claimed_costs.values()),
+            )
+            if remaining <= 0:
+                raise RiskRejected("shared_account_risk_budget_exhausted")
+
+            fraction = float(self._settings.live_max_account_risk_fraction)
+            effective_collateral = BalanceAllowance(
+                balance=min(float(collateral.balance), remaining / fraction),
+                allowance=min(float(collateral.allowance), remaining),
+                raw={"shared_round_budget": True},
+            )
+            sizing = compute_live_entry_size(
+                price=price,
+                available_size=available_size,
+                collateral=effective_collateral,
+                metadata=metadata,
+                max_account_fraction=fraction,
+                quantity_step=self._settings.live_quantity_floor_step,
+            )
+            if not sizing.accepted:
+                raise RiskRejected(sizing.reason or "shared_account_sizing_rejected")
+            if sizing.estimated_total_cost > remaining + 1e-9:
+                raise RiskRejected("shared_account_risk_budget_exceeded")
+            claim_id = self._next_claim_id
+            self._next_claim_id += 1
+            self._claimed_costs[claim_id] = sizing.estimated_total_cost
+            # Preserve the real account snapshot in audit output while the
+            # sizing budget records the remaining shared cap used by this claim.
+            sizing = replace(
+                sizing,
+                account_balance=float(collateral.balance),
+                collateral_allowance=float(collateral.allowance),
+                risk_budget=remaining,
+            )
+            return sizing, claim_id
+
+    def release_claim(self, claim_id: int) -> None:
+        """Release a claim only when no durable order intent was created."""
+
+        with self._lock:
+            self._claimed_costs.pop(int(claim_id), None)
 
 
 def _check_preflight_collateral(preflight: LivePreflight, required_cash: float) -> None:
@@ -444,7 +1069,15 @@ def _is_transient_transport_error(exc: BaseException) -> bool:
         return True
     return status_code is None and any(
         phrase in message
-        for phrase in ("request exception", "connection", "timeout", "temporarily unavailable")
+        for phrase in (
+            "request exception",
+            "connection",
+            "timeout",
+            "temporarily unavailable",
+            "market stream",
+            "websocket",
+            "socket",
+        )
     )
 
 
@@ -469,6 +1102,8 @@ def _audit_asset_transport_error(
         "status_code": status_code,
         "error_message": _safe_transport_message(exc),
     }
+    component = "asset:%s" % asset
+    detail = "%s: %s" % (phase, payload["error_message"])
     _audit(
         settings,
         store,
@@ -477,14 +1112,24 @@ def _audit_asset_transport_error(
         slug,
     )
     if notifier is not None:
-        _safe_notify(
-            notifier,
-            settings,
-            store,
-            "alert",
-            {"reason": "asset transport error", **payload},
-            slug,
+        _transition_component_and_notify(
+            store=store,
+            component=component,
+            status="unhealthy",
+            detail=detail,
+            notifier=notifier,
+            settings=settings,
+            kind="alert",
+            payload={
+                "reason": "asset transport error",
+                "component": component,
+                **payload,
+            },
+            slug=slug,
+            notify_on_no_transition=True,
         )
+    else:
+        _mark_component_unhealthy(store, component, detail)
 
 
 def _update_asset_error_state(
@@ -496,26 +1141,62 @@ def _update_asset_error_state(
     decisions: List[PostCloseDecision],
     error_state: Optional[set[str]],
 ) -> None:
-    if error_state is None:
-        return
     key = "asset:%s" % asset
     failed = any(
         "transport_error" in str(decision.reason)
-        or str(decision.reason) == "asset_round_timeout"
+        or str(decision.reason)
+        in {
+            "asset_round_timeout",
+            "asset_round_error",
+            "market_stream_not_ready",
+            "paired_post_close_state_not_fresh",
+            "post_close_preflight_missed",
+            "entry_runtime_error",
+        }
         for decision in decisions
     )
     if failed:
-        error_state.add(key)
-    elif key in error_state:
-        error_state.remove(key)
-        if notifier is not None:
-            _safe_notify(
-                notifier,
-                settings,
-                store,
-                "recovery_success",
-                {"component": "asset:%s" % asset, "reason": "asset round recovered"},
+        detail = ",".join(sorted({str(item.reason) for item in decisions}))
+        if notifier is not None and any(
+            str(item.reason) == "paired_post_close_state_not_fresh"
+            for item in decisions
+        ):
+            _transition_component_and_notify(
+                store=store,
+                component=key,
+                status="unhealthy",
+                detail=detail,
+                notifier=notifier,
+                settings=settings,
+                kind="alert",
+                payload={
+                    "reason": "paired post-close book freshness failed",
+                    "component": key,
+                    "asset": asset,
+                    "error_type": "MarketDataFreshnessError",
+                    "error_message": detail,
+                },
+                notify_on_no_transition=True,
             )
+        else:
+            _mark_component_unhealthy(store, key, detail)
+        if error_state is not None:
+            error_state.add(key)
+    else:
+        force_notify = error_state is not None and key in error_state
+        if error_state is not None:
+            error_state.discard(key)
+        _transition_component_and_notify(
+            store=store,
+            component=key,
+            status="healthy",
+            detail="asset round completed",
+            notifier=notifier,
+            settings=settings,
+            kind="recovery_success",
+            payload={"component": key, "reason": "asset round recovered"},
+            notify_on_no_transition=force_notify,
+        )
 
 
 def _entry_qty_for_decision(
@@ -524,7 +1205,8 @@ def _entry_qty_for_decision(
     decision: PostCloseDecision,
     metadata: MarketMetadata,
     preflight: Optional[LivePreflight],
-) -> tuple[float, Optional[LiveSizingDecision]]:
+    round_preflight: Optional[_RoundAccountPreflight] = None,
+) -> tuple[float, Optional[LiveSizingDecision], Optional[int]]:
     if decision.entry_ask is None or decision.entry_ask_size is None:
         raise RiskRejected("entry decision has no executable ask")
     if settings.dry_run:
@@ -543,9 +1225,16 @@ def _entry_qty_for_decision(
         )
         if not sizing.accepted:
             raise RiskRejected(sizing.reason or "dry_run_simulated_sizing_rejected")
-        return sizing.qty, sizing
+        return sizing.qty, sizing, None
     if preflight is None:
         raise RiskRejected("live_preflight_snapshot_missing")
+    if round_preflight is not None:
+        sizing, claim_id = round_preflight.claim_entry_size(
+            price=decision.entry_ask,
+            available_size=decision.entry_ask_size,
+            metadata=metadata,
+        )
+        return sizing.qty, sizing, claim_id
     sizing = compute_live_entry_size(
         price=decision.entry_ask,
         available_size=decision.entry_ask_size,
@@ -556,7 +1245,7 @@ def _entry_qty_for_decision(
     )
     if not sizing.accepted:
         raise RiskRejected(sizing.reason or "live_sizing_rejected")
-    return sizing.qty, sizing
+    return sizing.qty, sizing, None
 
 
 def run_round(
@@ -576,7 +1265,8 @@ def run_round(
 ) -> List[PostCloseDecision]:
     """Run exactly one newly opened 5-minute Aftertake round.
 
-    The expensive authenticated checks are complete ten seconds before close.
+    The expensive authenticated checks begin two minutes before close and must
+    complete before the close-critical window.
     The entry path after the classifier confirms does not perform REST, Telegram
     or retry I/O, so a qualifying residual ask is not intentionally delayed.
     """
@@ -607,14 +1297,24 @@ def run_round(
     seen_decisions: set = set()
     preflight_done = settings.dry_run
     live_preflight: Optional[LivePreflight] = None
-    preflight_at = float(round_end) - 10.0
-    stream_recovery_pending = False
+    preflight_at = float(round_end) - LIVE_PREFLIGHT_LEAD_S
+    stream_health_confirmed = False
+    stream_data_watchdog_armed = False
+    stream_component = "market_stream:%s" % active_asset
 
     stream.start()
     stream_generation = int(getattr(stream, "generation", 0))
     try:
         while True:
             now = float(clock())
+            if (
+                not stream_data_watchdog_armed
+                and now >= round_end - max(1.0, classifier_cfg.pre_close_latest_max_age_s * 4.0)
+            ):
+                arm_data_watchdog = getattr(stream, "arm_market_data_watchdog", None)
+                if callable(arm_data_watchdog):
+                    arm_data_watchdog(classifier_cfg.pre_close_latest_max_age_s)
+                stream_data_watchdog_armed = True
             current_generation = int(getattr(stream, "generation", stream_generation))
             if current_generation != stream_generation:
                 # A reconnect clears the stream's paired books. Do not let the
@@ -633,30 +1333,40 @@ def run_round(
                     slug,
                 )
                 if int(getattr(stream, "reconnect_count", 0)) > 0:
-                    stream_recovery_pending = True
-                    _safe_notify(
-                        notifier,
-                        settings,
-                        store,
-                        "alert",
-                        {
+                    stream_health_confirmed = False
+                    stream_error = str(
+                        getattr(stream, "last_error", "") or "market stream disconnected"
+                    )
+                    _transition_component_and_notify(
+                        store=store,
+                        component=stream_component,
+                        status="unhealthy",
+                        detail=stream_error,
+                        notifier=notifier,
+                        settings=settings,
+                        kind="alert",
+                        payload={
                             "reason": "market stream reconnecting",
-                            "component": "market_stream",
+                            "component": stream_component,
                             "generation": stream_generation,
                             "reconnect_count": int(getattr(stream, "reconnect_count", 0)),
-                            "error_message": str(getattr(stream, "last_error", "") or ""),
+                            "error_message": stream_error,
                         },
-                        slug,
+                        slug=slug,
+                        notify_on_no_transition=True,
                     )
-            if stream_recovery_pending and stream.ready:
-                stream_recovery_pending = False
-                _safe_notify(
-                    notifier,
-                    settings,
-                    store,
-                    "recovery_success",
-                    {
-                        "component": "market_stream",
+            if stream.ready and not stream_health_confirmed:
+                stream_health_confirmed = True
+                _transition_component_and_notify(
+                    store=store,
+                    component=stream_component,
+                    status="healthy",
+                    detail="fresh paired book restored",
+                    notifier=notifier,
+                    settings=settings,
+                    kind="recovery_success",
+                    payload={
+                        "component": stream_component,
                         "reason": "fresh paired book restored",
                         "details": "generation=%s reconnect_count=%s"
                         % (
@@ -664,7 +1374,7 @@ def run_round(
                             int(getattr(stream, "reconnect_count", 0)),
                         ),
                     },
-                    slug,
+                    slug=slug,
                 )
             if now < preflight_at:
                 # Stay subscribed for the complete scene-gate history without polling.
@@ -681,7 +1391,18 @@ def run_round(
                         reason += ": " + stream.last_error
                     decisions.append(PostCloseDecision("hold", "market_stream_not_ready"))
                     _audit(settings, store, "data_guard", {"reason": reason}, slug)
-                    _safe_notify(notifier, settings, store, "alert", {"reason": reason}, slug)
+                    _transition_component_and_notify(
+                        store=store,
+                        component=stream_component,
+                        status="unhealthy",
+                        detail=reason,
+                        notifier=notifier,
+                        settings=settings,
+                        kind="alert",
+                        payload={"reason": reason, "component": stream_component},
+                        slug=slug,
+                        notify_on_no_transition=True,
+                    )
                     break
                 sleep(min(0.05, max(0.0, round_end - now)))
                 continue
@@ -766,8 +1487,9 @@ def run_round(
                 now_ts=now,
                 qty=settings.qty,
             )
-            latest_ts = decision.audit.get("confirmation_timestamps", [None])[-1] if decision.audit else None
-            key = (decision.action, decision.reason, decision.side, latest_ts)
+            # One audit row per logical transition avoids close-time disk I/O
+            # on every websocket timestamp.
+            key = (decision.action, decision.reason, decision.side)
             audit_decision = None
             if key not in seen_decisions:
                 decisions.append(decision)
@@ -779,14 +1501,17 @@ def run_round(
                 sleep(POST_CLOSE_POLL_INTERVAL_S)
                 continue
 
+            round_claim_id: Optional[int] = None
+            claim_committed = False
             try:
                 # Do not re-fetch the public REST book here: the websocket
                 # observation is the executable premise and this is its short window.
-                entry_qty, live_sizing = _entry_qty_for_decision(
+                entry_qty, live_sizing, round_claim_id = _entry_qty_for_decision(
                     settings=settings,
                     decision=decision,
                     metadata=metadata,
                     preflight=live_preflight,
+                    round_preflight=round_preflight,
                 )
                 if live_sizing is not None:
                     # Dynamic sizing can be larger than AFTERTAKE_QTY, which is
@@ -837,6 +1562,9 @@ def run_round(
                         _audit_decision(settings, store, audit_decision, slug)
                     decisions.append(PostCloseDecision("hold", "market_already_reserved"))
                     break
+                # SQLite now owns the fail-closed reservation. Keep the shared
+                # cash claim even if submission acknowledgement is ambiguous.
+                claim_committed = True
                 decision_ts = float(clock())
                 book_observed_ts = None
                 try:
@@ -854,7 +1582,16 @@ def run_round(
                     "expected_taker_delay_ms": metadata.expected_taker_delay_ms,
                 }
                 result = executor.execute_reserved(record, metadata, fast=True, timing_context=timing_context)
-                executor.wait_for_event_delivery()
+                if (
+                    round_claim_id is not None
+                    and result.terminal
+                    and result.filled_qty <= 0
+                    and round_preflight is not None
+                ):
+                    # A definitive zero-fill consumes no account collateral;
+                    # let another asset in this same close window use it.
+                    round_preflight.release_claim(round_claim_id)
+                    round_claim_id = None
                 if audit_decision is not None:
                     _audit_decision(settings, store, audit_decision, slug)
                 _audit(
@@ -886,11 +1623,35 @@ def run_round(
                     available_size=decision.entry_ask_size,
                     simulated_take=result.dry_run,
                 )
+                result_raw = result.raw or {}
+                if (
+                    (
+                        result.submission_state == "unknown"
+                        and bool(result_raw.get("ambiguous_submission"))
+                    )
+                    or bool(result_raw.get("reconcile_transport_error"))
+                ):
+                    decisions.append(
+                        PostCloseDecision("hold", "submit_transport_error", side=decision.side)
+                    )
                 break
             except (RiskRejected, LivePreflightError) as exc:
                 if audit_decision is not None:
                     _audit_decision(settings, store, audit_decision, slug)
                 _audit(settings, store, "entry_blocked", {"reason": str(exc)}, slug)
+                _safe_notify(
+                    notifier,
+                    settings,
+                    store,
+                    "alert",
+                    {
+                        "reason": "entry blocked by risk/preflight",
+                        "component": "entry_risk",
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
+                    },
+                    slug,
+                )
                 decisions.append(PostCloseDecision("hold", str(exc), side=decision.side))
                 break
             except Exception as exc:
@@ -898,7 +1659,11 @@ def run_round(
                     _audit_decision(settings, store, audit_decision, slug)
                 _audit(settings, store, "entry_runtime_error", {"error": str(exc)}, slug)
                 _safe_notify(notifier, settings, store, "alert", {"reason": str(exc)}, slug)
+                decisions.append(PostCloseDecision("hold", "entry_runtime_error", side=decision.side))
                 break
+            finally:
+                if round_claim_id is not None and not claim_committed and round_preflight is not None:
+                    round_preflight.release_claim(round_claim_id)
     finally:
         stream.close()
 
@@ -919,12 +1684,13 @@ def _run_asset_rounds(
     sleep: Callable[[float], None] = time.sleep,
     timeout_s: float = ASSET_ROUND_TIMEOUT_S,
     error_state: Optional[set[str]] = None,
+    restart_fn: Optional[Callable[[], None]] = None,
 ) -> Dict[str, List[PostCloseDecision]]:
     """Run all configured assets for the same 5-minute round concurrently."""
 
     assets = tuple(settings.assets)
     round_preflight = (
-        _RoundAccountPreflight(settings, public, live_gateway)
+        _RoundAccountPreflight(settings, store, public, live_gateway)
         if settings.is_live and live_gateway is not None
         else None
     )
@@ -958,12 +1724,14 @@ def _run_asset_rounds(
     # enough pre-close lead remains.  A fixed 90-second deadline would then
     # kill a perfectly healthy worker before that market closes (the exact
     # failure mode seen after a mid-round service restart).  Budget through
-    # the round close plus a small cleanup margin, while retaining the fixed
-    # timeout as the minimum for already-expired/stuck rounds.
+    # the round close, the configured reconciliation lifecycle, and cleanup,
+    # while retaining the fixed timeout as the minimum for already-expired or
+    # genuinely stuck workers.
     round_completion_s = (
         float(round_start)
         + CRYPTO_5M_WINDOW_S
         + float(active_classifier_config().post_close_end_s)
+        + float(settings.reconcile_timeout_s)
         + ASSET_ROUND_COMPLETION_GRACE_S
         - time.time()
     )
@@ -974,8 +1742,29 @@ def _run_asset_rounds(
             remaining = max(0.0, deadline - time.monotonic())
             done, pending = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
             if not done:
+                if restart_fn is not None:
+                    try:
+                        print(
+                            json.dumps(
+                                {
+                                    "kind": "asset_supervisor_timeout",
+                                    "action": "process_restart_requested",
+                                },
+                                sort_keys=True,
+                            ),
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    finally:
+                        threading.Thread(
+                            target=restart_fn,
+                            daemon=True,
+                            name="aftertake-supervisor-restart",
+                        ).start()
+                timed_out_names: List[str] = []
                 for future in pending:
                     asset = futures[future]
+                    timed_out_names.append(asset)
                     slug, _, _ = current_crypto_5m_slug(asset, round_start)
                     timeout_error = TimeoutError(
                         "asset round exceeded supervisor timeout %.1fs" % effective_timeout_s
@@ -987,7 +1776,7 @@ def _run_asset_rounds(
                         slug=slug,
                         phase="asset_round_timeout",
                         exc=timeout_error,
-                        notifier=notifier,
+                        notifier=None,
                     )
                     results[asset] = [PostCloseDecision("hold", "asset_round_timeout")]
                     _update_asset_error_state(
@@ -997,6 +1786,21 @@ def _run_asset_rounds(
                         asset=asset,
                         decisions=results[asset],
                         error_state=error_state,
+                    )
+                if notifier is not None:
+                    _safe_notify(
+                        notifier,
+                        settings,
+                        store,
+                        "alert",
+                        {
+                            "reason": "asset round supervisor timeout",
+                            "component": "asset_supervisor",
+                            "asset": ",".join(sorted(timed_out_names)),
+                            "phase": "asset_round_timeout",
+                            "error_type": "TimeoutError",
+                            "error_message": "uncancellable workers require process restart",
+                        },
                     )
                 break
             for future in done:
@@ -1014,9 +1818,21 @@ def _run_asset_rounds(
                         exc=exc,
                         notifier=notifier,
                     )
-                    results[asset] = [PostCloseDecision("hold", "asset_round_transport_error")]
-                    if not _is_transient_transport_error(exc):
-                        raise
+                    reason = (
+                        "asset_round_transport_error"
+                        if _is_transient_transport_error(exc)
+                        else "asset_round_error"
+                    )
+                    # A completed asset-local failure cannot leave an
+                    # uncancellable worker behind. Isolate the asset and allow
+                    # every other market plus the next round to continue.
+                    results[asset] = [PostCloseDecision("hold", reason)]
+                # Do not restart on the first completed asset-local transport
+                # error: another worker may already have POSTed and still be
+                # persisting its acknowledgement. The outer round loop requests
+                # one process restart only after all bounded workers finish.
+                # A genuinely hung worker is handled by the supervisor timeout
+                # branch above, where an immediate restart is required.
                 _update_asset_error_state(
                     settings=settings,
                     store=store,
@@ -1052,6 +1868,7 @@ def _select_next_round_start(
     now: float,
     processed_round_starts: set[int],
     sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.time,
 ) -> int:
     """Return the next runnable 5m round without skipping active markets.
 
@@ -1061,19 +1878,24 @@ def _select_next_round_start(
     round prevents the old 10-minute cadence bug.
     """
 
-    current = int(now)
-    active_start = current - current % 300
-    active_end = active_start + 300
-    classifier_cfg = active_classifier_config()
-    minimum_lead_s = (
-        classifier_cfg.pre_close_window_s
-        + classifier_cfg.pre_close_latest_max_age_s
-    )
-    if active_start not in processed_round_starts and active_end - float(now) >= minimum_lead_s:
-        return active_start
-    next_start = active_start + 300
-    sleep(max(0.0, float(next_start) - float(now)))
-    return next_start
+    observed_now = float(now)
+    while True:
+        current = int(observed_now)
+        active_start = current - current % 300
+        active_end = active_start + 300
+        classifier_cfg = active_classifier_config()
+        minimum_lead_s = max(
+            classifier_cfg.pre_close_window_s + classifier_cfg.pre_close_latest_max_age_s,
+            LIVE_PREFLIGHT_LEAD_S,
+        )
+        if (
+            active_start not in processed_round_starts
+            and active_end - observed_now >= minimum_lead_s
+        ):
+            return active_start
+        next_start = active_start + 300
+        sleep(max(0.0, float(next_start) - observed_now))
+        observed_now = float(clock())
 
 
 def _reconcile_startup(
@@ -1081,27 +1903,54 @@ def _reconcile_startup(
 ) -> None:
     unresolved = store.unresolved_orders()
     for record in unresolved:
-        if record.state == "execution_unknown" and not record.order_id:
-            # Legacy versions stored submit-path PM infrastructure failures as
-            # execution_unknown with no durable order id.  Current policy is to
-            # terminal-skip only that affected market at startup, not to keep
-            # alerting or globally block new entries.
+        component = "startup_reconciliation:%s" % record.intent_id
+        if not record.order_id:
+            # A crash can occur after the request leaves the process but before
+            # its acknowledgement/order id is persisted.  No local evidence can
+            # prove zero-fill, even on a later boot. Keep the risk unresolved,
+            # never retry the slug, and make the operator attach an
+            # authoritative id before reconciliation can continue.
             raw = dict(record.raw or {})
-            raw["classification"] = raw.get("classification") or record.error or "legacy_execution_unknown"
-            raw["startup_terminal_skip"] = True
-            raw["terminal_skip"] = True
+            reason = record.error or "startup_intent_has_no_order_id"
+            raw["classification"] = raw.get("classification") or reason
+            raw["ambiguous_submission"] = True
+            raw["requires_operator_order_id_recovery"] = True
             raw["order_type"] = raw.get("order_type") or settings.order_type
-            store.mark_terminal_execution(record.intent_id, 0.0, 0.0, raw, "startup_skipped")
+            store.mark_execution_unknown(record.intent_id, reason, raw)
             _audit(
                 settings,
                 store,
-                "startup_terminal_skip",
-                {"reason": record.error or "legacy_execution_unknown", "order_id": "n/a"},
+                "startup_execution_unknown",
+                {"reason": reason, "order_id": "n/a", "intent_id": record.intent_id},
                 record.slug,
+            )
+            _transition_component_and_notify(
+                store=store,
+                component=component,
+                status="unhealthy",
+                detail=reason,
+                notifier=notifier,
+                settings=settings,
+                kind="alert",
+                payload={
+                    "reason": "startup execution unknown; order_id recovery required",
+                    "component": component,
+                    "error_type": "MissingOrderId",
+                    "error_message": reason,
+                    "order_id": "n/a",
+                    "intent_id": record.intent_id,
+                },
+                slug=record.slug,
+                notify_on_no_transition=True,
             )
             continue
         try:
-            result = executor.reconcile_existing(record)
+            reconcile_once = getattr(executor, "reconcile_existing_once", None)
+            result = (
+                reconcile_once(record)
+                if callable(reconcile_once)
+                else executor.reconcile_existing(record)
+            )
         except Exception as exc:
             # One stale/temporarily unreachable order must not prevent the
             # daemon from scanning fresh markets.  The intent remains in the
@@ -1118,21 +1967,70 @@ def _reconcile_startup(
                 },
                 record.slug,
             )
-            _safe_notify(
-                notifier,
-                settings,
-                store,
-                "alert",
-                {
+            _transition_component_and_notify(
+                store=store,
+                component=component,
+                status="unhealthy",
+                detail=_safe_transport_message(exc),
+                notifier=notifier,
+                settings=settings,
+                kind="alert",
+                payload={
                     "reason": "startup reconciliation error",
-                    "component": "startup_reconciliation",
+                    "component": component,
                     "error_type": type(exc).__name__,
                     "error_message": _safe_transport_message(exc),
                     "order_id": record.order_id or "n/a",
                 },
-                record.slug,
+                slug=record.slug,
+                notify_on_no_transition=True,
             )
             continue
+        result_raw = result.raw or {}
+        reconciliation_transport_error = bool(
+            result_raw.get("reconcile_transport_error")
+            or result.error == "reconcile_transport_timeout"
+        )
+        if reconciliation_transport_error:
+            detail = str(
+                result_raw.get("error_message")
+                or result.error
+                or "authoritative CLOB reconciliation timed out"
+            )
+            _transition_component_and_notify(
+                store=store,
+                component=component,
+                status="unhealthy",
+                detail=detail,
+                notifier=notifier,
+                settings=settings,
+                kind="alert",
+                payload={
+                    "reason": "startup reconciliation transport error",
+                    "component": component,
+                    "error_type": "TimeoutError",
+                    "error_message": detail,
+                    "order_id": result.order_id or record.order_id,
+                },
+                slug=record.slug,
+                notify_on_no_transition=True,
+            )
+        else:
+            _transition_component_and_notify(
+                store=store,
+                component=component,
+                status="healthy",
+                detail="authoritative CLOB reconciliation completed",
+                notifier=notifier,
+                settings=settings,
+                kind="recovery_success",
+                payload={
+                    "component": component,
+                    "reason": "authoritative CLOB reconciliation restored",
+                    "order_id": result.order_id or record.order_id,
+                },
+                slug=record.slug,
+            )
         if result.terminal:
             _notify_order_result(notifier, settings, store, result, record.slug)
             continue
@@ -1162,8 +2060,14 @@ def reconcile_submitted_orders(
     for record in store.unresolved_orders():
         if record.state != "submitted" or not record.order_id:
             continue
+        component = "submitted_reconciliation:%s" % record.intent_id
         try:
-            result = executor.reconcile_existing(record)
+            reconcile_once = getattr(executor, "reconcile_existing_once", None)
+            result = (
+                reconcile_once(record)
+                if callable(reconcile_once)
+                else executor.reconcile_existing(record)
+            )
         except Exception as exc:
             # Reconciliation is best-effort and must not hold the next market
             # boundary hostage to one order or one provider outage.
@@ -1178,21 +2082,70 @@ def reconcile_submitted_orders(
                 },
                 record.slug,
             )
-            _safe_notify(
-                notifier,
-                settings,
-                store,
-                "alert",
-                {
+            _transition_component_and_notify(
+                store=store,
+                component=component,
+                status="unhealthy",
+                detail=_safe_transport_message(exc),
+                notifier=notifier,
+                settings=settings,
+                kind="alert",
+                payload={
                     "reason": "submitted order reconciliation error",
-                    "component": "submitted_reconciliation",
+                    "component": component,
                     "error_type": type(exc).__name__,
                     "error_message": _safe_transport_message(exc),
                     "order_id": record.order_id,
                 },
-                record.slug,
+                slug=record.slug,
+                notify_on_no_transition=True,
             )
             continue
+        result_raw = result.raw or {}
+        reconciliation_transport_error = bool(
+            result_raw.get("reconcile_transport_error")
+            or result.error == "reconcile_transport_timeout"
+        )
+        if reconciliation_transport_error:
+            detail = str(
+                result_raw.get("error_message")
+                or result.error
+                or "authoritative CLOB status probe timed out"
+            )
+            _transition_component_and_notify(
+                store=store,
+                component=component,
+                status="unhealthy",
+                detail=detail,
+                notifier=notifier,
+                settings=settings,
+                kind="alert",
+                payload={
+                    "reason": "submitted reconciliation transport error",
+                    "component": component,
+                    "error_type": "TimeoutError",
+                    "error_message": detail,
+                    "order_id": result.order_id or record.order_id,
+                },
+                slug=record.slug,
+                notify_on_no_transition=True,
+            )
+        else:
+            _transition_component_and_notify(
+                store=store,
+                component=component,
+                status="healthy",
+                detail="authoritative CLOB status read succeeded",
+                notifier=notifier,
+                settings=settings,
+                kind="recovery_success",
+                payload={
+                    "component": component,
+                    "reason": "submitted order reconciliation restored",
+                    "order_id": result.order_id or record.order_id,
+                },
+                slug=record.slug,
+            )
         results.append(result)
         if result.terminal:
             _notify_order_result(notifier, settings, store, result, record.slug)
@@ -1200,30 +2153,299 @@ def reconcile_submitted_orders(
 
 
 def _live_runtime(
-    settings: Settings, store: StateStore, public: PolymarketPublicClient, notifier: Notifier
+    settings: Settings,
+    store: StateStore,
+    public: PolymarketPublicClient,
+    notifier: Notifier,
+    *,
+    restart_fn: Optional[Callable[[], None]] = None,
 ) -> Tuple[Optional[V2ClobGateway], OrderExecutor]:
     if not settings.is_live:
         return None, OrderExecutor(settings=settings, store=store)
     gateway = V2ClobGateway.from_settings(settings)
-    geo = public.geoblock_status(settings.geo_endpoint)
-    gateway.preflight(geo, 0.0)
 
     def report_submission(kind: str, payload: Dict[str, Any]) -> None:
         if kind == "submitted":
             _safe_notify(notifier, settings, store, "submitted", payload, str(payload["slug"]))
         elif kind == "heartbeat_error":
-            _safe_notify(notifier, settings, store, "alert", payload)
+            error_payload = {**payload, "component": "clob_heartbeat"}
+            _transition_component_and_notify(
+                store=store,
+                component="clob_heartbeat",
+                status="unhealthy",
+                detail=str(
+                    payload.get("error_message")
+                    or payload.get("reason")
+                    or "heartbeat failed"
+                ),
+                notifier=notifier,
+                settings=settings,
+                kind="alert",
+                payload=error_payload,
+                notify_on_no_transition=True,
+            )
         elif kind == "heartbeat_recovered":
-            _safe_notify(notifier, settings, store, "recovery_success", {
-                **payload,
-                "component": "clob_heartbeat",
-            })
+            _transition_component_and_notify(
+                store=store,
+                component="clob_heartbeat",
+                status="healthy",
+                detail="heartbeat acknowledged",
+                notifier=notifier,
+                settings=settings,
+                kind="recovery_success",
+                payload={
+                    **payload,
+                    "component": "clob_heartbeat",
+                },
+            )
 
-    executor = OrderExecutor(
-        settings=settings, store=store, gateway=gateway, event_callback=report_submission
+    def heartbeat_fatal(reason: str, payload: Dict[str, Any]) -> None:
+        # This path must not touch SQLite, disk, or Telegram. The status event
+        # was already queued independently; journald gets a synchronous final
+        # line and systemd receives a deterministic non-zero process exit.
+        try:
+            print(
+                json.dumps(
+                    {
+                        "kind": "heartbeat_process_restart",
+                        "reason": reason,
+                        **payload,
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+        finally:
+            if restart_fn is not None:
+                restart_fn()
+            else:
+                os._exit(1)
+
+    heartbeat = HeartbeatLoop(
+        gateway,
+        settings.heartbeat_interval_s,
+        fatal_callback=heartbeat_fatal,
     )
-    _reconcile_startup(settings, store, executor, notifier)
-    return gateway, executor
+    heartbeat.status_callback = report_submission
+    try:
+        prepare = getattr(gateway, "prepare_order_submission", None)
+        if callable(prepare):
+            prepare()
+        heartbeat.start()
+        geo = public.geoblock_status(settings.geo_endpoint)
+        gateway.preflight(geo, 0.0)
+        executor = OrderExecutor(
+            settings=settings,
+            store=store,
+            gateway=gateway,
+            event_callback=report_submission,
+            account_heartbeat=heartbeat,
+        )
+        _reconcile_startup(settings, store, executor, notifier)
+        return gateway, executor
+    except Exception:
+        heartbeat.stop()
+        raise
+
+
+class _MaintenanceWorker:
+    """Run reconciliation/settlement off the five-minute scheduler thread.
+
+    Only one sweep may run at a time. A new round is always more important than
+    duplicating an already-running best-effort maintenance pass.
+    """
+
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        store: StateStore,
+        public: PolymarketPublicClient,
+        notifier: Notifier,
+        restart_fn: Callable[[], None],
+        timeout_s: float = MAINTENANCE_TIMEOUT_S,
+    ) -> None:
+        self._settings = settings
+        self._store = store
+        self._public = public
+        self._notifier = notifier
+        self._restart_fn = restart_fn
+        self._timeout_s = max(0.01, float(timeout_s))
+        self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._timer: Optional[threading.Timer] = None
+        self._done = threading.Event()
+
+    def trigger(self, executor: OrderExecutor) -> bool:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return False
+            thread = threading.Thread(
+                target=self._run_guarded,
+                args=(executor,),
+                daemon=True,
+                name="aftertake-maintenance",
+            )
+            self._thread = thread
+            self._done = threading.Event()
+            timer = threading.Timer(self._timeout_s, self._timeout)
+            timer.daemon = True
+            self._timer = timer
+            thread.start()
+            timer.start()
+            return True
+
+    def wait(self, timeout_s: float) -> None:
+        with self._lock:
+            thread = self._thread
+        if thread is not None:
+            thread.join(timeout=max(0.0, float(timeout_s)))
+
+    def _timeout(self) -> None:
+        if self._done.is_set():
+            return
+        # Restart on an independent path *before* touching SQLite, disk or
+        # Telegram. If the hung worker owns one of those resources, diagnostics
+        # must not prevent systemd from recreating the process.
+        try:
+            print(
+                json.dumps(
+                    {
+                        "kind": "maintenance_timeout",
+                        "timeout_s": self._timeout_s,
+                        "action": "process_restart_requested",
+                    },
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
+        finally:
+            threading.Thread(
+                target=self._restart_fn,
+                daemon=True,
+                name="aftertake-maintenance-restart",
+            ).start()
+        _audit(
+            self._settings,
+            self._store,
+            "maintenance_timeout",
+            {"timeout_s": self._timeout_s},
+        )
+        _transition_component_and_notify(
+            store=self._store,
+            component="maintenance_worker",
+            status="unhealthy",
+            detail="maintenance exceeded %.1fs" % self._timeout_s,
+            notifier=self._notifier,
+            settings=self._settings,
+            kind="alert",
+            payload={
+                "reason": "maintenance worker timeout",
+                "component": "maintenance_worker",
+                "error_type": "TimeoutError",
+                "error_message": "uncancellable maintenance requires process restart",
+            },
+            notify_on_no_transition=True,
+        )
+
+    def _run_guarded(self, executor: OrderExecutor) -> None:
+        try:
+            self._run(executor)
+            _transition_component_and_notify(
+                store=self._store,
+                component="maintenance_worker",
+                status="healthy",
+                detail="maintenance sweep completed",
+                notifier=self._notifier,
+                settings=self._settings,
+                kind="recovery_success",
+                payload={
+                    "component": "maintenance_worker",
+                    "reason": "maintenance sweep recovered",
+                },
+            )
+        except Exception as exc:
+            _audit(
+                self._settings,
+                self._store,
+                "maintenance_unhandled_error",
+                {"error": _safe_transport_message(exc)},
+            )
+            _transition_component_and_notify(
+                store=self._store,
+                component="maintenance_worker",
+                status="unhealthy",
+                detail=_safe_transport_message(exc),
+                notifier=self._notifier,
+                settings=self._settings,
+                kind="alert",
+                payload={
+                    "reason": "maintenance worker error",
+                    "component": "maintenance_worker",
+                    "error_type": type(exc).__name__,
+                    "error_message": _safe_transport_message(exc),
+                },
+                notify_on_no_transition=True,
+            )
+        finally:
+            self._done.set()
+            with self._lock:
+                timer = self._timer
+                self._timer = None
+            if timer is not None:
+                timer.cancel()
+
+    def _run(self, executor: OrderExecutor) -> None:
+        # py-clob-client-v2 owns one module-global httpx pool. Constructing a
+        # second wrapper is not transport isolation and only obscures failures.
+        # Single-probe reconciliation is low volume and the 240s worker timeout
+        # forces a clean process restart well before the next close.
+        maintenance_executor = executor
+        if self._settings.is_live and getattr(maintenance_executor, "gateway", None) is not None:
+            try:
+                reconcile_submitted_orders(
+                    settings=self._settings,
+                    store=self._store,
+                    executor=maintenance_executor,
+                    notifier=self._notifier,
+                )
+            except Exception as exc:
+                _audit(self._settings, self._store, "submitted_reconcile_error", {"error": str(exc)})
+                _safe_notify(
+                    self._notifier,
+                    self._settings,
+                    self._store,
+                    "alert",
+                    {
+                        "reason": "submitted reconciliation sweep error",
+                        "component": "submitted_reconciliation_sweep",
+                        "error_type": type(exc).__name__,
+                        "error_message": _safe_transport_message(exc),
+                    },
+                )
+        try:
+            settle_open_positions(
+                settings=self._settings,
+                store=self._store,
+                public=self._public,
+                notifier=self._notifier,
+            )
+        except Exception as exc:
+            _audit(self._settings, self._store, "settlement_sweep_error", {"error": str(exc)})
+            _safe_notify(
+                self._notifier,
+                self._settings,
+                self._store,
+                "alert",
+                {
+                    "reason": "settlement sweep error",
+                    "component": "settlement_sweep",
+                    "error_type": type(exc).__name__,
+                    "error_message": _safe_transport_message(exc),
+                },
+            )
 
 
 def _run_round_loop(
@@ -1254,6 +2476,14 @@ def _run_round_loop(
     last_runtime_error = ""
     active_error_components: set[str] = set()
     processed_round_starts: set[int] = set()
+    runtime_ready_sent = False
+    maintenance = _MaintenanceWorker(
+        settings=settings,
+        store=store,
+        public=public,
+        notifier=notifier,
+        restart_fn=(runtime_watchdog.request_restart if runtime_watchdog is not None else lambda: os._exit(1)),
+    )
 
     while forever or completed < max(1, rounds):
         if runtime_watchdog is not None:
@@ -1268,30 +2498,67 @@ def _run_round_loop(
                 _audit(settings, store, "runtime_connect_retry", {"reason": reason})
                 # Every occurrence is intentional operator evidence. Telegram
                 # noise is preferable to another silent runtime freeze.
-                _safe_notify(
-                    notifier,
-                    settings,
-                    store,
-                    "alert",
-                    {"reason": reason, "component": "pm_runtime"},
+                _transition_component_and_notify(
+                    store=store,
+                    component="pm_runtime",
+                    status="unhealthy",
+                    detail=reason,
+                    notifier=notifier,
+                    settings=settings,
+                    kind="alert",
+                    payload={"reason": reason, "component": "pm_runtime"},
+                    notify_on_no_transition=True,
                 )
                 last_runtime_error = reason
                 if runtime_watchdog is not None:
                     runtime_watchdog.beat("runtime_retry_wait")
                 sleep(RUNTIME_RETRY_S)
                 continue
-            if last_runtime_error:
-                _audit(settings, store, "runtime_recovered", {"previous_error": last_runtime_error})
-                _safe_notify(
-                    notifier,
+            runtime_recovered = _transition_component_and_notify(
+                store=store,
+                component="pm_runtime",
+                status="healthy",
+                detail="live preflight passed",
+                notifier=notifier,
+                settings=settings,
+                kind="recovery_success",
+                payload={"component": "pm_runtime", "reason": "PM runtime recovered"},
+                notify_on_no_transition=bool(last_runtime_error),
+            )
+            if last_runtime_error or runtime_recovered:
+                _audit(
                     settings,
                     store,
-                    "recovery_success",
-                    {"component": "pm_runtime", "reason": "PM runtime recovered"},
+                    "runtime_recovered",
+                    {"previous_error": last_runtime_error or "persisted failure from prior process"},
                 )
                 last_runtime_error = ""
+            if not runtime_ready_sent:
+                ready_payload = {
+                    "dry_run": settings.dry_run,
+                    "assets": list(settings.assets),
+                    "pid": os.getpid(),
+                    "code_sha": _resolve_code_sha(),
+                }
+                _audit(settings, store, "runtime_ready", ready_payload)
+                _safe_notify(notifier, settings, store, "ready", ready_payload)
+                runtime_ready_sent = True
             if runtime_watchdog is not None:
                 runtime_watchdog.beat("waiting_for_round")
+
+        # Dry-run has no live gateway/preflight branch above, but it must still
+        # publish the same readiness marker used by the deployment gate.  A
+        # process that reaches the scheduler is operational in either mode.
+        if not settings.is_live and not runtime_ready_sent:
+            ready_payload = {
+                "dry_run": settings.dry_run,
+                "assets": list(settings.assets),
+                "pid": os.getpid(),
+                "code_sha": _resolve_code_sha(),
+            }
+            _audit(settings, store, "runtime_ready", ready_payload)
+            _safe_notify(notifier, settings, store, "ready", ready_payload)
+            runtime_ready_sent = True
 
         if wait_for_next_boundary is not _wait_for_next_boundary:
             start = wait_for_next_boundary()
@@ -1299,7 +2566,8 @@ def _run_round_loop(
             start = _select_next_round_start(
                 now=time.time(),
                 processed_round_starts=processed_round_starts,
-                sleep=time.sleep,
+                sleep=sleep,
+                clock=time.time,
             )
         processed_round_starts.add(start)
         if runtime_watchdog is not None:
@@ -1314,6 +2582,7 @@ def _run_round_loop(
                 round_start=start,
                 notifier=notifier,
                 error_state=active_error_components,
+                restart_fn=(runtime_watchdog.request_restart if runtime_watchdog is not None else None),
             )
             timed_out_assets = [
                 asset
@@ -1333,63 +2602,48 @@ def _run_round_loop(
                     # against the next round; SQLite recovery handles any
                     # reserved intent conservatively on the fresh boot.
                     runtime_watchdog.request_restart()
+            transport_failed_assets = [
+                asset
+                for asset, decisions in round_results.items()
+                if any("transport_error" in str(item.reason) for item in decisions)
+            ]
+            if settings.is_live and transport_failed_assets and not timed_out_assets:
+                # py-clob-client-v2 uses one module-global httpx pool, so
+                # rebuilding only our gateway wrapper cannot replace a poisoned
+                # transport. Persist ambiguous risk, alert, then let systemd
+                # recreate the process and SDK pool; never retry this market.
+                _audit(
+                    settings,
+                    store,
+                    "live_transport_restart",
+                    {"assets": transport_failed_assets},
+                )
+                if runtime_watchdog is not None:
+                    runtime_watchdog.request_restart()
+                    return
             if runtime_watchdog is not None:
                 runtime_watchdog.beat("round_complete")
         except Exception as exc:
             _audit(settings, store, "round_runtime_error", {"error": str(exc)})
             _safe_notify(notifier, settings, store, "alert", {"reason": str(exc)})
-            # Rebuild the live gateway before the next fresh round. This covers
-            # CLOB/Gamma/auth transport failures without attempting an order retry.
-            if settings.is_live:
-                gateway = None
-                executor = OrderExecutor(settings=settings, store=store)
             if runtime_watchdog is not None:
                 # The asset supervisor may have detached a worker that raised
                 # a non-transport exception. Do not keep running alongside an
                 # uncancellable worker with shared state/client objects.
                 runtime_watchdog.request_restart()
         finally:
-            # Post-round only: pending GTC reconciliation and official settlement
-            # must never delay market discovery for the next 5-minute boundary.
-            if settings.is_live and gateway is not None:
-                try:
-                    reconcile_submitted_orders(settings=settings, store=store, executor=executor, notifier=notifier)
-                except Exception as exc:
-                    _audit(settings, store, "submitted_reconcile_error", {"error": str(exc)})
-                    _safe_notify(
-                        notifier,
-                        settings,
-                        store,
-                        "alert",
-                        {
-                            "reason": "submitted reconciliation sweep error",
-                            "component": "submitted_reconciliation_sweep",
-                            "error_type": type(exc).__name__,
-                            "error_message": _safe_transport_message(exc),
-                        },
-                    )
-            try:
-                settle_open_positions(settings=settings, store=store, public=public, notifier=notifier)
-            except Exception as exc:
-                # Settlement is informational and per-position fail-closed. A
-                # database/provider fault in the sweep must not stop discovery
-                # of the next round.
-                _audit(settings, store, "settlement_sweep_error", {"error": str(exc)})
-                _safe_notify(
-                    notifier,
-                    settings,
-                    store,
-                    "alert",
-                    {
-                        "reason": "settlement sweep error",
-                        "component": "settlement_sweep",
-                        "error_type": type(exc).__name__,
-                        "error_message": _safe_transport_message(exc),
-                    },
-                )
+            # Network maintenance runs on one coalescing daemon worker. It may
+            # overlap the quiet part of the next market, but can never hold the
+            # scheduler thread hostage at the next boundary.
+            maintenance.trigger(executor)
             if runtime_watchdog is not None:
                 runtime_watchdog.beat("finalize_complete")
         completed += 1
+
+    # Finite/manual runs retain the old observable contract for quick sweeps,
+    # without imposing an unbounded shutdown wait on a stuck provider call.
+    maintenance.wait(1.0)
+    executor.close()
 
 
 def _probe_stream(
@@ -1523,8 +2777,23 @@ def settle_open_positions(
 
     settled: List[Dict[str, Any]] = []
     for record in store.open_positions():
+        component = "settlement_position:%s" % record.intent_id
         try:
             pm_up = parse_pm_up(public.market_by_slug(record.slug, allow_closed=True))
+            _transition_component_and_notify(
+                store=store,
+                component=component,
+                status="healthy",
+                detail="Gamma settlement lookup succeeded",
+                notifier=notifier,
+                settings=settings,
+                kind="recovery_success",
+                payload={
+                    "component": component,
+                    "reason": "settlement lookup restored",
+                },
+                slug=record.slug,
+            )
             if pm_up is None:
                 store.append_event("settlement_pending", {"reason": "pm_unresolved"}, record.slug)
                 continue
@@ -1560,19 +2829,25 @@ def settle_open_positions(
         except Exception as exc:
             store.append_event("settlement_pending", {"reason": str(exc)}, record.slug)
             if notifier is not None:
-                _safe_notify(
-                    notifier,
-                    settings,
-                    store,
-                    "alert",
-                    {
+                _transition_component_and_notify(
+                    store=store,
+                    component=component,
+                    status="unhealthy",
+                    detail=_safe_transport_message(exc),
+                    notifier=notifier,
+                    settings=settings,
+                    kind="alert",
+                    payload={
                         "reason": "settlement position error",
-                        "component": "settlement_position",
+                        "component": component,
                         "error_type": type(exc).__name__,
                         "error_message": _safe_transport_message(exc),
                     },
-                    record.slug,
+                    slug=record.slug,
+                    notify_on_no_transition=True,
                 )
+            else:
+                _mark_component_unhealthy(store, component, _safe_transport_message(exc))
     return settled
 
 
@@ -1630,6 +2905,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.dry_run:
         settings = replace(settings, dry_run=True)
         settings.validate()
+    # Start the process watchdog before any output-directory, SQLite, BOOT
+    # audit, or Telegram work. A Type=simple systemd unit otherwise considers
+    # a process stuck in startup I/O healthy forever.
+    startup_watchdog = RuntimeWatchdog()
+    startup_watchdog.start()
+    startup_watchdog.beat("boot")
     settings.out_dir.mkdir(parents=True, exist_ok=True)
     store = StateStore(settings.state_db)
     public = PolymarketPublicClient(
@@ -1638,6 +2919,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         http=PublicHttpClient(resolve_overrides=parse_resolve_overrides(settings.resolve_overrides)),
     )
     notifier = Notifier(token=settings.telegram_token, chat_id=settings.telegram_chat_id)
+    executor: Optional[OrderExecutor] = None
     try:
         if args.status:
             print(json.dumps(_status_payload(settings, store), indent=2, sort_keys=True))
@@ -1684,8 +2966,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             }
             _audit(settings, store, "boot", boot_payload)
             _safe_notify(notifier, settings, store, "boot", boot_payload)
-            runtime_watchdog = RuntimeWatchdog()
-            runtime_watchdog.start()
+            runtime_watchdog = startup_watchdog
             try:
                 _run_round_loop(
                     settings=settings,
@@ -1699,7 +2980,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             finally:
                 runtime_watchdog.stop()
     finally:
+        if executor is not None:
+            executor.close()
         store.close()
+        startup_watchdog.stop()
     return 0
 
 

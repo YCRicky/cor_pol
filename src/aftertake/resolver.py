@@ -12,9 +12,38 @@ from __future__ import annotations
 import contextlib
 import random
 import socket
+import threading
 from typing import Dict, Iterator, List, Mapping
 
 ResolveOverrides = Dict[str, List[str]]
+
+
+# ``socket.getaddrinfo`` is process-global, while Aftertake opens one market
+# stream per asset.  A naive save/replace/restore context manager is therefore
+# corruptible when two threads leave their contexts in a different order than
+# they entered.  Keep one dispatcher installed while any override context is
+# active and select the override from thread-local state instead.
+_resolver_lock = threading.RLock()
+_resolver_local = threading.local()
+_resolver_base = socket.getaddrinfo
+_resolver_contexts = 0
+
+
+def _dispatched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):  # type: ignore[no-untyped-def]
+    stack = getattr(_resolver_local, "stack", ())
+    overrides = stack[-1] if stack else {}
+    key = str(host or "").lower().rstrip(".")
+    ips = overrides.get(key)
+    with _resolver_lock:
+        original = _resolver_base
+    if not ips:
+        return original(host, port, family, type, proto, flags)
+    ordered = list(ips)
+    random.shuffle(ordered)
+    results = []
+    for ip in ordered:
+        results.extend(original(ip, port, family, type, proto, flags))
+    return results
 
 
 def parse_resolve_overrides(raw: str) -> ResolveOverrides:
@@ -45,29 +74,30 @@ def parse_resolve_overrides(raw: str) -> ResolveOverrides:
 
 @contextlib.contextmanager
 def scoped_getaddrinfo(overrides: Mapping[str, List[str]]) -> Iterator[None]:
-    """Temporarily override socket.getaddrinfo for selected hostnames only."""
+    """Override selected hostnames without corrupting concurrent callers."""
 
     normalized = {key.lower().rstrip("."): list(value) for key, value in overrides.items() if value}
     if not normalized:
         yield
         return
 
-    original = socket.getaddrinfo
-
-    def patched(host, port, family=0, type=0, proto=0, flags=0):  # type: ignore[no-untyped-def]
-        key = str(host or "").lower().rstrip(".")
-        ips = normalized.get(key)
-        if not ips:
-            return original(host, port, family, type, proto, flags)
-        ordered = list(ips)
-        random.shuffle(ordered)
-        results = []
-        for ip in ordered:
-            results.extend(original(ip, port, family, type, proto, flags))
-        return results
-
-    socket.getaddrinfo = patched  # type: ignore[assignment]
+    global _resolver_base, _resolver_contexts
+    with _resolver_lock:
+        if _resolver_contexts == 0:
+            _resolver_base = socket.getaddrinfo
+            socket.getaddrinfo = _dispatched_getaddrinfo  # type: ignore[assignment]
+        _resolver_contexts += 1
+    stack = list(getattr(_resolver_local, "stack", ()))
+    stack.append(normalized)
+    _resolver_local.stack = stack
     try:
         yield
     finally:
-        socket.getaddrinfo = original  # type: ignore[assignment]
+        stack = list(getattr(_resolver_local, "stack", ()))
+        if stack:
+            stack.pop()
+        _resolver_local.stack = stack
+        with _resolver_lock:
+            _resolver_contexts -= 1
+            if _resolver_contexts == 0:
+                socket.getaddrinfo = _resolver_base  # type: ignore[assignment]

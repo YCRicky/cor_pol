@@ -102,6 +102,7 @@ def test_operator_lifecycle_messages_are_stable(kind, payload, headline):
     [
         ("boot", {"dry_run": True, "qty": 5, "assets": ("BTC",)}, ""),
         ("preflight", {"dry_run": True, "qty": 5, "assets": ("BTC",), "slug": "btc-updown-5m-0"}, ""),
+        ("ready", {"dry_run": False, "assets": ("BTC", "ETH")}, ""),
         (
             "submitted",
             {"side": "YES", "requested_qty": 5, "requested_price": 0.64, "order_id": "order-1"},

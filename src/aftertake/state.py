@@ -3,8 +3,9 @@
 JSONL is useful as an audit export, but it cannot provide an atomic per-market
 entry lock.  This store uses SQLite WAL and records an intent *before* an
 external submission.  An interrupted or uncertain submission is never retried
-for the same slug; current Aftertake policy terminal-skips PM infrastructure
-failures for that market instead of globally blocking future entries.
+for the same slug.  Definite venue rejections may be terminal for that market;
+transport ambiguity remains ``execution_unknown`` and is reconciled or
+escalated to a process restart rather than silently treated as a no-fill.
 """
 
 from __future__ import annotations
@@ -108,6 +109,7 @@ class StateStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._closed = False
         self._conn = sqlite3.connect(
             str(self.path), timeout=15.0, isolation_level=None, check_same_thread=False
         )
@@ -120,7 +122,15 @@ class StateStore:
 
     def close(self) -> None:
         with self._lock:
+            if self._closed:
+                return
+            self._closed = True
             self._conn.close()
+
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._closed
 
     def _create_schema(self) -> None:
         self._conn.executescript(
@@ -175,6 +185,29 @@ class StateStore:
                 slug TEXT NOT NULL DEFAULT '',
                 payload_json TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS component_health (
+                component TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                detail TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS notification_outbox (
+                notification_id TEXT PRIMARY KEY,
+                component TEXT NOT NULL DEFAULT '',
+                kind TEXT NOT NULL,
+                slug TEXT NOT NULL DEFAULT '',
+                message TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at REAL NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_notification_outbox_pending
+                ON notification_outbox(status, next_attempt_at, created_at);
             """
         )
         columns = {
@@ -193,6 +226,19 @@ class StateStore:
                 "ALTER TABLE orders ADD COLUMN fee_exponent REAL NOT NULL DEFAULT 1"
             )
 
+        notification_columns = {
+            str(row["name"])
+            for row in self._conn.execute("PRAGMA table_info(notification_outbox)").fetchall()
+        }
+        if "component" not in notification_columns:
+            self._conn.execute(
+                "ALTER TABLE notification_outbox ADD COLUMN component TEXT NOT NULL DEFAULT ''"
+            )
+        self._conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_notification_outbox_component
+               ON notification_outbox(component, status)"""
+        )
+
     @contextmanager
     def _transaction(self):
         self._begin()
@@ -205,6 +251,178 @@ class StateStore:
 
     def _begin(self) -> None:
         self._conn.execute("BEGIN IMMEDIATE")
+
+    def enqueue_notification(
+        self,
+        kind: str,
+        message: str,
+        slug: str = "",
+        component: str = "",
+    ) -> str:
+        """Persist an operator notification before Telegram delivery.
+
+        Telegram acknowledgement is not runtime health.  Keeping the message
+        in the same FULL-synchronous state database means a transport failure
+        or process restart cannot erase a pending error/recovery notification.
+        """
+
+        notification_id = uuid.uuid4().hex
+        now = _utc_now()
+        with self._lock, self._transaction():
+            self._conn.execute(
+                """INSERT INTO notification_outbox
+                   (notification_id, component, kind, slug, message, status, attempts,
+                    next_attempt_at, last_error, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'pending', 0, 0, '', ?, ?)""",
+                (
+                    notification_id,
+                    str(component),
+                    str(kind),
+                    str(slug),
+                    str(message),
+                    now,
+                    now,
+                ),
+            )
+        return notification_id
+
+    def transition_component_and_enqueue_notification(
+        self,
+        *,
+        component: str,
+        status: str,
+        detail: str,
+        kind: str,
+        message: str,
+        slug: str = "",
+        enqueue_on_no_transition: bool = False,
+    ) -> tuple[bool, str]:
+        """Atomically change health and create its operator notification."""
+
+        component = str(component or "").strip()
+        if not component:
+            raise ValueError("component is required")
+        status = str(status or "").strip().lower()
+        if status not in {"healthy", "unhealthy"}:
+            raise ValueError("component status must be healthy or unhealthy")
+        now = _utc_now()
+        notification_id = ""
+        with self._lock, self._transaction():
+            row = self._conn.execute(
+                "SELECT status FROM component_health WHERE component = ?", (component,)
+            ).fetchone()
+            previous = str(row["status"]) if row is not None else ""
+            transitioned = previous != status and not (not previous and status == "healthy")
+            if status == "unhealthy" and not previous:
+                transitioned = True
+            self._conn.execute(
+                """INSERT INTO component_health (component, status, detail, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(component) DO UPDATE SET
+                       status = excluded.status, detail = excluded.detail,
+                       updated_at = excluded.updated_at""",
+                (component, status, str(detail or "")[:1000], now),
+            )
+            if transitioned or enqueue_on_no_transition:
+                notification_id = uuid.uuid4().hex
+                self._conn.execute(
+                    """INSERT INTO notification_outbox
+                       (notification_id, component, kind, slug, message, status,
+                        attempts, next_attempt_at, last_error, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, 'pending', 0, 0, '', ?, ?)""",
+                    (
+                        notification_id,
+                        component,
+                        str(kind),
+                        str(slug),
+                        str(message),
+                        now,
+                        now,
+                    ),
+                )
+        return transitioned, notification_id
+
+    def notification(self, notification_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM notification_outbox WHERE notification_id = ?",
+                (str(notification_id),),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def deliverable_notification(
+        self, notification_id: str, *, ready_at: float
+    ) -> Optional[Dict[str, Any]]:
+        """Return a due row only when no same-component alert precedes it."""
+
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT current.* FROM notification_outbox AS current
+                   WHERE current.notification_id = ?
+                     AND current.status = 'pending'
+                     AND current.next_attempt_at <= ?
+                     AND (
+                         current.component = ''
+                         OR NOT EXISTS (
+                             SELECT 1 FROM notification_outbox AS predecessor
+                             WHERE predecessor.component = current.component
+                               AND predecessor.status = 'pending'
+                               AND predecessor.rowid < current.rowid
+                         )
+                     )""",
+                (str(notification_id), float(ready_at)),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def pending_notifications(
+        self, *, ready_at: float, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT current.* FROM notification_outbox AS current
+                   WHERE current.status = 'pending'
+                     AND current.next_attempt_at <= ?
+                     AND (
+                         current.component = ''
+                         OR NOT EXISTS (
+                             SELECT 1 FROM notification_outbox AS predecessor
+                             WHERE predecessor.component = current.component
+                               AND predecessor.status = 'pending'
+                               AND predecessor.rowid < current.rowid
+                         )
+                     )
+                   ORDER BY current.rowid LIMIT ?""",
+                (float(ready_at), max(1, int(limit))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_notification_sent(self, notification_id: str) -> None:
+        now = _utc_now()
+        with self._lock, self._transaction():
+            self._conn.execute(
+                """UPDATE notification_outbox
+                   SET status = 'sent', attempts = attempts + 1,
+                       last_error = '', updated_at = ?
+                   WHERE notification_id = ? AND status = 'pending'""",
+                (now, str(notification_id)),
+            )
+
+    def mark_notification_failed(
+        self,
+        notification_id: str,
+        error: str,
+        *,
+        retry_at: float,
+    ) -> None:
+        now = _utc_now()
+        with self._lock, self._transaction():
+            self._conn.execute(
+                """UPDATE notification_outbox
+                   SET status = 'pending', attempts = attempts + 1,
+                       next_attempt_at = ?, last_error = ?, updated_at = ?
+                   WHERE notification_id = ? AND status = 'pending'""",
+                (float(retry_at), str(error)[:500], now, str(notification_id)),
+            )
 
     def observe_market(self, slug: str, condition_id: str, round_start: int) -> None:
         now = _utc_now()
@@ -356,30 +574,44 @@ class StateStore:
             )
 
     def attach_recovered_order_id(self, intent_id: str, order_id: str) -> None:
-        """Attach an ID that must pass strict authenticated identity validation."""
+        """Attach or replace an ID that must pass strict identity validation.
+
+        Replacement is allowed only after a recovered ID itself failed that
+        validation.  An arbitrary submitted/live order can never be redirected
+        to a different ID.
+        """
 
         if not order_id.strip():
             raise ValueError("order_id is required")
         now = _utc_now()
         with self._lock, self._transaction():
             current = self._conn.execute(
-                """SELECT raw_json FROM orders
-                   WHERE intent_id = ? AND state = 'execution_unknown' AND order_id = ''""",
+                """SELECT order_id, raw_json FROM orders
+                   WHERE intent_id = ? AND state = 'execution_unknown'""",
                 (intent_id,),
             ).fetchone()
             if current is None:
-                raise RuntimeError("intent is not an unknown execution with a missing order ID")
+                raise RuntimeError("intent is not an unknown execution")
             raw = json.loads(str(current["raw_json"] or "{}"))
+            previous_order_id = str(current["order_id"] or "")
+            if previous_order_id and raw.get("classification") != "recovered_order_identity_mismatch":
+                raise RuntimeError("existing recovered order ID is not replaceable")
+            history = list(raw.get("recovered_order_id_history") or [])
+            if previous_order_id and previous_order_id not in history:
+                history.append(previous_order_id)
+            raw["recovered_order_id_history"] = history
             raw["recovered_order_id"] = order_id.strip()
             raw["requires_identity_validation"] = True
+            raw.pop("identity_error", None)
+            raw["classification"] = "operator_attached_order_id"
             cursor = self._conn.execute(
                 """UPDATE orders SET state = 'submitted', order_id = ?, error = '',
                    raw_json = ?, updated_at = ?
-                   WHERE intent_id = ? AND state = 'execution_unknown' AND order_id = ''""",
+                   WHERE intent_id = ? AND state = 'execution_unknown'""",
                 (order_id.strip(), json.dumps(raw, sort_keys=True), now, intent_id),
             )
             if cursor.rowcount != 1:
-                raise RuntimeError("intent is not an unknown execution with a missing order ID")
+                raise RuntimeError("intent is not an unknown execution")
             self._conn.execute(
                 """UPDATE markets SET state = 'submitted', reason = '', updated_at = ?
                    WHERE intent_id = ? AND state = 'execution_unknown'""",
@@ -489,6 +721,57 @@ class StateStore:
                    WHERE m.state IN ('entry_reserved', 'submitted', 'execution_unknown', 'open')"""
             ).fetchone()
         return float(row["amount"] or 0.0)
+
+    def mark_component_unhealthy(self, component: str, detail: str = "") -> bool:
+        """Persist a component failure; return true on a healthy->failed edge."""
+
+        component = str(component or "").strip()
+        if not component:
+            raise ValueError("component is required")
+        now = _utc_now()
+        with self._lock, self._transaction():
+            row = self._conn.execute(
+                "SELECT status FROM component_health WHERE component = ?", (component,)
+            ).fetchone()
+            transitioned = row is None or str(row["status"]) != "unhealthy"
+            self._conn.execute(
+                """INSERT INTO component_health (component, status, detail, updated_at)
+                   VALUES (?, 'unhealthy', ?, ?)
+                   ON CONFLICT(component) DO UPDATE SET
+                       status = 'unhealthy', detail = excluded.detail,
+                       updated_at = excluded.updated_at""",
+                (component, str(detail or "")[:1000], now),
+            )
+        return transitioned
+
+    def mark_component_healthy(self, component: str, detail: str = "") -> bool:
+        """Persist healthy state; return true only when recovering a failure."""
+
+        component = str(component or "").strip()
+        if not component:
+            raise ValueError("component is required")
+        now = _utc_now()
+        with self._lock, self._transaction():
+            row = self._conn.execute(
+                "SELECT status FROM component_health WHERE component = ?", (component,)
+            ).fetchone()
+            recovered = row is not None and str(row["status"]) == "unhealthy"
+            self._conn.execute(
+                """INSERT INTO component_health (component, status, detail, updated_at)
+                   VALUES (?, 'healthy', ?, ?)
+                   ON CONFLICT(component) DO UPDATE SET
+                       status = 'healthy', detail = excluded.detail,
+                       updated_at = excluded.updated_at""",
+                (component, str(detail or "")[:1000], now),
+            )
+        return recovered
+
+    def component_status(self, component: str) -> Optional[str]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT status FROM component_health WHERE component = ?", (str(component),)
+            ).fetchone()
+        return str(row["status"]) if row is not None else None
 
     def market_state(self, slug: str) -> Optional[str]:
         with self._lock:

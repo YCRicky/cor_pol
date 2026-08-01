@@ -17,7 +17,7 @@ from .resolver import ResolveOverrides, scoped_getaddrinfo
 
 MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 CONNECT_TIMEOUT_S = 2.0
-RECEIVE_TIMEOUT_S = 0.25
+RECEIVE_TIMEOUT_S = 0.05
 PING_INTERVAL_S = 5.0
 PONG_TIMEOUT_S = 12.0
 RECONNECT_INITIAL_S = 0.5
@@ -136,8 +136,20 @@ class MarketBookStream:
         self._ready = threading.Event()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._watchdog_thread: Optional[threading.Thread] = None
+        self._watchdog_stop = threading.Event()
+        self._socket_lock = threading.Lock()
+        self._socket: Any = None
+        self._watchdog_triggered = threading.Event()
         self.last_error = ""
+        # Transport traffic and usable market data are different health
+        # signals. A PONG proves only that the socket is open; it must never
+        # make a frozen order book look fresh.
         self.last_message_at = 0.0
+        self.last_market_message_at = 0.0
+        self._last_market_message_mono = 0.0
+        self._market_data_watchdog_s: Optional[float] = None
+        self._market_data_watchdog_armed_mono = 0.0
         self.reconnect_count = 0
         self._generation = 0
 
@@ -155,13 +167,72 @@ class MarketBookStream:
     def start(self) -> None:
         if self._thread is not None:
             raise RuntimeError("market stream is already running")
+        self._watchdog_stop.clear()
+        self._watchdog_triggered.clear()
         self._thread = threading.Thread(target=self._run, daemon=True, name="aftertake-market-stream")
         self._thread.start()
+        self._watchdog_thread = threading.Thread(
+            target=self._market_data_watchdog,
+            daemon=True,
+            name="aftertake-market-watchdog",
+        )
+        self._watchdog_thread.start()
+
+    def arm_market_data_watchdog(self, timeout_s: float) -> None:
+        """Require a relevant book update during the close-critical window."""
+
+        with self._lock:
+            self._market_data_watchdog_s = max(0.05, float(timeout_s))
+            self._market_data_watchdog_armed_mono = time.monotonic()
+            self._watchdog_triggered.clear()
 
     def close(self, timeout_s: float = 2.0) -> None:
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=max(0.0, timeout_s))
+        self._watchdog_stop.set()
+        with self._socket_lock:
+            socket = self._socket
+        if socket is not None:
+            try:
+                socket.close()
+            except Exception:
+                pass
+        thread_alive = False
+        try:
+            if self._thread is not None:
+                self._thread.join(timeout=max(0.0, timeout_s))
+                thread_alive = self._thread.is_alive()
+        finally:
+            if self._watchdog_thread is not None:
+                self._watchdog_thread.join(timeout=min(0.25, max(0.0, timeout_s)))
+        if thread_alive:
+            self.last_error = "market stream thread did not stop during shutdown"
+            raise RuntimeError(self.last_error)
+
+    def _market_data_watchdog(self) -> None:
+        """Interrupt a recv() that ignores its configured socket timeout."""
+
+        while not self._watchdog_stop.wait(0.01):
+            with self._lock:
+                timeout_s = self._market_data_watchdog_s
+                last_market = self._last_market_message_mono
+                armed_at = self._market_data_watchdog_armed_mono
+            if timeout_s is None:
+                continue
+            baseline = last_market or armed_at
+            if not baseline or time.monotonic() - baseline < timeout_s:
+                continue
+            if self._watchdog_triggered.is_set():
+                continue
+            self._watchdog_triggered.set()
+            self.last_error = "RuntimeError: market stream data silence timeout"
+            self._reset_books()
+            with self._socket_lock:
+                socket = self._socket
+            if socket is not None:
+                try:
+                    socket.close()
+                except Exception:
+                    pass
 
     def _reset_books(self) -> None:
         with self._lock:
@@ -170,7 +241,19 @@ class MarketBookStream:
                 self.no_token_id: _TokenBook(),
             }
             self._ready.clear()
+            self._last_market_message_mono = 0.0
             self._generation += 1
+
+    def _raise_if_market_data_stale(self, now_mono: float, connection_started: float) -> None:
+        with self._lock:
+            timeout_s = self._market_data_watchdog_s
+            last_market = self._last_market_message_mono
+            armed_at = self._market_data_watchdog_armed_mono
+        if timeout_s is None:
+            return
+        baseline = last_market or max(connection_started, armed_at)
+        if now_mono - baseline >= timeout_s:
+            raise RuntimeError("market stream data silence timeout")
 
     def _run(self) -> None:
         try:
@@ -180,9 +263,9 @@ class MarketBookStream:
             return
 
         reconnect_delay = RECONNECT_INITIAL_S
+        self._reset_books()
         while not self._stop.is_set():
             ws = None
-            self._reset_books()
             connection_started = time.monotonic()
             try:
                 # Use the official hostname and normal resolver/TLS path.
@@ -194,6 +277,9 @@ class MarketBookStream:
                 # responsive to stop/reconnect requests.
                 with scoped_getaddrinfo(self._resolve_overrides):
                     ws = websocket.create_connection(self._url, timeout=CONNECT_TIMEOUT_S)
+                with self._socket_lock:
+                    self._socket = ws
+                self._watchdog_triggered.clear()
                 ws.settimeout(RECEIVE_TIMEOUT_S)
                 ws.send(
                     json.dumps(
@@ -219,6 +305,7 @@ class MarketBookStream:
                     try:
                         raw = ws.recv()
                     except websocket.WebSocketTimeoutException:
+                        self._raise_if_market_data_stale(time.monotonic(), connection_started)
                         continue
                     if raw in (None, ""):
                         raise RuntimeError("market stream closed")
@@ -229,13 +316,20 @@ class MarketBookStream:
                     # proves the TCP path is alive, so clear the watchdog.
                     pong_deadline = None
                     if isinstance(raw, str) and raw.upper() == "PONG":
+                        self._raise_if_market_data_stale(time.monotonic(), connection_started)
                         continue
-                    self.process_message(raw, received_at=float(self._clock()))
+                    changed = self.process_message(raw, received_at=float(self._clock()))
+                    if not changed:
+                        self._raise_if_market_data_stale(time.monotonic(), connection_started)
                     if time.monotonic() - connection_started >= RECONNECT_STABLE_S:
                         reconnect_delay = RECONNECT_INITIAL_S
             except Exception as exc:
                 self.last_error = "%s: %s" % (type(exc).__name__, str(exc))
                 self.reconnect_count += 1
+                # Invalidate the paired snapshot before the reconnect backoff.
+                # Leaving ``ready`` set during this wait exposes a disconnected
+                # generation to the close-critical classifier.
+                self._reset_books()
                 self._stop.wait(reconnect_delay)
                 reconnect_delay = min(RECONNECT_MAX_S, reconnect_delay * 2.0)
             finally:
@@ -244,26 +338,30 @@ class MarketBookStream:
                         ws.close()
                     except Exception:
                         pass
+                with self._socket_lock:
+                    if self._socket is ws:
+                        self._socket = None
 
-    def process_message(self, raw: Any, *, received_at: Optional[float] = None) -> None:
+    def process_message(self, raw: Any, *, received_at: Optional[float] = None) -> bool:
         """Apply one raw official stream message; exposed for deterministic tests."""
 
         if isinstance(raw, str):
             try:
                 raw = json.loads(raw)
             except json.JSONDecodeError:
-                return
+                return False
         if isinstance(raw, list):
+            changed = False
             for item in raw:
-                self.process_message(item, received_at=received_at)
-            return
+                changed = self.process_message(item, received_at=received_at) or changed
+            return changed
         if not isinstance(raw, dict):
-            return
+            return False
 
         event_type = str(raw.get("type") or raw.get("event_type") or "").lower()
         payload = raw.get("payload") if isinstance(raw.get("payload"), dict) else raw
         if not isinstance(payload, dict):
-            return
+            return False
         timestamp = _timestamp_s(payload.get("timestamp", raw.get("timestamp")))
         observed_at = float(self._clock() if received_at is None else received_at)
 
@@ -304,11 +402,13 @@ class MarketBookStream:
                         or changed
                     )
             if not changed:
-                return
+                return False
+            self.last_market_message_at = observed_at
+            self._last_market_message_mono = time.monotonic()
             yes = self._books[self.yes_token_id]
             no = self._books[self.no_token_id]
             if not (yes.initialized and no.initialized):
-                return
+                return True
             self._ready.set()
             snapshot = PairedBook(
                 observed_at=observed_at,
@@ -319,3 +419,4 @@ class MarketBookStream:
                 no_updated_at=no.updated_at,
             )
         self._on_book(snapshot)
+        return True

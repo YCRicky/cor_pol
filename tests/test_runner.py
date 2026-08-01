@@ -3,6 +3,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 import aftertake.runner as runner_module
 from aftertake.config import Settings
 from aftertake.execution import OrderExecutor
@@ -124,25 +126,6 @@ class DeepSupportPairedStream(PairedStream):
 
 class ResidualTenSupportPairedStream(PairedStream):
     no_ask_size = 10
-
-
-
-
-class NoOrderIdStartupExecutor:
-    def __init__(self, store):
-        self.store = store
-
-    def reconcile_existing(self, record):
-        return OrderExecutor(Settings(dry_run=False), self.store, gateway=object())._result_from_record(
-            record,
-            "execution_unknown",
-            0.0,
-            0.0,
-            False,
-            "unknown",
-            "persisted_intent_has_no_order_id",
-            {},
-        )
 
 
 
@@ -406,7 +389,9 @@ def test_live_round_blocks_dynamic_quantity_that_the_observed_bid_support_cannot
         assert any(item.action == "enter" for item in decisions)
         assert gateway.submitted_qty == 0
         assert store.market_state("btc-updown-5m-900") == "observing"
-        assert notifier.messages == []
+        assert len(notifier.messages) == 1
+        assert notifier.messages[0].startswith("[Aftertake] ALERT")
+        assert "entry blocked by risk/preflight" in notifier.messages[0]
     finally:
         store.close()
 
@@ -504,7 +489,126 @@ def test_live_round_account_preflight_is_shared_once_across_assets(tmp_path):
         store.close()
 
 
-def test_live_asset_transport_failure_isolated_without_rebuilding_runtime(tmp_path, monkeypatch):
+def test_shared_account_snapshot_claims_cost_atomically_across_all_assets(tmp_path):
+    assets = ("BTC", "ETH", "XRP", "HYPE", "DOGE", "SOL")
+
+    class AssetPublic(LivePublic):
+        def market_by_slug(self, slug, allow_closed=False):
+            asset = slug.split("-", 1)[0]
+            return GammaMarket(
+                slug=slug,
+                condition_id="condition-" + asset,
+                outcomes=("Up", "Down"),
+                clob_token_ids=(asset + "-up-token", asset + "-down-token"),
+                active=True,
+            )
+
+    class CapturingGateway:
+        def __init__(self):
+            self.preflight_calls = 0
+            self._lock = threading.Lock()
+            self._orders = {}
+
+        def preflight(self, geo, required_cash):
+            with self._lock:
+                self.preflight_calls += 1
+            assert required_cash == 0.0
+            return LivePreflight(
+                geo=geo,
+                collateral=BalanceAllowance(balance=100.0, allowance=80.0, raw={}),
+                closed_only=False,
+            )
+
+        def market_metadata(self, condition_id):
+            asset = condition_id.removeprefix("condition-")
+            return MarketMetadata(
+                condition_id=condition_id,
+                tick_size="0.01",
+                min_order_size=1,
+                neg_risk=False,
+                fee_rate=0.0,
+                tokens={"up": asset + "-up-token", "down": asset + "-down-token"},
+                raw={},
+            )
+
+        def submit_limit_buy_fast(self, token_id, price, qty, metadata, order_type="GTC"):
+            order_id = "order-" + token_id
+            with self._lock:
+                self._orders[order_id] = (str(token_id), float(price), float(qty))
+            return {"orderID": order_id}
+
+        def get_order(self, order_id):
+            _token_id, price, qty = self._orders[order_id]
+            return {
+                "id": order_id,
+                "status": "matched",
+                "size_matched": str(qty),
+                "average_price": str(price),
+            }
+
+        def order_trades(self, token_id, order_id):
+            _stored_token, price, qty = self._orders[order_id]
+            return [{"order_id": order_id, "size": str(qty), "price": str(price)}]
+
+        def post_heartbeat(self, heartbeat_id=""):
+            return {"heartbeat_id": heartbeat_id or "h"}
+
+        @property
+        def submitted_cost(self):
+            with self._lock:
+                return sum(price * qty for _token, price, qty in self._orders.values())
+
+    class EntryClock:
+        def __init__(self):
+            self._local = threading.local()
+
+        def __call__(self):
+            calls = getattr(self._local, "calls", 0) + 1
+            self._local.calls = calls
+            return 1190.0 if calls <= 2 else 1200.22
+
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        # Existing unresolved risk consumes $10 of the shared account budget.
+        existing = store.reserve_entry(
+            "legacy-updown-5m-0", "legacy-condition", 0, "legacy-token", "YES", 10, 1.0
+        )
+        assert existing is not None
+        assert store.total_risk_exposure() == 10.0
+
+        settings = Settings(
+            dry_run=False,
+            assets=assets,
+            order_type="GTC",
+            live_max_account_risk_fraction=0.50,
+            out_dir=tmp_path / "out",
+            state_db=tmp_path / "state.sqlite3",
+        )
+        gateway = CapturingGateway()
+        results = _run_asset_rounds(
+            settings=settings,
+            store=store,
+            public=AssetPublic(),
+            executor=OrderExecutor(settings, store, gateway=gateway),
+            live_gateway=gateway,
+            round_start=900,
+            notifier=Notifier(),
+            stream_factory=DeepSupportPairedStream,
+            clock=EntryClock(),
+            sleep=lambda _seconds: None,
+        )
+
+        account_budget = min(100.0, 80.0) * 0.50
+        assert sorted(results) == sorted(assets)
+        assert gateway.preflight_calls == 1
+        assert gateway.submitted_cost > 0.0
+        assert gateway.submitted_cost + 10.0 <= account_budget
+        assert store.total_risk_exposure() <= account_budget
+    finally:
+        store.close()
+
+
+def test_live_asset_transport_failure_isolated_and_schedules_runtime_rebuild(tmp_path, monkeypatch):
     class PolyApiExceptionLike(Exception):
         status_code = None
         error_message = "Request exception!"
@@ -580,8 +684,9 @@ def test_live_asset_transport_failure_isolated_without_rebuilding_runtime(tmp_pa
         assert sorted(asset_results) == ["BTC", "ETH", "XRP"]
         assert asset_results["ETH"][-1].reason == "market_metadata_transport_error"
         assert all(asset_results[asset] for asset in ("BTC", "XRP"))
-        assert len(notifier.messages) == 1
-        assert all(message.startswith("[Aftertake] ALERT") for message in notifier.messages)
+        alerts = [message for message in notifier.messages if message.startswith("[Aftertake] ALERT")]
+        assert len(alerts) == 1
+        assert any(message.startswith("[Aftertake] RUNTIME_READY") for message in notifier.messages)
         audit = store._conn.execute(
             """SELECT slug, payload_json FROM audit_events
                WHERE kind = 'asset_transport_error' ORDER BY id DESC LIMIT 1"""
@@ -600,7 +705,7 @@ def test_live_asset_transport_failure_isolated_without_rebuilding_runtime(tmp_pa
         store.close()
 
 
-def test_unhandled_asset_transport_failure_isolated_without_rebuilding_runtime(tmp_path, monkeypatch):
+def test_unhandled_asset_transport_failure_isolated_and_rebuilds_runtime(tmp_path, monkeypatch):
     class PolyApiExceptionLike(Exception):
         status_code = None
         error_message = "Request exception!"
@@ -618,6 +723,14 @@ def test_unhandled_asset_transport_failure_isolated_without_rebuilding_runtime(t
         runtime_calls = []
         worker_threads = []
         asset_result_rounds = []
+        restart_requested = []
+
+        class FakeWatchdog:
+            def beat(self, _stage):
+                return None
+
+            def request_restart(self):
+                restart_requested.append(True)
 
         def live_runtime(*_args):
             runtime_calls.append("runtime")
@@ -649,10 +762,12 @@ def test_unhandled_asset_transport_failure_isolated_without_rebuilding_runtime(t
             live_runtime_factory=live_runtime,
             wait_for_next_boundary=lambda: next(round_starts),
             sleep=lambda _seconds: None,
+            runtime_watchdog=FakeWatchdog(),
         )
 
         assert runtime_calls == ["runtime"]
-        assert len(asset_result_rounds) == 2
+        assert restart_requested == [True]
+        assert len(asset_result_rounds) == 1
         assert all(sorted(results) == ["BTC", "ETH", "XRP"] for results in asset_result_rounds)
         assert all(thread.startswith("aftertake-asset") for thread in worker_threads)
         for results in asset_result_rounds:
@@ -662,8 +777,9 @@ def test_unhandled_asset_transport_failure_isolated_without_rebuilding_runtime(t
                 "hold",
                 "asset_round_transport_error",
             )
-        assert len(notifier.messages) == 2
-        assert all(message.startswith("[Aftertake] ALERT") for message in notifier.messages)
+        alerts = [message for message in notifier.messages if message.startswith("[Aftertake] ALERT")]
+        assert len(alerts) == 1
+        assert any(message.startswith("[Aftertake] RUNTIME_READY") for message in notifier.messages)
         assert store._conn.execute(
             "SELECT COUNT(*) FROM audit_events WHERE kind = 'round_runtime_error'"
         ).fetchone()[0] == 0
@@ -671,7 +787,7 @@ def test_unhandled_asset_transport_failure_isolated_without_rebuilding_runtime(t
             """SELECT slug, payload_json FROM audit_events
                WHERE kind = 'asset_transport_error' ORDER BY id"""
         ).fetchall()
-        assert [audit["slug"] for audit in audits] == ["eth-updown-5m-900", "eth-updown-5m-1200"]
+        assert [audit["slug"] for audit in audits] == ["eth-updown-5m-900"]
         for audit in audits:
             assert json.loads(audit["payload_json"]) == {
                 "asset": "ETH",
@@ -681,6 +797,48 @@ def test_unhandled_asset_transport_failure_isolated_without_rebuilding_runtime(t
                 "slug": audit["slug"],
                 "status_code": None,
             }
+    finally:
+        store.close()
+
+
+def test_single_asset_non_transient_error_is_held_without_aborting_other_assets(
+    tmp_path, monkeypatch
+):
+    assets = ("BTC", "ETH", "XRP", "HYPE", "DOGE", "SOL")
+    completed = []
+    completed_lock = threading.Lock()
+
+    def one_broken_asset(*, asset, **_kwargs):
+        if asset == "ETH":
+            raise ValueError("malformed ETH market metadata")
+        with completed_lock:
+            completed.append(asset)
+        return [runner_module.PostCloseDecision("hold", "clean_round")]
+
+    monkeypatch.setattr(runner_module, "run_round", one_broken_asset)
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        settings = Settings(
+            dry_run=True,
+            assets=assets,
+            out_dir=tmp_path / "out",
+            state_db=tmp_path / "state.sqlite3",
+        )
+        results = _run_asset_rounds(
+            settings=settings,
+            store=store,
+            public=FakePublic(),
+            executor=OrderExecutor(settings, store),
+            live_gateway=None,
+            round_start=900,
+            notifier=CaptureNotifier(),
+            timeout_s=1.0,
+        )
+
+        assert sorted(results) == sorted(assets)
+        assert sorted(completed) == sorted(set(assets) - {"ETH"})
+        assert results["ETH"][-1].action == "hold"
+        assert "error" in results["ETH"][-1].reason
     finally:
         store.close()
 
@@ -847,6 +1005,90 @@ def test_runtime_watchdog_does_not_restart_while_active_round_is_waiting():
         watchdog.stop()
 
 
+def test_runtime_watchdog_active_round_exemption_has_a_finite_deadline(monkeypatch):
+    exits = []
+    monkeypatch.setattr(runner_module, "RUNTIME_ACTIVE_STAGE_TIMEOUT_S", 0.02)
+    watchdog = RuntimeWatchdog(stale_after_s=0.01, interval_s=0.001, exit_fn=exits.append)
+    watchdog.beat("active_round")
+    watchdog.start()
+    try:
+        deadline = time.monotonic() + 0.5
+        while not exits and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert exits == [1]
+    finally:
+        watchdog.stop()
+
+
+def test_audit_persistence_failure_does_not_suppress_transport_alert(tmp_path, monkeypatch):
+    store = StateStore(tmp_path / "state.sqlite3")
+    notifier = CaptureNotifier()
+
+    def fail_audit(*_args, **_kwargs):
+        raise OSError("injected disk failure")
+
+    try:
+        monkeypatch.setattr(store, "append_event", fail_audit)
+        monkeypatch.setattr(runner_module, "append_jsonl", fail_audit)
+        runner_module._audit_asset_transport_error(
+            Settings(out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3"),
+            store,
+            asset="BTC",
+            slug="btc-updown-5m-900",
+            phase="market_stream",
+            exc=TimeoutError("wire timed out"),
+            notifier=notifier,
+        )
+
+        assert len(notifier.messages) == 1
+        assert notifier.messages[0].startswith("[Aftertake] ALERT")
+    finally:
+        store.close()
+
+
+def test_live_asset_notification_transport_never_blocks_asset_worker(tmp_path, monkeypatch):
+    store = StateStore(tmp_path / "state.sqlite3")
+    notifier = Notifier(token="test-token", chat_id="test-chat")
+    started = threading.Event()
+    release = threading.Event()
+    worker_returned = threading.Event()
+
+    def slow_send(_text):
+        started.set()
+        release.wait(timeout=2.0)
+        return True
+
+    monkeypatch.setattr(notifier, "send", slow_send)
+
+    def asset_worker():
+        runner_module._safe_notify(
+            notifier,
+            Settings(out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3"),
+            store,
+            "alert",
+            {"reason": "injected"},
+        )
+        worker_returned.set()
+
+    worker = threading.Thread(target=asset_worker, name="aftertake-asset-test")
+    try:
+        worker.start()
+        assert started.wait(1.0)
+        assert worker_returned.wait(0.1), "Telegram blocked the close-critical asset worker"
+    finally:
+        release.set()
+        worker.join(timeout=1.0)
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            count = store._conn.execute(
+                "SELECT COUNT(*) FROM audit_events WHERE kind = 'notification_sent'"
+            ).fetchone()[0]
+            if count:
+                break
+            time.sleep(0.01)
+        store.close()
+
+
 def test_configured_assets_do_not_block_each_other_by_position_or_cooldown(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     try:
@@ -904,15 +1146,60 @@ def test_round_scheduler_joins_active_round_after_previous_close_instead_of_skip
 def test_round_scheduler_waits_when_active_round_is_too_close_to_close():
     slept = []
     processed = set()
+    current = [1494.0]
+
+    def sleep(seconds):
+        slept.append(seconds)
+        current[0] += seconds
 
     selected = _select_next_round_start(
         now=1494.0,
         processed_round_starts=processed,
-        sleep=lambda seconds: slept.append(seconds),
+        sleep=sleep,
+        clock=lambda: current[0],
     )
 
     assert selected == 1500
     assert slept == [6.0]
+
+
+def test_round_scheduler_requires_enough_lead_for_bounded_multi_asset_preflight():
+    slept = []
+    current = [1381.0]
+
+    def sleep(seconds):
+        slept.append(seconds)
+        current[0] += seconds
+
+    selected = _select_next_round_start(
+        now=1381.0,  # 119 seconds remain; live preflight requires 120.
+        processed_round_starts=set(),
+        sleep=sleep,
+        clock=lambda: current[0],
+    )
+
+    assert selected == 1500
+    assert slept == [119.0]
+
+
+def test_round_scheduler_rechecks_clock_after_oversleep_and_skips_stale_boundary():
+    slept = []
+    current = [1494.0]
+
+    def sleep(seconds):
+        slept.append(seconds)
+        # Simulate a suspended process waking 185 seconds late.
+        current[0] += seconds + (185.0 if len(slept) == 1 else 0.0)
+
+    selected = _select_next_round_start(
+        now=1494.0,
+        processed_round_starts=set(),
+        sleep=sleep,
+        clock=lambda: current[0],
+    )
+
+    assert selected == 1800
+    assert slept == [6.0, 115.0]
 
 
 def test_deployment_check_requires_tg_and_verifies_paired_websocket():
@@ -1119,7 +1406,7 @@ def test_confirmed_open_fill_is_settled_from_pm_outcome(tmp_path):
         store.close()
 
 
-def test_startup_reconciliation_missing_order_id_terminal_skips_without_alert_spam(tmp_path):
+def test_startup_reconciliation_keeps_missing_order_id_ambiguous_and_alerts_every_boot(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     try:
         record = store.reserve_entry(
@@ -1131,21 +1418,62 @@ def test_startup_reconciliation_missing_order_id_terminal_skips_without_alert_sp
             5,
             0.64,
         )
-        store.mark_execution_unknown(record.intent_id, "submit_exception", {"order_type": "FAK"})
+        assert record is not None
         notifier = CaptureNotifier()
+        settings = Settings(
+            dry_run=False,
+            order_type="GTC",
+            out_dir=tmp_path / "out",
+            state_db=tmp_path / "state.sqlite3",
+        )
+        executor = OrderExecutor(settings, store, gateway=object())
 
-        _reconcile_startup(
-            Settings(dry_run=False, order_type="FAK", out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3"),
-            store,
-            NoOrderIdStartupExecutor(store),
-            notifier,
+        for boot_number in (1, 2):
+            _reconcile_startup(settings, store, executor, notifier)
+
+            unresolved = store.unresolved_orders()
+            assert len(unresolved) == 1, "boot %s discarded ambiguous exposure" % boot_number
+            assert unresolved[0].intent_id == record.intent_id
+            assert unresolved[0].state == "execution_unknown"
+            assert store.has_execution_unknown() is True
+
+        assert len(notifier.messages) == 2
+        assert all(message.startswith("[Aftertake] ALERT") for message in notifier.messages)
+        assert all("order_id" in message.lower() for message in notifier.messages)
+    finally:
+        store.close()
+
+
+def test_dry_run_runner_emits_runtime_ready_before_scheduler(tmp_path, monkeypatch):
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        settings = Settings(
+            dry_run=True,
+            assets=("BTC",),
+            out_dir=tmp_path / "out",
+            state_db=tmp_path / "state.sqlite3",
+        )
+        notifier = CaptureNotifier()
+        monkeypatch.setattr(runner_module, "_run_asset_rounds", lambda **_kwargs: {})
+
+        _run_round_loop(
+            settings=settings,
+            store=store,
+            public=FakePublic(),
+            notifier=notifier,
+            forever=False,
+            rounds=1,
+            wait_for_next_boundary=lambda: 900,
+            sleep=lambda _seconds: None,
         )
 
-        assert store.has_execution_unknown() is False
-        unresolved = store.unresolved_orders()
-        assert unresolved == []
-        assert notifier.messages == []
-        assert store.reserve_entry("eth-updown-5m-1200", "condition", 1200, "token", "YES", 5, 0.51) is not None
+        assert [message.splitlines()[0] for message in notifier.messages] == [
+            "[Aftertake] RUNTIME_READY"
+        ]
+        payload = store._conn.execute(
+            "SELECT payload_json FROM audit_events WHERE kind = 'runtime_ready'"
+        ).fetchone()
+        assert json.loads(payload["payload_json"])["dry_run"] is True
     finally:
         store.close()
 
@@ -1219,4 +1547,124 @@ def test_round_loop_scans_assets_before_pending_order_reconciliation(monkeypatch
 
         assert events == ["runtime", "boundary", "scan_assets", "reconcile_pending", "settle"]
     finally:
+        store.close()
+
+
+@pytest.mark.parametrize("slow_component", ["reconcile", "settlement"])
+def test_slow_post_round_maintenance_does_not_block_next_round_scheduler(
+    slow_component, monkeypatch, tmp_path
+):
+    store = StateStore(tmp_path / slow_component / "state.sqlite3")
+    release_maintenance = threading.Event()
+    maintenance_started = threading.Event()
+    second_scan_started = threading.Event()
+    runner_errors = []
+    scanned_rounds = []
+    try:
+        settings = Settings(
+            dry_run=False,
+            assets=("BTC",),
+            order_type="GTC",
+            out_dir=tmp_path / slow_component / "out",
+            state_db=tmp_path / slow_component / "state.sqlite3",
+        )
+
+        def live_runtime(*_args):
+            gateway = InstantGateway()
+            return gateway, OrderExecutor(settings, store, gateway=gateway)
+
+        boundaries = iter((900, 1200))
+
+        def scan_assets(*, round_start, **_kwargs):
+            scanned_rounds.append(round_start)
+            if round_start == 1200:
+                second_scan_started.set()
+            return {}
+
+        def fast_maintenance(**_kwargs):
+            return []
+
+        def slow_maintenance(**_kwargs):
+            maintenance_started.set()
+            release_maintenance.wait(timeout=2.0)
+            return []
+
+        monkeypatch.setattr(runner_module, "_run_asset_rounds", scan_assets)
+        monkeypatch.setattr(
+            runner_module,
+            "reconcile_submitted_orders",
+            slow_maintenance if slow_component == "reconcile" else fast_maintenance,
+        )
+        monkeypatch.setattr(
+            runner_module,
+            "settle_open_positions",
+            slow_maintenance if slow_component == "settlement" else fast_maintenance,
+        )
+
+        def run_loop():
+            try:
+                _run_round_loop(
+                    settings=settings,
+                    store=store,
+                    public=LivePublic(),
+                    notifier=CaptureNotifier(),
+                    forever=False,
+                    rounds=2,
+                    live_runtime_factory=live_runtime,
+                    wait_for_next_boundary=lambda: next(boundaries),
+                    sleep=lambda _seconds: None,
+                )
+            except BaseException as exc:
+                runner_errors.append(exc)
+
+        runner_thread = threading.Thread(target=run_loop, daemon=True)
+        runner_thread.start()
+        assert maintenance_started.wait(1.0)
+        try:
+            assert second_scan_started.wait(0.25), (
+                "%s blocked discovery of the next five-minute round" % slow_component
+            )
+        finally:
+            release_maintenance.set()
+            runner_thread.join(timeout=2.0)
+
+        assert runner_errors == []
+        assert runner_thread.is_alive() is False
+        assert scanned_rounds == [900, 1200]
+    finally:
+        release_maintenance.set()
+        store.close()
+
+
+def test_uncancellable_maintenance_requests_process_restart(tmp_path, monkeypatch):
+    store = StateStore(tmp_path / "state.sqlite3")
+    release = threading.Event()
+    restarted = threading.Event()
+
+    def hung_settlement(**_kwargs):
+        release.wait(timeout=1.0)
+        return []
+
+    monkeypatch.setattr(runner_module, "settle_open_positions", hung_settlement)
+    worker = runner_module._MaintenanceWorker(
+        settings=Settings(out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3"),
+        store=store,
+        public=FakePublic(),
+        notifier=CaptureNotifier(),
+        restart_fn=restarted.set,
+        timeout_s=0.03,
+    )
+    try:
+        assert worker.trigger(OrderExecutor(Settings(), store)) is True
+        assert restarted.wait(0.5), "hung maintenance remained silently detached"
+        deadline = time.monotonic() + 0.5
+        while (
+            store.component_status("maintenance_worker") != "unhealthy"
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.005)
+        assert store.component_status("maintenance_worker") == "unhealthy"
+    finally:
+        release.set()
+        worker.wait(1.0)
         store.close()

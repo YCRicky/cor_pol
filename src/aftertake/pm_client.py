@@ -339,7 +339,11 @@ class V2ClobGateway:
             signature_type=settings.polymarket_signature_type,
             funder=settings.polymarket_funder,
             builder_config=builder_config,
-            use_server_time=True,
+            # Deployment refuses an unsynchronised EC2 clock and runtime
+            # preflight verifies it once. Asking the SDK for /time before every
+            # L2 request doubles reconciliation traffic and adds a full RTT to
+            # the close-critical submit.
+            use_server_time=False,
             retry_on_error=False,
         )
         sdk = {
@@ -360,6 +364,36 @@ class V2ClobGateway:
             ).BUY,
         }
         return cls(client, sdk, settings.polymarket_signature_type, settings.builder_code)
+
+    def prepare_order_submission(self, max_clock_skew_s: float = 2.0) -> Dict[str, Any]:
+        """Warm signing caches and verify local time before any close window."""
+
+        with self._client_lock:
+            started = time.time()
+            server_raw = self._client.get_server_time()
+            ended = time.time()
+            if isinstance(server_raw, dict):
+                server_raw = server_raw.get("time", server_raw.get("timestamp"))
+            server_time = _as_float(server_raw, "CLOB server time")
+            if server_time > 10_000_000_000:
+                server_time /= 1000.0
+            local_midpoint = (started + ended) / 2.0
+            skew_s = abs(server_time - local_midpoint)
+            if skew_s > float(max_clock_skew_s):
+                raise LivePreflightError(
+                    "system clock differs from CLOB server by %.3fs" % skew_s
+                )
+
+            resolve_version = getattr(self._client, "_ClobClient__resolve_version", None)
+            if callable(resolve_version):
+                version = int(resolve_version())
+            else:
+                version = int(self._client.get_version())
+                # py-clob-client-v2 1.1.0 stores this exact private cache. The
+                # fallback keeps deterministic injected clients testable.
+                if hasattr(self._client, "_ClobClient__cached_version"):
+                    setattr(self._client, "_ClobClient__cached_version", version)
+            return {"version": version, "clock_skew_s": skew_s}
 
     def preflight(self, geo: GeoStatus, required_notional: float) -> LivePreflight:
         with self._client_lock:
@@ -543,15 +577,38 @@ class V2ClobGateway:
 
     def _post_order(self, order: Any, order_type: Any) -> Any:
         try:
-            return self._client.post_order(order, order_type=order_type, post_only=False)
+            # Aftertake is a taker strategy: never ask the matching engine to
+            # defer execution. SDK-side transaction-hash enrichment happens
+            # only after the POST has reached the engine, so changing this wire
+            # flag cannot improve arrival time and may delay matching.
+            return self._client.post_order(
+                order,
+                order_type=order_type,
+                post_only=False,
+                defer_exec=False,
+            )
         except TypeError as first_exc:
             try:
-                return self._client.post_order(order, orderType=order_type, post_only=False)
+                return self._client.post_order(
+                    order,
+                    orderType=order_type,
+                    post_only=False,
+                    defer_exec=False,
+                )
             except TypeError:
                 try:
-                    return self._client.post_order(order, order_type)
+                    return self._client.post_order(order, order_type, False, False)
                 except TypeError:
-                    raise first_exc from None
+                    try:
+                        # Compatibility only for older injected/test clients.
+                        return self._client.post_order(
+                            order, order_type=order_type, post_only=False
+                        )
+                    except TypeError:
+                        try:
+                            return self._client.post_order(order, order_type)
+                        except TypeError:
+                            raise first_exc from None
 
     def _order_type(self, order_type: str) -> Any:
         normalized = str(order_type or "").upper().strip()

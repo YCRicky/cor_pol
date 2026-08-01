@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-import os
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,13 +15,13 @@ def utc_now_iso() -> str:
 def append_jsonl(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     row = {"ts": utc_now_iso(), **data}
-    # JSONL remains a human-readable audit mirror.  SQLite is the authoritative
-    # state machine, but this write must still be durable and must not hide I/O
-    # failures from the caller.
+    # JSONL is a human-readable mirror; SQLite FULL-sync transactions are the
+    # authoritative durable state.  Forcing an fsync on every close-time book
+    # decision can stall the strategy thread and provides no additional order
+    # safety, so the mirror is flushed to Python/OS only.
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
         f.flush()
-        os.fsync(f.fileno())
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:

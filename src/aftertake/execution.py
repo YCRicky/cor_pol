@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import re
 import threading
 import time
@@ -116,19 +117,39 @@ def _heartbeat_id_from_value(value: Any) -> str:
 class HeartbeatLoop:
     """CLOB order heartbeat, separate from WebSocket ping/keepalive."""
 
-    def __init__(self, gateway: OrderGateway, interval_s: float):
+    def __init__(
+        self,
+        gateway: OrderGateway,
+        interval_s: float,
+        *,
+        fatal_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    ):
         self.gateway = gateway
         self.interval_s = float(interval_s)
-        self.call_timeout_s = max(0.1, min(2.0, self.interval_s * 0.5))
+        # Live uses ``use_server_time=False``, so this path contains one HTTP
+        # request with the pinned SDK's five-second timeout. Bound a provider
+        # call just beyond that timeout; a two-second wrapper would turn a slow
+        # but valid response into a restart storm. Small test intervals remain
+        # responsive.
+        self.call_timeout_s = max(0.2, min(5.5, self.interval_s * 2.5))
+        self.hard_failure_s = 7.0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._request_thread: Optional[threading.Thread] = None
+        self._request_done: Optional[threading.Event] = None
+        self._request_result: Dict[str, Any] = {}
+        self._request_failure: List[BaseException] = []
         self._request_lock = threading.Lock()
         self.last_error = ""
         self._heartbeat_id = ""
         self.last_success_at = 0.0
         self.consecutive_failures = 0
         self.status_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None
+        self.fatal_callback = fatal_callback
+        self._fatal_requested = threading.Event()
+        self._status_queue: "queue.Queue[tuple]" = queue.Queue(maxsize=64)
+        self._status_stop = threading.Event()
+        self._status_thread: Optional[threading.Thread] = None
 
     @property
     def heartbeat_id(self) -> str:
@@ -139,28 +160,37 @@ class HeartbeatLoop:
     def start(self) -> None:
         if self._thread is not None:
             return
+        self._status_thread = threading.Thread(
+            target=self._status_worker,
+            daemon=True,
+            name="aftertake-heartbeat-status",
+        )
+        self._status_thread.start()
         self._thread = threading.Thread(target=self._run, daemon=True, name="aftertake-heartbeat")
         self._thread.start()
 
     def _post_heartbeat_bounded(self) -> Dict[str, Any]:
-        """Bound one SDK call and prevent overlapping hung request threads."""
+        """Bound one SDK call and retain a completion that arrives late."""
 
         with self._request_lock:
-            if self._request_thread is not None and self._request_thread.is_alive():
-                raise TimeoutError("previous heartbeat request is still in flight")
+            if self._request_thread is not None:
+                if self._request_thread.is_alive():
+                    raise TimeoutError("previous heartbeat request is still in flight")
+                return self._consume_request_locked()
             done = threading.Event()
-            result: Dict[str, Any] = {}
-            failure: List[BaseException] = []
+            self._request_done = done
+            self._request_result = {}
+            self._request_failure = []
 
             def call() -> None:
                 try:
                     response = self.gateway.post_heartbeat(self._heartbeat_id)
                     if isinstance(response, dict):
-                        result.update(response)
+                        self._request_result.update(response)
                     else:
-                        result["raw"] = response
+                        self._request_result["raw"] = response
                 except Exception as exc:  # propagate SDK failures to the loop
-                    failure.append(exc)
+                    self._request_failure.append(exc)
                 finally:
                     done.set()
 
@@ -175,25 +205,104 @@ class HeartbeatLoop:
         if not done.wait(self.call_timeout_s):
             raise TimeoutError("heartbeat request timed out")
         with self._request_lock:
-            self._request_thread = None
+            return self._consume_request_locked()
+
+    def _consume_request_locked(self) -> Dict[str, Any]:
+        """Consume exactly one completed request while ``_request_lock`` is held."""
+
+        if self._request_thread is None or self._request_thread.is_alive():
+            raise TimeoutError("previous heartbeat request is still in flight")
+        failure = list(self._request_failure)
+        result = dict(self._request_result)
+        self._request_thread = None
+        self._request_done = None
+        self._request_result = {}
+        self._request_failure = []
         if failure:
             raise failure[0]
         return result
 
-    def _notify_status(self, kind: str, payload: Dict[str, Any]) -> None:
-        callback = self.status_callback
+    def _notify_status(self, kind: str, payload: Dict[str, Any]) -> Optional[threading.Event]:
+        if self.status_callback is None:
+            return None
+        acknowledged = threading.Event()
+        try:
+            self._status_queue.put_nowait((str(kind), dict(payload), acknowledged))
+            return acknowledged
+        except queue.Full:
+            # A blocked diagnostics consumer must never block the dead-man
+            # heartbeat itself. Losing heartbeat status is a fatal
+            # observability fault, so recreate the process instead.
+            self._request_fatal(
+                "heartbeat status queue is full",
+                {"consecutive_failures": self.consecutive_failures},
+            )
+            return None
+
+    def _status_worker(self) -> None:
+        while not self._status_stop.is_set():
+            try:
+                kind, payload, acknowledged = self._status_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            try:
+                callback = self.status_callback
+                if callback is not None:
+                    callback(kind, payload)
+            except Exception:
+                # Diagnostics must never terminate heartbeat processing.
+                pass
+            finally:
+                acknowledged.set()
+                self._status_queue.task_done()
+
+    def _request_fatal(
+        self,
+        reason: str,
+        payload: Dict[str, Any],
+        acknowledged: Optional[threading.Event] = None,
+    ) -> None:
+        if self._fatal_requested.is_set():
+            return
+        self._fatal_requested.set()
+        callback = self.fatal_callback
         if callback is None:
             return
-        try:
-            callback(kind, payload)
-        except Exception:
-            # Diagnostics must never terminate the heartbeat loop.
-            return
+
+        def invoke() -> None:
+            try:
+                if acknowledged is not None:
+                    # Give the independent status worker a short chance to
+                    # commit the durable ALERT. A locked/broken database must
+                    # never postpone process recovery beyond this bound.
+                    acknowledged.wait(0.1)
+                callback(str(reason), dict(payload))
+            except Exception:
+                return
+
+        threading.Thread(
+            target=invoke,
+            daemon=True,
+            name="aftertake-heartbeat-restart",
+        ).start()
+
+    @property
+    def fatal_requested(self) -> bool:
+        return self._fatal_requested.is_set()
 
     def _run(self) -> None:
         had_error = False
+        first_success = True
+        started_mono = time.monotonic()
+        last_success_mono = 0.0
+        next_due = started_mono
+        # The live runtime starts this single account-wide loop well before the
+        # close. Send immediately so an existing GTC is protected on boot and a
+        # valid heartbeat id is warm before any new order can be acknowledged.
         while not self._stop.is_set():
-            wait_s = self.interval_s
+            wait_s = max(0.0, next_due - time.monotonic())
+            if self._stop.wait(wait_s):
+                return
             try:
                 response = self._post_heartbeat_bounded()
                 heartbeat_id = _heartbeat_id_from_value(response)
@@ -201,13 +310,16 @@ class HeartbeatLoop:
                     self._heartbeat_id = heartbeat_id
                 self.last_error = ""
                 self.last_success_at = time.time()
+                last_success_mono = time.monotonic()
                 self.consecutive_failures = 0
-                if had_error:
+                if had_error or first_success:
                     self._notify_status(
                         "heartbeat_recovered",
                         {"reason": "CLOB heartbeat restored", "heartbeat_id": self._heartbeat_id},
                     )
                 had_error = False
+                first_success = False
+                next_due += self.interval_s
             except Exception as exc:  # execution reconciliation will fail closed
                 # Polymarket returns the replacement heartbeat_id alongside a
                 # 400 when the previous id expired.  Keeping the old id here
@@ -218,11 +330,10 @@ class HeartbeatLoop:
                 replacement_id = _heartbeat_id_from_value(exc)
                 if replacement_id:
                     self._heartbeat_id = replacement_id
-                    wait_s = min(0.25, self.interval_s)
                 error_value = getattr(exc, "error_msg", None)
                 self.last_error = _safe_error_message(error_value if error_value is not None else exc)
                 had_error = True
-                self._notify_status(
+                status_ack = self._notify_status(
                     "heartbeat_error",
                     {
                         "reason": "CLOB heartbeat failed",
@@ -231,15 +342,56 @@ class HeartbeatLoop:
                         "consecutive_failures": self.consecutive_failures,
                     },
                 )
-            self._stop.wait(max(0.01, wait_s))
+                now_mono = time.monotonic()
+                failure_age = now_mono - (last_success_mono or started_mono)
+                request_stuck = isinstance(exc, TimeoutError) and (
+                    "timed out" in self.last_error.lower()
+                    or "still in flight" in self.last_error.lower()
+                )
+                repeated_failure = not replacement_id and self.consecutive_failures >= 2
+                if request_stuck or repeated_failure or failure_age >= self.hard_failure_s:
+                    self._request_fatal(
+                        "CLOB heartbeat is not recoverable in-process",
+                        {
+                            "error_message": self.last_error,
+                            "consecutive_failures": self.consecutive_failures,
+                            "failure_age_s": failure_age,
+                        },
+                        acknowledged=status_ack,
+                    )
+                if replacement_id:
+                    next_due = now_mono + min(0.25, self.interval_s)
+                else:
+                    next_due += self.interval_s
+            # If a call consumed the full cadence, retry immediately rather
+            # than adding request latency to every heartbeat interval.
+            next_due = max(next_due, time.monotonic())
 
     def stop(self) -> None:
         self._stop.set()
-        request_thread = self._request_thread
+        # `_post_heartbeat_bounded` publishes and starts the request while
+        # holding this same lock.  Taking the snapshot under the lock prevents
+        # joining a Thread object in the tiny pre-start interval.
+        with self._request_lock:
+            request_thread = self._request_thread
         if request_thread is not None:
-            request_thread.join(timeout=self.call_timeout_s + 0.25)
+            request_thread.join(timeout=min(1.0, self.call_timeout_s + 0.25))
         if self._thread is not None:
-            self._thread.join(timeout=max(1.0, self.interval_s + 1.0))
+            self._thread.join(timeout=min(2.0, max(1.0, self.interval_s + 0.25)))
+        if request_thread is not None and request_thread.is_alive():
+            self.last_error = "heartbeat request remained alive during shutdown"
+            self._notify_status(
+                "heartbeat_error",
+                {
+                    "reason": "CLOB heartbeat shutdown failed",
+                    "error_message": self.last_error,
+                    "heartbeat_id": self._heartbeat_id,
+                    "consecutive_failures": self.consecutive_failures,
+                },
+            )
+        self._status_stop.set()
+        if self._status_thread is not None:
+            self._status_thread.join(timeout=0.25)
 
 
 def _number(payload: Dict[str, Any], keys: tuple, default: float = 0.0) -> float:
@@ -318,6 +470,45 @@ def _is_fak_no_match_exception(exc: BaseException, order_type: str) -> bool:
     )
 
 
+def _is_definite_submit_rejection(exc: BaseException) -> bool:
+    """Return true only for documented failures that cannot have inserted an order.
+
+    HTTP status alone is not enough.  In particular, Polymarket reports a
+    duplicated signed order as HTTP 400 even though the identical order may
+    already be live.  Treating every 4xx as zero risk can therefore hide a real
+    position.
+    """
+
+    status_code = getattr(exc, "status_code", None)
+    try:
+        status_code = int(status_code)
+    except (TypeError, ValueError):
+        return False
+    if status_code in {401, 403}:
+        return True
+    if status_code not in {400, 404, 422}:
+        return False
+    error_value = getattr(exc, "error_msg", None)
+    message = _safe_error_message(error_value if error_value is not None else str(exc)).lower()
+    if any(marker in message for marker in ("duplicat", "already been placed")):
+        return False
+    definite_markers = (
+        "invalid order payload",
+        "invalid order type",
+        "owner of the api key",
+        "signer address has to be",
+        "address banned",
+        "closed only mode",
+        "breaks minimum tick size",
+        "lower than the minimum",
+        "not enough balance",
+        "not enough allowance",
+        "invalid expiration",
+        "market is not yet ready",
+    )
+    return any(marker in message for marker in definite_markers)
+
+
 def _sanitize_exception(exc: BaseException, *, phase: str, order_type: str) -> Dict[str, Any]:
     status_code = getattr(exc, "status_code", None)
     error_msg = getattr(exc, "error_msg", None)
@@ -347,9 +538,9 @@ class OrderExecutor:
     """Submit one already-reserved entry and reconcile it before returning.
 
     It never automatically retries a failed/ambiguous submission for the same
-    market.  Polymarket CLOB/network submit-path failures are terminal-skipped
-    for the affected slug; confirmed fills/reconciliation still update durable
-    state, but stale infrastructure errors must not globally block future entries.
+    market.  A definite venue rejection is terminal for that slug; a timeout,
+    disconnect, 5xx, or missing acknowledgement remains durable
+    ``execution_unknown`` because the server may already have accepted it.
     """
 
     def __init__(
@@ -361,6 +552,7 @@ class OrderExecutor:
         monotonic: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
         heartbeat_factory: Callable[[OrderGateway, float], HeartbeatLoop] = HeartbeatLoop,
+        account_heartbeat: Optional[HeartbeatLoop] = None,
         event_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ):
         self.settings = settings
@@ -370,6 +562,11 @@ class OrderExecutor:
         self._monotonic = monotonic
         self._wall_clock = wall_clock
         self._heartbeat_factory = heartbeat_factory
+        # Heartbeats are an account-wide dead-man switch: one chain protects
+        # every open order.  The live runner owns one long-lived instance.
+        # Per-order loops race their heartbeat ids and cancel pending GTCs when
+        # the individual reconciliation call returns.
+        self.account_heartbeat = account_heartbeat
         self._event_callback = event_callback
         self._event_threads: List[tuple] = []
         self._event_threads_lock = threading.Lock()
@@ -379,6 +576,14 @@ class OrderExecutor:
         if hasattr(heartbeat, "status_callback"):
             heartbeat.status_callback = lambda kind, payload: self._emit(kind, payload)
         return heartbeat
+
+    def close(self) -> None:
+        """Stop the account-wide heartbeat owned by this executor, if any."""
+
+        heartbeat = self.account_heartbeat
+        self.account_heartbeat = None
+        if heartbeat is not None:
+            heartbeat.stop()
 
     def _emit(self, kind: str, payload: Dict[str, Any]) -> None:
         if self._event_callback is None:
@@ -469,8 +674,6 @@ class OrderExecutor:
         if self.gateway is None:
             raise RuntimeError("live order executor requires a V2 CLOB gateway")
 
-        heartbeat = self._new_heartbeat()
-        heartbeat.start()
         try:
             submit_start_wall = 0.0
             submit_start_mono = 0.0
@@ -531,16 +734,26 @@ class OrderExecutor:
                         record, "no_fill", 0.0, 0.0, True, "venue_no_match", reason, raw
                     )
 
-                # Polymarket CLOB/network failures are common enough that they
-                # must not globally freeze future entries.  Do not retry this
-                # market after a submit-path exception, but persist diagnostics
-                # and terminal-skip only the affected slug.
                 reason = "matching_engine_restart" if is_matching_engine_restart_error(exc) else "submit_exception"
                 raw["classification"] = reason
-                raw["terminal_skip"] = True
-                self.store.mark_terminal_execution(record.intent_id, 0.0, 0.0, raw, "submit_skipped")
+                if _is_definite_submit_rejection(exc):
+                    # A concrete 4xx response (other than timeout/rate limit)
+                    # is a negative venue acknowledgement: the request was
+                    # rejected and cannot have created a resting order.
+                    raw["terminal_skip"] = True
+                    self.store.mark_terminal_execution(record.intent_id, 0.0, 0.0, raw, "submit_skipped")
+                    return self._result_from_record(
+                        record, "submit_skipped", 0.0, 0.0, True, "skipped", reason, raw
+                    )
+
+                # The request may have reached the matching engine before the
+                # transport failed.  Retrying could duplicate live risk and
+                # declaring zero-fill would hide it, so preserve the intent as
+                # unresolved until an operator attaches an authoritative id.
+                raw["ambiguous_submission"] = True
+                self.store.mark_execution_unknown(record.intent_id, reason, raw)
                 return self._result_from_record(
-                    record, "submit_skipped", 0.0, 0.0, True, "skipped", reason, raw
+                    record, "execution_unknown", 0.0, 0.0, False, "unknown", reason, raw
                 )
 
             timing = self._build_timing(
@@ -563,10 +776,10 @@ class OrderExecutor:
                 raw = dict(submitted)
                 raw["timing"] = timing
                 raw["classification"] = reason
-                raw["terminal_skip"] = True
-                self.store.mark_terminal_execution(record.intent_id, 0.0, 0.0, raw, "submit_skipped")
+                raw["ambiguous_submission"] = True
+                self.store.mark_execution_unknown(record.intent_id, reason, raw)
                 return self._result_from_record(
-                    record, "submit_skipped", 0.0, 0.0, True, "skipped", reason, raw
+                    record, "execution_unknown", 0.0, 0.0, False, "unknown", reason, raw
                 )
             self.store.mark_submitted(record.intent_id, order_id, submitted)
             self._emit(
@@ -587,7 +800,9 @@ class OrderExecutor:
             )
             return self._reconcile(record, order_id, submitted)
         finally:
-            heartbeat.stop()
+            # The account heartbeat is deliberately not stopped here.  A GTC
+            # may remain live after this bounded reconciliation window.
+            pass
 
     def reconcile_existing(self, record: OrderRecord) -> OrderResult:
         """Reconcile a persisted submitted order before new live risk is allowed."""
@@ -600,12 +815,172 @@ class OrderExecutor:
             return self._result_from_record(
                 record, "execution_unknown", 0.0, 0.0, False, "unknown", reason, {}
             )
-        heartbeat = self._new_heartbeat()
-        heartbeat.start()
+        return self._reconcile(record, record.order_id, {"recovery": True})
+
+    def reconcile_existing_once(self, record: OrderRecord) -> OrderResult:
+        """Perform one authoritative status probe without a 45-second sweep.
+
+        Startup and background maintenance may have many persisted orders. A
+        full reconciliation deadline per record can starve the scheduler or
+        create a permanent reboot loop. One successful CLOB lookup is enough to
+        settle a terminal order or safely leave a GTC pending for the next pass.
+        """
+
+        if self.gateway is None:
+            raise RuntimeError("reconciliation requires a V2 CLOB gateway")
+        if not record.order_id:
+            reason = "persisted_intent_has_no_order_id"
+            self.store.mark_execution_unknown(record.intent_id, reason)
+            return self._result_from_record(
+                record, "execution_unknown", 0.0, 0.0, False, "unknown", reason, {}
+            )
+
+        reconcile_start_wall = self._wall_clock()
+        started_at = self._monotonic()
+        deadline = started_at + self.settings.reconcile_timeout_s
         try:
-            return self._reconcile(record, record.order_id, {"recovery": True})
-        finally:
-            heartbeat.stop()
+            order = self._call_bounded(
+                lambda: self.gateway.get_order(record.order_id),
+                max(0.01, deadline - self._monotonic()),
+                "get_order",
+            )
+        except Exception as exc:
+            raw = {
+                "submit": record.raw or {},
+                "classification": "reconcile_transport_timeout",
+                "ambiguous_submission": True,
+                "error_message": _safe_error_message(str(exc)),
+                "timing": self._merge_reconcile_timing(
+                    {"_timing": dict((record.raw or {}).get("timing") or {})},
+                    reconcile_start_wall,
+                    started_at,
+                ),
+            }
+            self.store.mark_execution_unknown(
+                record.intent_id, "reconcile_transport_timeout", raw
+            )
+            return self._result_from_record(
+                record,
+                "execution_unknown",
+                0.0,
+                0.0,
+                False,
+                "unknown",
+                "reconcile_transport_timeout",
+                raw,
+            )
+        if record.raw.get("requires_identity_validation"):
+            identity_error = self._recovered_identity_error(record, record.order_id, order)
+            if identity_error:
+                raw = {
+                    **dict(record.raw or {}),
+                    "order": order,
+                    "identity_error": identity_error,
+                    "requires_identity_validation": True,
+                    "classification": "recovered_order_identity_mismatch",
+                }
+                self.store.mark_execution_unknown(
+                    record.intent_id, "recovered_order_identity_mismatch", raw
+                )
+                return self._result_from_record(
+                    record,
+                    "execution_unknown",
+                    0.0,
+                    0.0,
+                    False,
+                    "unknown",
+                    identity_error,
+                    raw,
+                )
+        status = _normalise_status(order.get("status") or "")
+        trades: List[Dict[str, Any]] = []
+        provisional_qty, provisional_avg = self._summarize_fill(record, order, trades)
+        if _terminal_status(status) and provisional_qty > 0 and provisional_avg <= 0:
+            try:
+                trades = self._call_bounded(
+                    lambda: self.gateway.order_trades(record.token_id, record.order_id),
+                    max(0.01, deadline - self._monotonic()),
+                    "order_trades",
+                )
+            except Exception as exc:
+                if isinstance(exc, TimeoutError):
+                    raw = {
+                        "submit": record.raw or {},
+                        "order": order,
+                        "classification": "reconcile_transport_timeout",
+                        "ambiguous_submission": True,
+                        "error_message": _safe_error_message(str(exc)),
+                        "timing": self._merge_reconcile_timing(
+                            {"_timing": dict((record.raw or {}).get("timing") or {})},
+                            reconcile_start_wall,
+                            started_at,
+                        ),
+                    }
+                    self.store.mark_execution_unknown(
+                        record.intent_id, "reconcile_transport_timeout", raw
+                    )
+                    return self._result_from_record(
+                        record,
+                        "execution_unknown",
+                        provisional_qty,
+                        0.0,
+                        False,
+                        "unknown",
+                        "reconcile_transport_timeout",
+                        raw,
+                    )
+                order = {**order, "trades_lookup_error": str(exc)}
+        timing = self._merge_reconcile_timing(
+            {"_timing": dict((record.raw or {}).get("timing") or {})},
+            reconcile_start_wall,
+            started_at,
+        )
+        raw = {
+            "submit": record.raw or {},
+            "order": order,
+            "trades": trades,
+            "timing": timing,
+            "single_probe": True,
+        }
+        if _terminal_status(status):
+            filled_qty, avg_price = self._summarize_fill(record, order, trades)
+            if filled_qty > 0 and avg_price <= 0:
+                reason = "confirmed_fill_without_execution_price"
+                self.store.mark_execution_unknown(record.intent_id, reason, raw)
+                return self._result_from_record(
+                    record,
+                    "execution_unknown",
+                    filled_qty,
+                    0.0,
+                    False,
+                    "unknown",
+                    reason,
+                    raw,
+                )
+            self.store.mark_terminal_execution(record.intent_id, filled_qty, avg_price, raw, status)
+            return self._result_from_record(
+                record,
+                status,
+                filled_qty,
+                avg_price,
+                True,
+                "acknowledged",
+                "",
+                raw,
+            )
+
+        raw["awaiting_settlement"] = True
+        raw["order_type"] = self.settings.order_type
+        return self._result_from_record(
+            record,
+            "submitted_pending",
+            0.0,
+            0.0,
+            False,
+            "awaiting_settlement",
+            "gtc_awaiting_settlement",
+            raw,
+        )
 
     def _reconcile(
         self, record: OrderRecord, order_id: str, submitted: Dict[str, Any]
@@ -626,18 +1001,32 @@ class OrderExecutor:
         cancel_errors: List[str] = []
         last_order: Dict[str, Any] = {}
         last_trades: List[Dict[str, Any]] = []
+        reconcile_transport_error = False
 
         while self._monotonic() <= deadline:
             order_lookup_ok = False
             try:
-                last_order = self.gateway.get_order(order_id)
+                last_order = self._call_bounded(
+                    lambda: self.gateway.get_order(order_id),
+                    max(0.01, deadline - self._monotonic()),
+                    "get_order",
+                )
                 order_lookup_ok = True
             except Exception as exc:
                 last_order = {"lookup_error": str(exc)}
+                if isinstance(exc, TimeoutError):
+                    reconcile_transport_error = True
+                    break
             if order_lookup_ok and record.raw.get("requires_identity_validation"):
                 identity_error = self._recovered_identity_error(record, order_id, last_order)
                 if identity_error:
-                    raw = {"order": last_order, "identity_error": identity_error}
+                    raw = {
+                        **dict(record.raw or {}),
+                        "order": last_order,
+                        "identity_error": identity_error,
+                        "requires_identity_validation": True,
+                        "classification": "recovered_order_identity_mismatch",
+                    }
                     self.store.mark_execution_unknown(
                         record.intent_id, "recovered_order_identity_mismatch", raw
                     )
@@ -651,14 +1040,52 @@ class OrderExecutor:
                         identity_error,
                         raw,
                     )
-            try:
-                last_trades = self.gateway.order_trades(record.token_id, order_id)
-            except Exception as exc:
-                # A lookup failure cannot prove a known terminal state.
-                last_trades = []
-                last_order["trades_lookup_error"] = str(exc)
             status = _normalise_status(last_order.get("status") or "") if order_lookup_ok else ""
             if order_lookup_ok and _terminal_status(status):
+                # A live/unmatched order needs only the direct ID lookup.  The
+                # old loop paginated the account's full trade history on every
+                # 500ms poll, multiplying one pending GTC into thousands of
+                # HTTP requests across six assets. Query trades only when a
+                # terminal fill has quantity but no authoritative average.
+                provisional_qty, provisional_avg = self._summarize_fill(
+                    record, last_order, []
+                )
+                if provisional_qty > 0 and provisional_avg <= 0:
+                    try:
+                        last_trades = self._call_bounded(
+                            lambda: self.gateway.order_trades(record.token_id, order_id),
+                            max(0.01, deadline - self._monotonic()),
+                            "order_trades",
+                        )
+                    except Exception as exc:
+                        if isinstance(exc, TimeoutError):
+                            last_order["trades_lookup_error"] = str(exc)
+                            raw = {
+                                "submit": submitted,
+                                "order": last_order,
+                                "cancel": cancel_raw,
+                                "trades": [],
+                                "classification": "reconcile_transport_timeout",
+                                "ambiguous_submission": True,
+                                "timing": self._merge_reconcile_timing(
+                                    submitted, reconcile_start_wall, started_at
+                                ),
+                            }
+                            self.store.mark_execution_unknown(
+                                record.intent_id, "reconcile_transport_timeout", raw
+                            )
+                            return self._result_from_record(
+                                record,
+                                "execution_unknown",
+                                provisional_qty,
+                                0.0,
+                                False,
+                                "unknown",
+                                "reconcile_transport_timeout",
+                                raw,
+                            )
+                        last_trades = []
+                        last_order["trades_lookup_error"] = str(exc)
                 filled_qty, avg_price = self._summarize_fill(record, last_order, last_trades)
                 timing = self._merge_reconcile_timing(submitted, reconcile_start_wall, started_at)
                 raw = {
@@ -705,7 +1132,9 @@ class OrderExecutor:
                     # bounded reconciliation deadline.
                     cancel_errors.append(str(exc))
                     cancel_raw = {"cancel_errors": list(cancel_errors)}
-            self._sleep(min(0.5, max(0.01, deadline - self._monotonic())))
+            elapsed = max(0.0, self._monotonic() - started_at)
+            poll_s = min(2.0, max(0.5, elapsed / 4.0))
+            self._sleep(min(poll_s, max(0.01, deadline - self._monotonic())))
 
         timing = self._merge_reconcile_timing(submitted, reconcile_start_wall, started_at)
         raw = {
@@ -715,6 +1144,10 @@ class OrderExecutor:
             "trades": last_trades,
             "timing": timing,
         }
+        if reconcile_transport_error:
+            raw["classification"] = "reconcile_transport_timeout"
+            raw["reconcile_transport_error"] = True
+            raw["error_message"] = str(last_order.get("lookup_error") or "reconcile transport timeout")
         reason = "order_not_terminal_after_reconcile_timeout"
         if self.settings.order_type == "GTC" and order_id:
             raw["awaiting_settlement"] = True
@@ -726,13 +1159,43 @@ class OrderExecutor:
                 0.0,
                 False,
                 "awaiting_settlement",
-                "gtc_awaiting_settlement",
+                "reconcile_transport_timeout" if reconcile_transport_error else "gtc_awaiting_settlement",
                 raw,
             )
         self.store.mark_execution_unknown(record.intent_id, reason, raw)
         return self._result_from_record(
             record, "execution_unknown", 0.0, 0.0, False, "unknown", reason, raw
         )
+
+    @staticmethod
+    def _call_bounded(
+        call: Callable[[], Any], timeout_s: float, label: str
+    ) -> Any:
+        """Run one SDK probe under a deadline even if its client ignores it."""
+
+        done = threading.Event()
+        result: List[Any] = []
+        failure: List[BaseException] = []
+
+        def invoke() -> None:
+            try:
+                result.append(call())
+            except BaseException as exc:  # preserve SDK exception types
+                failure.append(exc)
+            finally:
+                done.set()
+
+        thread = threading.Thread(
+            target=invoke,
+            daemon=True,
+            name="aftertake-clob-%s" % str(label),
+        )
+        thread.start()
+        if not done.wait(max(0.01, float(timeout_s))):
+            raise TimeoutError("%s probe exceeded reconciliation deadline" % label)
+        if failure:
+            raise failure[0]
+        return result[0] if result else None
 
 
     def _build_timing(
