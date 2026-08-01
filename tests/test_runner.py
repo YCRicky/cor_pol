@@ -214,6 +214,46 @@ def test_shadow_round_uses_websocket_classifier_and_never_sends_an_order(tmp_pat
         store.close()
 
 
+def test_run_round_does_not_arm_market_data_watchdog_for_quiet_book(tmp_path):
+    streams = []
+
+    class TrackingStream(DeepSupportPairedStream):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.watchdog_arms = []
+
+        def arm_market_data_watchdog(self, timeout_s):
+            self.watchdog_arms.append(timeout_s)
+
+    def stream_factory(**kwargs):
+        stream = TrackingStream(**kwargs)
+        streams.append(stream)
+        return stream
+
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        settings = Settings(
+            dry_run=True,
+            out_dir=tmp_path / "out",
+            state_db=tmp_path / "state.sqlite3",
+        )
+        run_round(
+            settings=settings,
+            store=store,
+            public=FakePublic(),
+            executor=OrderExecutor(settings, store),
+            live_gateway=None,
+            round_start=900,
+            clock=lambda: 1200.22,
+            sleep=lambda _: None,
+            stream_factory=stream_factory,
+        )
+        assert len(streams) == 1
+        assert streams[0].watchdog_arms == []
+    finally:
+        store.close()
+
+
 def test_runtime_status_reports_active_v8_guards(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     try:

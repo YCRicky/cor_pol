@@ -1495,7 +1495,6 @@ def run_round(
     live_preflight: Optional[LivePreflight] = None
     preflight_at = float(round_end) - LIVE_PREFLIGHT_LEAD_S
     stream_health_confirmed = False
-    stream_data_watchdog_armed = False
     stream_component = "market_stream:%s" % active_asset
 
     stream.start()
@@ -1503,14 +1502,6 @@ def run_round(
     try:
         while True:
             now = float(clock())
-            if (
-                not stream_data_watchdog_armed
-                and now >= round_end - max(1.0, classifier_cfg.pre_close_latest_max_age_s * 4.0)
-            ):
-                arm_data_watchdog = getattr(stream, "arm_market_data_watchdog", None)
-                if callable(arm_data_watchdog):
-                    arm_data_watchdog(classifier_cfg.pre_close_latest_max_age_s)
-                stream_data_watchdog_armed = True
             current_generation = int(getattr(stream, "generation", stream_generation))
             if current_generation != stream_generation:
                 # A reconnect clears the stream's paired books. Do not let the
