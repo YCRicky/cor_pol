@@ -1,6 +1,5 @@
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -28,3 +27,6 @@ def test_ec2_deploy_runs_regressions_clock_gate_and_pid_stability_check():
     assert "initial_pid=" in script
     assert "current_pid=" in script
     assert "systemctl is-active --quiet cor-pol" in script
+    assert "awk -v pid=\"${initial_pid}\"" in script
+    assert '"kind"[[:space:]]*:[[:space:]]*"boot"' in script
+    assert '"kind"[[:space:]]*:[[:space:]]*"runtime_ready"' in script

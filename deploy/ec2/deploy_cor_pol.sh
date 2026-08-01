@@ -121,9 +121,18 @@ for _attempt in $(seq 1 120); do
     journalctl -u cor-pol -n 100 --no-pager >&2
     exit 4
   }
+  # Audit records are one JSON object per line. Require a BOOT record for this
+  # exact MainPID before accepting its later RUNTIME_READY record; two separate
+  # greps could combine an old READY with a new process's BOOT and falsely pass.
   if test -f "${OUT_DIR}/runtime.jsonl" \
-    && grep -Eq '"kind"[[:space:]]*:[[:space:]]*"runtime_ready"' "${OUT_DIR}/runtime.jsonl" \
-    && grep -Eq "\"pid\"[[:space:]]*:[[:space:]]*${initial_pid}([[:space:],}]|$)" "${OUT_DIR}/runtime.jsonl"; then
+    && awk -v pid="${initial_pid}" '
+      function has_pid(line) {
+        return line ~ ("\"pid\"[[:space:]]*:[[:space:]]*" pid "([[:space:],}]|$)")
+      }
+      /"kind"[[:space:]]*:[[:space:]]*"boot"/ && has_pid($0) { boot_seen = 1 }
+      boot_seen && /"kind"[[:space:]]*:[[:space:]]*"runtime_ready"/ && has_pid($0) { ready_seen = 1 }
+      END { exit ready_seen ? 0 : 1 }
+    ' "${OUT_DIR}/runtime.jsonl"; then
     ready_seen=1
     break
   fi

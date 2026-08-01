@@ -150,6 +150,7 @@ class MarketBookStream:
         self._last_market_message_mono = 0.0
         self._market_data_watchdog_s: Optional[float] = None
         self._market_data_watchdog_armed_mono = 0.0
+        self._connection_started_mono = 0.0
         self.reconnect_count = 0
         self._generation = 0
 
@@ -216,9 +217,14 @@ class MarketBookStream:
                 timeout_s = self._market_data_watchdog_s
                 last_market = self._last_market_message_mono
                 armed_at = self._market_data_watchdog_armed_mono
+                connection_started = self._connection_started_mono
             if timeout_s is None:
                 continue
-            baseline = last_market or armed_at
+            # A reconnect after the close-critical watchdog was armed gets a
+            # fresh silence window. The previous implementation kept using the
+            # old arm time, so the watchdog closed every newly-created socket
+            # before its first snapshot could arrive.
+            baseline = last_market or max(connection_started, armed_at)
             if not baseline or time.monotonic() - baseline < timeout_s:
                 continue
             if self._watchdog_triggered.is_set():
@@ -266,7 +272,7 @@ class MarketBookStream:
         self._reset_books()
         while not self._stop.is_set():
             ws = None
-            connection_started = time.monotonic()
+            connection_started = 0.0
             try:
                 # Use the official hostname and normal resolver/TLS path.
                 # A hard-coded CDN IP can drift and is not an acceptable
@@ -277,8 +283,14 @@ class MarketBookStream:
                 # responsive to stop/reconnect requests.
                 with scoped_getaddrinfo(self._resolve_overrides):
                     ws = websocket.create_connection(self._url, timeout=CONNECT_TIMEOUT_S)
+                # Start the silence window after the handshake succeeds. A
+                # slow DNS/TLS connect must not consume the new socket's first
+                # watchdog window or make it look stale immediately.
+                connection_started = time.monotonic()
                 with self._socket_lock:
                     self._socket = ws
+                with self._lock:
+                    self._connection_started_mono = connection_started
                 self._watchdog_triggered.clear()
                 ws.settimeout(RECEIVE_TIMEOUT_S)
                 ws.send(
@@ -341,6 +353,9 @@ class MarketBookStream:
                 with self._socket_lock:
                     if self._socket is ws:
                         self._socket = None
+                with self._lock:
+                    if self._connection_started_mono == connection_started:
+                        self._connection_started_mono = 0.0
 
     def process_message(self, raw: Any, *, received_at: Optional[float] = None) -> bool:
         """Apply one raw official stream message; exposed for deterministic tests."""

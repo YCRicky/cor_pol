@@ -147,7 +147,7 @@ class HeartbeatLoop:
         self.status_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None
         self.fatal_callback = fatal_callback
         self._fatal_requested = threading.Event()
-        self._status_queue: "queue.Queue[tuple]" = queue.Queue(maxsize=64)
+        self._status_queue: queue.Queue[tuple] = queue.Queue(maxsize=64)
         self._status_stop = threading.Event()
         self._status_thread: Optional[threading.Thread] = None
 
@@ -570,6 +570,8 @@ class OrderExecutor:
         self._event_callback = event_callback
         self._event_threads: List[tuple] = []
         self._event_threads_lock = threading.Lock()
+        self._process_restart_required = threading.Event()
+        self._process_restart_reason = ""
 
     def _new_heartbeat(self) -> HeartbeatLoop:
         heartbeat = self._heartbeat_factory(self.gateway, self.settings.heartbeat_interval_s)
@@ -584,6 +586,21 @@ class OrderExecutor:
         self.account_heartbeat = None
         if heartbeat is not None:
             heartbeat.stop()
+
+    @property
+    def process_restart_required(self) -> bool:
+        """Return whether an SDK call outlived its hard reconciliation deadline."""
+
+        return self._process_restart_required.is_set()
+
+    @property
+    def process_restart_reason(self) -> str:
+        return self._process_restart_reason
+
+    def _mark_process_restart_required(self, reason: str) -> None:
+        if not self._process_restart_required.is_set():
+            self._process_restart_reason = str(reason)
+            self._process_restart_required.set()
 
     def _emit(self, kind: str, payload: Dict[str, Any]) -> None:
         if self._event_callback is None:
@@ -1167,8 +1184,8 @@ class OrderExecutor:
             record, "execution_unknown", 0.0, 0.0, False, "unknown", reason, raw
         )
 
-    @staticmethod
     def _call_bounded(
+        self,
         call: Callable[[], Any], timeout_s: float, label: str
     ) -> Any:
         """Run one SDK probe under a deadline even if its client ignores it."""
@@ -1192,7 +1209,9 @@ class OrderExecutor:
         )
         thread.start()
         if not done.wait(max(0.01, float(timeout_s))):
-            raise TimeoutError("%s probe exceeded reconciliation deadline" % label)
+            reason = "%s probe exceeded reconciliation deadline" % label
+            self._mark_process_restart_required(reason)
+            raise TimeoutError(reason)
         if failure:
             raise failure[0]
         return result[0] if result else None

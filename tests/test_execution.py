@@ -666,6 +666,21 @@ def test_reconcile_trade_lookup_is_bounded_and_keeps_fill_unknown(tmp_path):
         store.close()
 
 
+def test_bounded_clob_timeout_marks_process_restart_required(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    release = threading.Event()
+    executor = OrderExecutor(Settings(state_db=tmp_path / "state.sqlite3"), store)
+
+    try:
+        with pytest.raises(TimeoutError, match="probe exceeded"):
+            executor._call_bounded(lambda: release.wait(timeout=2.0), 0.02, "probe")
+        assert executor.process_restart_required is True
+        assert executor.process_restart_reason == "probe probe exceeded reconciliation deadline"
+    finally:
+        release.set()
+        store.close()
+
+
 def test_partial_trade_page_cannot_price_the_full_matched_quantity(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     try:

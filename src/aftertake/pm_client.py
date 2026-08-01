@@ -7,6 +7,7 @@ market-data inspection never need a private key or the live optional package.
 from __future__ import annotations
 
 import datetime as dt
+import inspect
 import json
 import ssl
 import threading
@@ -392,7 +393,7 @@ class V2ClobGateway:
                 # py-clob-client-v2 1.1.0 stores this exact private cache. The
                 # fallback keeps deterministic injected clients testable.
                 if hasattr(self._client, "_ClobClient__cached_version"):
-                    setattr(self._client, "_ClobClient__cached_version", version)
+                    self._client._ClobClient__cached_version = version
             return {"version": version, "clock_skew_s": skew_s}
 
     def preflight(self, geo: GeoStatus, required_notional: float) -> LivePreflight:
@@ -576,39 +577,33 @@ class V2ClobGateway:
         return raw
 
     def _post_order(self, order: Any, order_type: Any) -> Any:
+        # The live extra pins py-clob-client-v2==1.1.0. Resolve its call shape
+        # before invoking it; a TypeError raised by the SDK after the HTTP POST
+        # is ambiguous and must never trigger a second POST of the same signed
+        # order. Signature inspection is local and cannot submit an order.
         try:
-            # Aftertake is a taker strategy: never ask the matching engine to
-            # defer execution. SDK-side transaction-hash enrichment happens
-            # only after the POST has reached the engine, so changing this wire
-            # flag cannot improve arrival time and may delay matching.
-            return self._client.post_order(
-                order,
-                order_type=order_type,
-                post_only=False,
-                defer_exec=False,
+            parameters = inspect.signature(self._client.post_order).parameters
+        except (TypeError, ValueError) as exc:
+            raise LivePreflightError(
+                "cannot inspect the pinned CLOB post_order signature"
+            ) from exc
+
+        required = ("order_type", "post_only", "defer_exec")
+        if not all(name in parameters for name in required):
+            raise LivePreflightError(
+                "unsupported CLOB post_order signature; expected order_type, post_only, and defer_exec"
             )
-        except TypeError as first_exc:
-            try:
-                return self._client.post_order(
-                    order,
-                    orderType=order_type,
-                    post_only=False,
-                    defer_exec=False,
-                )
-            except TypeError:
-                try:
-                    return self._client.post_order(order, order_type, False, False)
-                except TypeError:
-                    try:
-                        # Compatibility only for older injected/test clients.
-                        return self._client.post_order(
-                            order, order_type=order_type, post_only=False
-                        )
-                    except TypeError:
-                        try:
-                            return self._client.post_order(order, order_type)
-                        except TypeError:
-                            raise first_exc from None
+
+        # Aftertake is a taker strategy: never ask the matching engine to defer
+        # execution. SDK-side transaction-hash enrichment happens only after
+        # the POST reaches the engine, so changing this flag cannot improve
+        # arrival time and may delay matching.
+        return self._client.post_order(
+            order,
+            order_type=order_type,
+            post_only=False,
+            defer_exec=False,
+        )
 
     def _order_type(self, order_type: str) -> Any:
         normalized = str(order_type or "").upper().strip()

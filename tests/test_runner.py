@@ -981,6 +981,24 @@ def test_runtime_watchdog_requests_process_restart_after_active_stall():
         watchdog.stop()
 
 
+def test_runtime_watchdog_persists_fatal_diagnostics_before_restart():
+    events = []
+    watchdog = RuntimeWatchdog(
+        stale_after_s=0.01,
+        interval_s=0.001,
+        exit_fn=lambda _code: events.append("restart"),
+        fatal_callback=lambda _reason, _payload: events.append("alert"),
+    )
+    watchdog.start()
+    try:
+        deadline = time.monotonic() + 0.5
+        while not events and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert events == ["alert", "restart"]
+    finally:
+        watchdog.stop()
+
+
 def test_runtime_watchdog_does_not_restart_while_waiting_for_boundary():
     exits = []
     watchdog = RuntimeWatchdog(stale_after_s=0.01, interval_s=0.001, exit_fn=exits.append)
@@ -1042,6 +1060,66 @@ def test_audit_persistence_failure_does_not_suppress_transport_alert(tmp_path, m
 
         assert len(notifier.messages) == 1
         assert notifier.messages[0].startswith("[Aftertake] ALERT")
+    finally:
+        store.close()
+
+
+def test_fatal_restart_runs_after_diagnostics_persist(tmp_path):
+    events = []
+
+    runner_module._run_diagnostics_then_restart(
+        lambda: events.append("restart"),
+        lambda: events.append("alert_outbox_persisted"),
+        grace_s=0.1,
+    )
+
+    assert events == ["alert_outbox_persisted", "restart"]
+
+
+def test_heartbeat_fatal_persists_alert_before_process_restart(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    notifier = CaptureNotifier()
+    events = []
+
+    def restart():
+        events.append("restart")
+        events.append("alert" if notifier.messages else "missing_alert")
+
+    try:
+        runner_module._restart_after_heartbeat_fatal(
+            settings=Settings(state_db=tmp_path / "state.sqlite3"),
+            store=store,
+            notifier=notifier,
+            reason="heartbeat status queue is full",
+            payload={"consecutive_failures": 3},
+            restart_fn=restart,
+        )
+        assert events == ["restart", "alert"]
+        assert notifier.messages[0].startswith("[Aftertake] ALERT")
+    finally:
+        store.close()
+
+
+def test_executor_timeout_persists_alert_before_process_restart(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    notifier = CaptureNotifier()
+    executor = OrderExecutor(Settings(state_db=tmp_path / "state.sqlite3"), store)
+    executor._mark_process_restart_required("get_order probe exceeded reconciliation deadline")
+    events = []
+
+    def restart():
+        events.append("restart")
+        events.append("alert" if notifier.messages else "missing_alert")
+
+    try:
+        assert runner_module._restart_after_executor_timeout(
+            settings=Settings(state_db=tmp_path / "state.sqlite3"),
+            store=store,
+            notifier=notifier,
+            executor=executor,
+            restart_fn=restart,
+        ) is True
+        assert events == ["restart", "alert"]
     finally:
         store.close()
 
@@ -1497,6 +1575,67 @@ def test_reconcile_submitted_orders_keeps_pending_quiet_then_notifies_terminal(t
         assert second[0].terminal is True
         assert notifier.messages
         assert notifier.messages[-1].startswith("[Aftertake] ENTRY_CONFIRMED")
+    finally:
+        store.close()
+
+
+def test_reconcile_submitted_orders_stops_after_uncancellable_timeout(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        records = []
+        for index in (1, 2):
+            record = store.reserve_entry(
+                "btc-updown-5m-%s" % (900 + index),
+                "condition-%s" % index,
+                900 + index,
+                "up-token",
+                "YES",
+                5,
+                0.64,
+            )
+            assert record is not None
+            store.mark_submitted(record.intent_id, "order-live-%s" % index, {})
+            records.append(record)
+
+        class TimeoutExecutor:
+            process_restart_required = False
+
+            def __init__(self):
+                self.calls = 0
+
+            def reconcile_existing_once(self, record):
+                self.calls += 1
+                self.process_restart_required = True
+                return OrderExecutor(
+                    Settings(dry_run=False),
+                    StateStore.__new__(StateStore),
+                    gateway=object(),
+                )._result_from_record(
+                    record,
+                    "execution_unknown",
+                    0.0,
+                    0.0,
+                    False,
+                    "unknown",
+                    "reconcile_transport_timeout",
+                    {"reconcile_transport_error": True},
+                )
+
+        executor = TimeoutExecutor()
+        results = reconcile_submitted_orders(
+            settings=Settings(
+                dry_run=False,
+                order_type="GTC",
+                out_dir=tmp_path / "out",
+                state_db=tmp_path / "state.sqlite3",
+            ),
+            store=store,
+            executor=executor,
+            notifier=CaptureNotifier(),
+        )
+
+        assert executor.calls == 1
+        assert len(results) == 1
     finally:
         store.close()
 

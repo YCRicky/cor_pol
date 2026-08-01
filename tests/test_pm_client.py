@@ -311,7 +311,7 @@ def test_http_425_retries_the_same_signed_order_object():
         def create_order(self, args, options=None):
             return object()
 
-        def post_order(self, order, order_type):
+        def post_order(self, order, *, order_type, post_only, defer_exec):
             self.posted.append(order)
             if len(self.posted) == 1:
                 raise RuntimeError("HTTP 425 Too Early")
@@ -353,7 +353,7 @@ def test_fast_post_close_submission_does_not_retry_a_matching_engine_restart():
         def create_order(self, args, options=None):
             return object()
 
-        def post_order(self, order, order_type):
+        def post_order(self, order, *, order_type, post_only, defer_exec):
             self.posted.append(order)
             raise RuntimeError("HTTP 425 Too Early")
 
@@ -374,6 +374,24 @@ def test_fast_post_close_submission_does_not_retry_a_matching_engine_restart():
         gateway.submit_limit_buy_fast("token", 0.5, 5, metadata)
 
     assert len(client.posted) == 1
+
+
+def test_post_order_typeerror_after_call_is_not_retried():
+    class Client:
+        def __init__(self):
+            self.calls = 0
+
+        def post_order(self, order, *, order_type, post_only, defer_exec):
+            self.calls += 1
+            raise TypeError("injected post-send response decode failure")
+
+    client = Client()
+    gateway = V2ClobGateway(client, {})
+
+    with pytest.raises(TypeError, match="post-send"):
+        gateway._post_order("signed-order", "GTC")
+
+    assert client.calls == 1
 
 
 def test_fast_submit_is_not_delayed_by_held_market_metadata_lock():
@@ -403,7 +421,7 @@ def test_fast_submit_is_not_delayed_by_held_market_metadata_lock():
         def create_order(self, args, options=None):
             return {"signed": True}
 
-        def post_order(self, order, order_type):
+        def post_order(self, order, *, order_type, post_only, defer_exec):
             fast_submit_completed.set()
             return {"orderID": "order-1"}
 
@@ -452,7 +470,7 @@ def test_fast_post_close_submission_uses_fak_order_type():
         def create_order(self, args, options=None):
             return object()
 
-        def post_order(self, order, order_type):
+        def post_order(self, order, *, order_type, post_only, defer_exec):
             self.order_types.append(order_type)
             return {"orderID": "order-1"}
 
@@ -488,8 +506,13 @@ def test_fak_post_order_uses_documented_keyword_order_type_and_post_only_false()
         def create_order(self, args, options=None):
             return {"signed": True}
 
-        def post_order(self, order, *, order_type="GTC", post_only=True):
-            self.seen = {"order": order, "order_type": order_type, "post_only": post_only}
+        def post_order(self, order, *, order_type="GTC", post_only=True, defer_exec=True):
+            self.seen = {
+                "order": order,
+                "order_type": order_type,
+                "post_only": post_only,
+                "defer_exec": defer_exec,
+            }
             return {"orderID": "order-fak"}
 
     client = Client()
@@ -515,4 +538,9 @@ def test_fak_post_order_uses_documented_keyword_order_type_and_post_only_false()
     raw = gateway.submit_limit_buy_fast("token", 0.5, 5, metadata, "FAK")
 
     assert raw["orderID"] == "order-fak"
-    assert client.seen == {"order": {"signed": True}, "order_type": "FAK", "post_only": False}
+    assert client.seen == {
+        "order": {"signed": True},
+        "order_type": "FAK",
+        "post_only": False,
+        "defer_exec": False,
+    }

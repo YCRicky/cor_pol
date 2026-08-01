@@ -328,6 +328,36 @@ def test_market_stream_watchdog_interrupts_recv_that_ignores_socket_timeout(monk
             stream._watchdog_thread.join(timeout=1.0)
 
 
+def test_market_data_watchdog_resets_silence_baseline_for_new_connection():
+    close_called = threading.Event()
+    stream = MarketBookStream(
+        yes_token_id="yes-token",
+        no_token_id="no-token",
+        on_book=lambda _snapshot: None,
+    )
+
+    class Socket:
+        def close(self):
+            close_called.set()
+
+    stream._market_data_watchdog_s = 0.05
+    stream._market_data_watchdog_armed_mono = time.monotonic() - 1.0
+    stream._connection_started_mono = time.monotonic()
+    stream._last_market_message_mono = 0.0
+    stream._watchdog_triggered.clear()
+    stream._socket = Socket()
+    stream._watchdog_stop.clear()
+    watchdog = threading.Thread(target=stream._market_data_watchdog, daemon=True)
+    watchdog.start()
+    try:
+        time.sleep(0.01)
+        assert close_called.is_set() is False
+        assert close_called.wait(0.2)
+    finally:
+        stream._watchdog_stop.set()
+        watchdog.join(timeout=1.0)
+
+
 def test_market_stream_counts_only_near_touch_bid_depth():
     snapshots = []
     stream = MarketBookStream(

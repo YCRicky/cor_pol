@@ -68,6 +68,7 @@ RUNTIME_WATCHDOG_INTERVAL_S = 5.0
 RUNTIME_WAITING_STAGE_TIMEOUT_S = 360.0
 RUNTIME_ACTIVE_STAGE_TIMEOUT_S = 600.0
 MAINTENANCE_TIMEOUT_S = 240.0
+OBSERVABILITY_RESTART_GRACE_S = 2.0
 # This only bounds how long the runner waits to re-check an already-recorded
 # websocket observation. Event confirmation and all thresholds remain in
 # PostCloseConfig.
@@ -76,10 +77,10 @@ POST_CLOSE_POLL_INTERVAL_S = 0.005
 # sequential metadata retries can consume roughly 75 seconds at their documented
 # socket limits; finish that I/O well before the ten-second scene gate.
 LIVE_PREFLIGHT_LEAD_S = 150.0
-_AUDIT_QUEUE: "queue.Queue[tuple]" = queue.Queue(maxsize=4096)
+_AUDIT_QUEUE: queue.Queue[tuple] = queue.Queue(maxsize=4096)
 _AUDIT_THREAD: Optional[threading.Thread] = None
 _AUDIT_THREAD_LOCK = threading.Lock()
-_NOTIFY_QUEUE: "queue.Queue[tuple]" = queue.Queue(maxsize=512)
+_NOTIFY_QUEUE: queue.Queue[tuple] = queue.Queue(maxsize=512)
 _NOTIFY_THREAD: Optional[threading.Thread] = None
 _NOTIFY_THREAD_LOCK = threading.Lock()
 _NOTIFY_REGISTRY: Dict[str, tuple] = {}
@@ -87,6 +88,54 @@ _NOTIFY_REGISTRY_LOCK = threading.Lock()
 _NOTIFY_QUEUED: set[str] = set()
 _NOTIFY_QUEUED_LOCK = threading.Lock()
 _NOTIFY_RETRY_CAP_S = 60.0
+
+
+def _run_diagnostics_then_restart(
+    restart_fn: Callable[[], None],
+    diagnostics: Callable[[], None],
+    *,
+    grace_s: float = OBSERVABILITY_RESTART_GRACE_S,
+) -> None:
+    """Persist a fatal-path alert before exit, with a bounded escape hatch.
+
+    SQLite or Telegram may themselves be wedged. The fallback thread therefore
+    requests the process restart after a short grace period, while the normal
+    path runs diagnostics first so the durable notification outbox is populated
+    before systemd recreates the process.
+    """
+
+    requested = threading.Event()
+    diagnostics_done = threading.Event()
+    request_lock = threading.Lock()
+
+    def request_once() -> None:
+        with request_lock:
+            if requested.is_set():
+                return
+            requested.set()
+        try:
+            restart_fn()
+        except Exception:
+            # The process watchdog/systemd is the final recovery boundary. A
+            # test or injected restart callback may return or raise, but that
+            # must never strand the diagnostics worker.
+            return
+
+    def emergency_restart() -> None:
+        if not diagnostics_done.wait(max(0.0, float(grace_s))):
+            request_once()
+
+    fallback = threading.Thread(
+        target=emergency_restart,
+        daemon=True,
+        name="aftertake-observability-restart",
+    )
+    fallback.start()
+    try:
+        diagnostics()
+    finally:
+        diagnostics_done.set()
+        request_once()
 
 
 class RuntimeWatchdog:
@@ -106,16 +155,25 @@ class RuntimeWatchdog:
         interval_s: float = RUNTIME_WATCHDOG_INTERVAL_S,
         monotonic: Callable[[], float] = time.monotonic,
         exit_fn: Callable[[int], None] = os._exit,
+        fatal_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ):
         self.stale_after_s = max(0.01, float(stale_after_s))
         self.interval_s = max(0.1, float(interval_s))
         self._monotonic = monotonic
         self._exit_fn = exit_fn
+        self._fatal_callback = fatal_callback
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._last_progress = self._monotonic()
         self._stage = "boot"
         self._thread: Optional[threading.Thread] = None
+
+    def set_fatal_callback(
+        self, callback: Optional[Callable[[str, Dict[str, Any]], None]]
+    ) -> None:
+        """Attach durable diagnostics after startup dependencies are ready."""
+
+        self._fatal_callback = callback
 
     def start(self) -> None:
         if self._thread is not None:
@@ -151,7 +209,37 @@ class RuntimeWatchdog:
             elif stage == "active_round":
                 limit = max(limit, RUNTIME_ACTIVE_STAGE_TIMEOUT_S)
             if age >= limit:
-                self._exit_fn(1)
+                payload = {
+                    "stage": stage,
+                    "age_s": age,
+                    "limit_s": limit,
+                    "action": "process_restart_requested",
+                }
+
+                def persist_stall_diagnostics(
+                    stall_items: tuple = tuple(payload.items()),
+                ) -> None:
+                    stall_payload = dict(stall_items)
+                    print(
+                        json.dumps(
+                            {
+                                "kind": "runtime_watchdog_stall",
+                                "reason": "runtime made no progress before watchdog deadline",
+                                **stall_payload,
+                            },
+                            sort_keys=True,
+                        ),
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    callback = self._fatal_callback
+                    if callback is not None:
+                        callback("runtime watchdog stall", dict(stall_payload))
+
+                _run_diagnostics_then_restart(
+                    lambda: self._exit_fn(1),
+                    persist_stall_diagnostics,
+                )
                 return
 
     def stop(self) -> None:
@@ -1199,6 +1287,113 @@ def _update_asset_error_state(
         )
 
 
+def _restart_after_executor_timeout(
+    *,
+    settings: Settings,
+    store: StateStore,
+    notifier: Optional[Notifier],
+    executor: OrderExecutor,
+    restart_fn: Optional[Callable[[], None]],
+    component: str = "clob_executor",
+    slug: str = "",
+) -> bool:
+    """Persist a fatal SDK-timeout alert, then recreate the process once."""
+
+    if not bool(getattr(executor, "process_restart_required", False)):
+        return False
+    reason = str(
+        getattr(executor, "process_restart_reason", "")
+        or "CLOB SDK call exceeded its bounded deadline"
+    )
+
+    def persist_timeout_diagnostics() -> None:
+        payload = {
+            "reason": "CLOB SDK worker exceeded bounded timeout",
+            "component": component,
+            "error_type": "TimeoutError",
+            "error_message": reason,
+            "action": "process_restart_requested",
+        }
+        _audit(settings, store, "clob_worker_timeout", payload, slug)
+        if notifier is not None:
+            _transition_component_and_notify(
+                store=store,
+                component=component,
+                status="unhealthy",
+                detail=reason,
+                notifier=notifier,
+                settings=settings,
+                kind="alert",
+                payload=payload,
+                slug=slug,
+                notify_on_no_transition=True,
+            )
+
+    if restart_fn is not None:
+        _run_diagnostics_then_restart(restart_fn, persist_timeout_diagnostics)
+    else:
+        persist_timeout_diagnostics()
+    return True
+
+
+def _restart_after_heartbeat_fatal(
+    *,
+    settings: Settings,
+    store: StateStore,
+    notifier: Optional[Notifier],
+    reason: str,
+    payload: Dict[str, Any],
+    restart_fn: Optional[Callable[[], None]],
+) -> None:
+    """Persist the heartbeat ALERT before the process-level recovery boundary."""
+
+    alert_payload = {
+        **payload,
+        "reason": reason,
+        "component": "clob_heartbeat",
+        "error_type": "HeartbeatFatal",
+        "error_message": str(payload.get("error_message") or reason),
+        "action": "process_restart_requested",
+    }
+
+    def persist_heartbeat_diagnostics() -> None:
+        # Keep journald as an immediate fallback, but persist the same ALERT
+        # before asking systemd to recreate the process. The old path exited
+        # here first, so a full heartbeat status queue could lose the only
+        # Telegram/outbox record of the failure.
+        print(
+            json.dumps(
+                {
+                    "kind": "heartbeat_process_restart",
+                    **alert_payload,
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+        _audit(settings, store, "heartbeat_fatal", alert_payload)
+        _transition_component_and_notify(
+            store=store,
+            component="clob_heartbeat",
+            status="unhealthy",
+            detail=str(alert_payload["error_message"]),
+            notifier=notifier,
+            settings=settings,
+            kind="alert",
+            payload=alert_payload,
+            notify_on_no_transition=True,
+        )
+
+    def hard_exit() -> None:
+        os._exit(1)
+
+    _run_diagnostics_then_restart(
+        restart_fn if restart_fn is not None else hard_exit,
+        persist_heartbeat_diagnostics,
+    )
+
+
 def _entry_qty_for_decision(
     *,
     settings: Settings,
@@ -1262,6 +1457,7 @@ def run_round(
     sleep: Callable[[float], None] = time.sleep,
     notifier: Optional[Notifier] = None,
     stream_factory: Callable[..., MarketBookStream] = MarketBookStream,
+    restart_fn: Optional[Callable[[], None]] = None,
 ) -> List[PostCloseDecision]:
     """Run exactly one newly opened 5-minute Aftertake round.
 
@@ -1623,6 +1819,19 @@ def run_round(
                     available_size=decision.entry_ask_size,
                     simulated_take=result.dry_run,
                 )
+                if settings.is_live and _restart_after_executor_timeout(
+                    settings=settings,
+                    store=store,
+                    notifier=notifier,
+                    executor=executor,
+                    restart_fn=restart_fn,
+                    component="clob_executor:%s" % active_asset,
+                    slug=slug,
+                ):
+                    decisions.append(
+                        PostCloseDecision("hold", "clob_worker_timeout", side=decision.side)
+                    )
+                    break
                 result_raw = result.raw or {}
                 if (
                     (
@@ -1716,6 +1925,7 @@ def _run_asset_rounds(
             stream_factory=stream_factory,
             clock=clock,
             sleep=sleep,
+            restart_fn=restart_fn,
         ): asset
         for asset in assets
     }
@@ -1742,66 +1952,58 @@ def _run_asset_rounds(
             remaining = max(0.0, deadline - time.monotonic())
             done, pending = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
             if not done:
-                if restart_fn is not None:
-                    try:
-                        print(
-                            json.dumps(
-                                {
-                                    "kind": "asset_supervisor_timeout",
-                                    "action": "process_restart_requested",
-                                },
-                                sort_keys=True,
-                            ),
-                            file=sys.stderr,
-                            flush=True,
-                        )
-                    finally:
-                        threading.Thread(
-                            target=restart_fn,
-                            daemon=True,
-                            name="aftertake-supervisor-restart",
-                        ).start()
+                timed_out_pending = tuple(pending)
                 timed_out_names: List[str] = []
-                for future in pending:
-                    asset = futures[future]
-                    timed_out_names.append(asset)
-                    slug, _, _ = current_crypto_5m_slug(asset, round_start)
-                    timeout_error = TimeoutError(
-                        "asset round exceeded supervisor timeout %.1fs" % effective_timeout_s
-                    )
-                    _audit_asset_transport_error(
-                        settings,
-                        store,
-                        asset=asset,
-                        slug=slug,
-                        phase="asset_round_timeout",
-                        exc=timeout_error,
-                        notifier=None,
-                    )
-                    results[asset] = [PostCloseDecision("hold", "asset_round_timeout")]
-                    _update_asset_error_state(
-                        settings=settings,
-                        store=store,
-                        notifier=notifier,
-                        asset=asset,
-                        decisions=results[asset],
-                        error_state=error_state,
-                    )
-                if notifier is not None:
-                    _safe_notify(
-                        notifier,
-                        settings,
-                        store,
-                        "alert",
-                        {
-                            "reason": "asset round supervisor timeout",
-                            "component": "asset_supervisor",
-                            "asset": ",".join(sorted(timed_out_names)),
-                            "phase": "asset_round_timeout",
-                            "error_type": "TimeoutError",
-                            "error_message": "uncancellable workers require process restart",
-                        },
-                    )
+
+                def persist_timeout_diagnostics(
+                    pending_futures: tuple = timed_out_pending,
+                    timed_out_assets: List[str] = timed_out_names,
+                ) -> None:
+                    for future in pending_futures:
+                        asset = futures[future]
+                        timed_out_assets.append(asset)
+                        slug, _, _ = current_crypto_5m_slug(asset, round_start)
+                        timeout_error = TimeoutError(
+                            "asset round exceeded supervisor timeout %.1fs" % effective_timeout_s
+                        )
+                        _audit_asset_transport_error(
+                            settings,
+                            store,
+                            asset=asset,
+                            slug=slug,
+                            phase="asset_round_timeout",
+                            exc=timeout_error,
+                            notifier=None,
+                        )
+                        results[asset] = [PostCloseDecision("hold", "asset_round_timeout")]
+                        _update_asset_error_state(
+                            settings=settings,
+                            store=store,
+                            notifier=notifier,
+                            asset=asset,
+                            decisions=results[asset],
+                            error_state=error_state,
+                        )
+                    if notifier is not None:
+                        _safe_notify(
+                            notifier,
+                            settings,
+                            store,
+                            "alert",
+                            {
+                                "reason": "asset round supervisor timeout",
+                                "component": "asset_supervisor",
+                                "asset": ",".join(sorted(timed_out_assets)),
+                                "phase": "asset_round_timeout",
+                                "error_type": "TimeoutError",
+                                "error_message": "uncancellable workers require process restart",
+                            },
+                        )
+
+                if restart_fn is not None:
+                    _run_diagnostics_then_restart(restart_fn, persist_timeout_diagnostics)
+                else:
+                    persist_timeout_diagnostics()
                 break
             for future in done:
                 asset = futures[future]
@@ -1943,6 +2145,11 @@ def _reconcile_startup(
                 slug=record.slug,
                 notify_on_no_transition=True,
             )
+            if bool(getattr(executor, "process_restart_required", False)):
+                # The bounded probe's daemon thread is still uncancellable;
+                # do not start another probe while the outer maintenance
+                # worker is preparing the durable ALERT and process restart.
+                break
             continue
         try:
             reconcile_once = getattr(executor, "reconcile_existing_once", None)
@@ -1985,6 +2192,11 @@ def _reconcile_startup(
                 slug=record.slug,
                 notify_on_no_transition=True,
             )
+            if bool(getattr(executor, "process_restart_required", False)):
+                # The bounded probe's daemon thread is still uncancellable;
+                # do not start another probe while the outer maintenance
+                # worker is preparing the durable ALERT and process restart.
+                break
             continue
         result_raw = result.raw or {}
         reconciliation_transport_error = bool(
@@ -2031,6 +2243,11 @@ def _reconcile_startup(
                 },
                 slug=record.slug,
             )
+        if executor.process_restart_required:
+            # Do not start another bounded SDK probe while the previous one is
+            # still alive. The outer runtime loop persists the process-level
+            # alert and lets systemd recreate the client/pool.
+            break
         if result.terminal:
             _notify_order_result(notifier, settings, store, result, record.slug)
             continue
@@ -2100,6 +2317,11 @@ def reconcile_submitted_orders(
                 slug=record.slug,
                 notify_on_no_transition=True,
             )
+            if bool(getattr(executor, "process_restart_required", False)):
+                # The bounded probe's daemon thread is still uncancellable;
+                # do not start another probe while the outer maintenance
+                # worker is preparing the durable ALERT and process restart.
+                break
             continue
         result_raw = result.raw or {}
         reconciliation_transport_error = bool(
@@ -2149,6 +2371,10 @@ def reconcile_submitted_orders(
         results.append(result)
         if result.terminal:
             _notify_order_result(notifier, settings, store, result, record.slug)
+        if bool(getattr(executor, "process_restart_required", False)):
+            # Stop before the next unresolved order so a single wedged SDK
+            # call cannot accumulate one live daemon thread per record.
+            break
     return results
 
 
@@ -2200,27 +2426,14 @@ def _live_runtime(
             )
 
     def heartbeat_fatal(reason: str, payload: Dict[str, Any]) -> None:
-        # This path must not touch SQLite, disk, or Telegram. The status event
-        # was already queued independently; journald gets a synchronous final
-        # line and systemd receives a deterministic non-zero process exit.
-        try:
-            print(
-                json.dumps(
-                    {
-                        "kind": "heartbeat_process_restart",
-                        "reason": reason,
-                        **payload,
-                    },
-                    sort_keys=True,
-                ),
-                file=sys.stderr,
-                flush=True,
-            )
-        finally:
-            if restart_fn is not None:
-                restart_fn()
-            else:
-                os._exit(1)
+        _restart_after_heartbeat_fatal(
+            settings=settings,
+            store=store,
+            notifier=notifier,
+            reason=reason,
+            payload=payload,
+            restart_fn=restart_fn,
+        )
 
     heartbeat = HeartbeatLoop(
         gateway,
@@ -2305,10 +2518,8 @@ class _MaintenanceWorker:
     def _timeout(self) -> None:
         if self._done.is_set():
             return
-        # Restart on an independent path *before* touching SQLite, disk or
-        # Telegram. If the hung worker owns one of those resources, diagnostics
-        # must not prevent systemd from recreating the process.
-        try:
+
+        def persist_timeout_diagnostics() -> None:
             print(
                 json.dumps(
                     {
@@ -2321,34 +2532,33 @@ class _MaintenanceWorker:
                 file=sys.stderr,
                 flush=True,
             )
-        finally:
-            threading.Thread(
-                target=self._restart_fn,
-                daemon=True,
-                name="aftertake-maintenance-restart",
-            ).start()
-        _audit(
-            self._settings,
-            self._store,
-            "maintenance_timeout",
-            {"timeout_s": self._timeout_s},
-        )
-        _transition_component_and_notify(
-            store=self._store,
-            component="maintenance_worker",
-            status="unhealthy",
-            detail="maintenance exceeded %.1fs" % self._timeout_s,
-            notifier=self._notifier,
-            settings=self._settings,
-            kind="alert",
-            payload={
-                "reason": "maintenance worker timeout",
-                "component": "maintenance_worker",
-                "error_type": "TimeoutError",
-                "error_message": "uncancellable maintenance requires process restart",
-            },
-            notify_on_no_transition=True,
-        )
+            _audit(
+                self._settings,
+                self._store,
+                "maintenance_timeout",
+                {"timeout_s": self._timeout_s},
+            )
+            _transition_component_and_notify(
+                store=self._store,
+                component="maintenance_worker",
+                status="unhealthy",
+                detail="maintenance exceeded %.1fs" % self._timeout_s,
+                notifier=self._notifier,
+                settings=self._settings,
+                kind="alert",
+                payload={
+                    "reason": "maintenance worker timeout",
+                    "component": "maintenance_worker",
+                    "error_type": "TimeoutError",
+                    "error_message": "uncancellable maintenance requires process restart",
+                },
+                notify_on_no_transition=True,
+            )
+
+        # Persist the alert before the normal restart. If SQLite/Telegram is
+        # itself wedged, the bounded fallback still gives systemd a recovery
+        # boundary instead of leaving a detached worker alive forever.
+        _run_diagnostics_then_restart(self._restart_fn, persist_timeout_diagnostics)
 
     def _run_guarded(self, executor: OrderExecutor) -> None:
         try:
@@ -2411,7 +2621,25 @@ class _MaintenanceWorker:
                     executor=maintenance_executor,
                     notifier=self._notifier,
                 )
+                if _restart_after_executor_timeout(
+                    settings=self._settings,
+                    store=self._store,
+                    notifier=self._notifier,
+                    executor=maintenance_executor,
+                    restart_fn=self._restart_fn,
+                    component="submitted_reconciliation",
+                ):
+                    return
             except Exception as exc:
+                if _restart_after_executor_timeout(
+                    settings=self._settings,
+                    store=self._store,
+                    notifier=self._notifier,
+                    executor=maintenance_executor,
+                    restart_fn=self._restart_fn,
+                    component="submitted_reconciliation",
+                ):
+                    return
                 _audit(self._settings, self._store, "submitted_reconcile_error", {"error": str(exc)})
                 _safe_notify(
                     self._notifier,
@@ -2493,6 +2721,19 @@ def _run_round_loop(
                 gateway, executor = live_runtime_factory(settings, store, public, notifier)
                 if gateway is None:
                     raise RuntimeError("live runtime did not provide a CLOB gateway")
+                if _restart_after_executor_timeout(
+                    settings=settings,
+                    store=store,
+                    notifier=notifier,
+                    executor=executor,
+                    restart_fn=(
+                        runtime_watchdog.request_restart
+                        if runtime_watchdog is not None
+                        else None
+                    ),
+                    component="clob_executor_startup",
+                ):
+                    return
             except Exception as exc:
                 reason = "PM runtime unavailable; retrying: %s: %s" % (type(exc).__name__, str(exc))
                 _audit(settings, store, "runtime_connect_retry", {"reason": reason})
@@ -2919,6 +3160,29 @@ def main(argv: Optional[List[str]] = None) -> int:
         http=PublicHttpClient(resolve_overrides=parse_resolve_overrides(settings.resolve_overrides)),
     )
     notifier = Notifier(token=settings.telegram_token, chat_id=settings.telegram_chat_id)
+
+    def persist_runtime_watchdog_alert(reason: str, payload: Dict[str, Any]) -> None:
+        alert_payload = {
+            **payload,
+            "reason": reason,
+            "component": "runtime_watchdog",
+            "error_type": "RuntimeStall",
+            "error_message": "runtime watchdog detected no progress",
+        }
+        _audit(settings, store, "runtime_watchdog_stall", alert_payload)
+        _transition_component_and_notify(
+            store=store,
+            component="runtime_watchdog",
+            status="unhealthy",
+            detail=reason,
+            notifier=notifier,
+            settings=settings,
+            kind="alert",
+            payload=alert_payload,
+            notify_on_no_transition=True,
+        )
+
+    startup_watchdog.set_fatal_callback(persist_runtime_watchdog_alert)
     executor: Optional[OrderExecutor] = None
     try:
         if args.status:
