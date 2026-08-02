@@ -1069,9 +1069,10 @@ class _RoundAccountPreflight:
         with self._lock:
             preflight = self.snapshot()
             collateral = preflight.collateral
-            total_budget = (
-                min(float(collateral.balance), float(collateral.allowance))
-                * float(self._settings.live_max_account_risk_fraction)
+            total_budget = min(
+                float(collateral.balance)
+                * float(self._settings.live_max_account_risk_fraction),
+                float(collateral.allowance),
             )
             remaining = max(
                 0.0,
@@ -2054,6 +2055,51 @@ def _run_asset_rounds(
     return results
 
 
+def _round_lifecycle_payload(
+    *,
+    round_start: int,
+    assets: tuple[str, ...],
+    round_results: Optional[Dict[str, List[PostCloseDecision]]] = None,
+) -> Dict[str, Any]:
+    """Build one compact, durable proof that the scheduler ran a round."""
+
+    payload: Dict[str, Any] = {
+        "round_start": int(round_start),
+        "assets": list(assets),
+    }
+    if round_results is None:
+        return payload
+
+    asset_results: Dict[str, Dict[str, Any]] = {}
+    qualified_assets: List[str] = []
+    missing_assets: List[str] = []
+    for asset in assets:
+        decisions = list(round_results.get(asset, []))
+        qualified_candidate = any(decision.action == "enter" for decision in decisions)
+        if qualified_candidate:
+            qualified_assets.append(asset)
+        if not decisions:
+            missing_assets.append(asset)
+        final = decisions[-1] if decisions else None
+        asset_results[asset] = {
+            "decision_count": len(decisions),
+            # A classifier candidate may still be blocked before reservation
+            # or POST. Actual submission remains authoritative in `orders` and
+            # the ORDER_SUBMITTED lifecycle event.
+            "qualified_candidate": qualified_candidate,
+            "final_action": final.action if final is not None else "missing",
+            "final_reason": final.reason if final is not None else "missing_result",
+        }
+    payload.update(
+        {
+            "asset_results": asset_results,
+            "qualified_assets": qualified_assets,
+            "missing_assets": missing_assets,
+        }
+    )
+    return payload
+
+
 def _wait_for_next_boundary(
     clock: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep
 ) -> int:
@@ -2809,6 +2855,15 @@ def _run_round_loop(
                 clock=time.time,
             )
         processed_round_starts.add(start)
+        _audit(
+            settings,
+            store,
+            "round_started",
+            _round_lifecycle_payload(
+                round_start=start,
+                assets=tuple(settings.assets),
+            ),
+        )
         if runtime_watchdog is not None:
             runtime_watchdog.beat("active_round")
         try:
@@ -2822,6 +2877,16 @@ def _run_round_loop(
                 notifier=notifier,
                 error_state=active_error_components,
                 restart_fn=(runtime_watchdog.request_restart if runtime_watchdog is not None else None),
+            )
+            _audit(
+                settings,
+                store,
+                "round_complete",
+                _round_lifecycle_payload(
+                    round_start=start,
+                    assets=tuple(settings.assets),
+                    round_results=round_results,
+                ),
             )
             timed_out_assets = [
                 asset

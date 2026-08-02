@@ -70,9 +70,11 @@ CLOB reconciliation or official settlement resolves it. The bot never
 automatically retries the same market.
 
 Telegram reports `DEPLOYMENT_CHECK_OK`, `BOOT`, `ORDER_SUBMITTED`, actual
-`ENTRY_CONFIRMED` or `ORDER_RESULT`, `ENTRY_BLOCKED`, `ALERT`, round-level
-`NO_ENTRY`, and official Polymarket `SETTLE`. It does **not** send a separate
-signal notification.
+`ENTRY_CONFIRMED` or `ORDER_RESULT`, `ENTRY_BLOCKED`, `ALERT`, and official
+Polymarket `SETTLE`. It does **not** send a separate signal or round-level
+no-entry notification. Every scheduled round instead persists `round_started`
+and `round_complete` SQLite audit rows, including each asset's final action and
+reason, without adding Telegram noise.
 
 For EC2, Aftertake deliberately keeps the existing cor_pol deployment identity:
 use [deploy/ec2/deploy_cor_pol.sh](deploy/ec2/deploy_cor_pol.sh) and

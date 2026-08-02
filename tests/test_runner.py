@@ -772,11 +772,15 @@ def test_shared_account_snapshot_claims_cost_atomically_across_all_assets(tmp_pa
             sleep=lambda _seconds: None,
         )
 
-        account_budget = min(100.0, 80.0) * 0.50
+        account_budget = min(100.0 * 0.50, 80.0)
         assert sorted(results) == sorted(assets)
         assert gateway.preflight_calls == 1
         assert gateway.submitted_cost > 0.0
         assert gateway.submitted_cost + 10.0 <= account_budget
+        # The allowance is a hard spend ceiling, not another balance value to
+        # which the risk fraction is applied. The old formula capped this test
+        # at $40 and silently rejected otherwise valid account capacity.
+        assert gateway.submitted_cost + 10.0 > min(100.0, 80.0) * 0.50
         assert store.total_risk_exposure() <= account_budget
     finally:
         store.close()
@@ -825,22 +829,33 @@ def test_live_asset_transport_failure_isolated_and_schedules_runtime_rebuild(tmp
         gateway = FlakyGateway()
         runtime_calls = []
         asset_results = {}
+        asset_clocks = {
+            asset: PreflightThenExpiredClock() for asset in settings.assets
+        }
+        original_run_round = runner_module.run_round
 
         def live_runtime(*_args):
             runtime_calls.append("runtime")
             return gateway, OrderExecutor(settings, store, gateway=gateway)
+
+        def run_with_asset_clock(*, asset, clock, **kwargs):
+            return original_run_round(
+                asset=asset,
+                clock=asset_clocks[asset],
+                **kwargs,
+            )
 
         def run_with_test_clock(**kwargs):
             asset_results.update(
                 _run_asset_rounds(
                     **kwargs,
                     stream_factory=DeepSupportPairedStream,
-                    clock=PreflightThenExpiredClock(),
                     sleep=lambda _seconds: None,
                 )
             )
             return asset_results
 
+        monkeypatch.setattr(runner_module, "run_round", run_with_asset_clock)
         monkeypatch.setattr(runner_module, "_run_asset_rounds", run_with_test_clock)
         _run_round_loop(
             settings=settings,
@@ -1706,7 +1721,13 @@ def test_dry_run_runner_emits_runtime_ready_before_scheduler(tmp_path, monkeypat
             state_db=tmp_path / "state.sqlite3",
         )
         notifier = CaptureNotifier()
-        monkeypatch.setattr(runner_module, "_run_asset_rounds", lambda **_kwargs: {})
+        monkeypatch.setattr(
+            runner_module,
+            "_run_asset_rounds",
+            lambda **_kwargs: {
+                "BTC": [runner_module.PostCloseDecision("hold", "no_candidate")]
+            },
+        )
 
         _run_round_loop(
             settings=settings,
@@ -1726,6 +1747,31 @@ def test_dry_run_runner_emits_runtime_ready_before_scheduler(tmp_path, monkeypat
             "SELECT payload_json FROM audit_events WHERE kind = 'runtime_ready'"
         ).fetchone()
         assert json.loads(payload["payload_json"])["dry_run"] is True
+        lifecycle_rows = store._conn.execute(
+            """SELECT kind, payload_json FROM audit_events
+               WHERE kind IN ('round_started', 'round_complete') ORDER BY id"""
+        ).fetchall()
+        assert [row["kind"] for row in lifecycle_rows] == [
+            "round_started",
+            "round_complete",
+        ]
+        started = json.loads(lifecycle_rows[0]["payload_json"])
+        completed = json.loads(lifecycle_rows[1]["payload_json"])
+        assert started == {"assets": ["BTC"], "round_start": 900}
+        assert completed == {
+            "asset_results": {
+                "BTC": {
+                    "decision_count": 1,
+                    "final_action": "hold",
+                    "final_reason": "no_candidate",
+                    "qualified_candidate": False,
+                }
+            },
+            "assets": ["BTC"],
+            "missing_assets": [],
+            "qualified_assets": [],
+            "round_start": 900,
+        }
     finally:
         store.close()
 
