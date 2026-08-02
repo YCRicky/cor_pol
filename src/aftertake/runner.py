@@ -50,6 +50,7 @@ from .risk import RiskRejected, check_entry_risk
 from .rounds import CRYPTO_5M_WINDOW_S
 from .settlement import builder_fee_total, fee_total, settle_trade
 from .state import RuntimeLock, StateStore
+from .v9 import V9DualLaneClassifier, active_v9_config
 
 _TELEGRAM_NOTIFIER_TYPE = Notifier
 
@@ -985,6 +986,23 @@ def _metadata_token_matches(market: GammaMarket, metadata: MarketMetadata, side:
     return token_id
 
 
+def _settlement_semantics_label(market: GammaMarket) -> str:
+    """Return only a structural Gamma label; never infer the future outcome."""
+
+    outcomes = {str(outcome).strip().lower() for outcome in market.outcomes}
+    if outcomes == {"up", "down"} and len(market.outcomes) == 2:
+        return "binary_up_down"
+    if outcomes == {"yes", "no"} and len(market.outcomes) == 2:
+        return "binary_yes_no"
+    return "unverified"
+
+
+def _classifier_config_for_settings(settings: Settings) -> Any:
+    if settings.strategy_family == "v9":
+        return active_v9_config()
+    return active_classifier_config()
+
+
 def _build_dry_metadata(market: GammaMarket) -> MarketMetadata:
     return MarketMetadata(
         condition_id=market.condition_id,
@@ -1472,6 +1490,8 @@ def run_round(
     slug, expected_start, round_end = current_crypto_5m_slug(active_asset, round_start)
     if expected_start != int(round_start):
         raise ValueError("run_round requires a 5-minute boundary")
+    if settings.strategy_family == "v9" and settings.is_live and not settings.v9_live_enabled:
+        raise LivePreflightError("V9 live trading requires AFTERTAKE_V9_LIVE_ENABLED=true")
     market = public.market_by_slug(slug)
     if not market.condition_id:
         raise LivePreflightError("Gamma market has no condition ID")
@@ -1479,8 +1499,15 @@ def run_round(
     yes_token = market.token_for_side("YES")
     no_token = market.token_for_side("NO")
     metadata = _build_dry_metadata(market)
-    classifier_cfg = active_classifier_config()
-    classifier = PostCloseWinnerClassifier(classifier_cfg)
+    classifier_cfg = _classifier_config_for_settings(settings)
+    if settings.strategy_family == "v9":
+        classifier = V9DualLaneClassifier(
+            classifier_cfg,
+            settlement_label=_settlement_semantics_label(market),
+            code_sha=_resolve_code_sha(),
+        )
+    else:
+        classifier = PostCloseWinnerClassifier(classifier_cfg)
     notifier = notifier or Notifier(token=settings.telegram_token, chat_id=settings.telegram_chat_id)
     stream = stream_factory(
         yes_token_id=yes_token,
@@ -3170,9 +3197,23 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _status_payload(settings: Settings, store: StateStore) -> Dict[str, Any]:
-    classifier_cfg = active_classifier_config()
+    classifier_cfg = _classifier_config_for_settings(settings)
+    if settings.strategy_family == "v9":
+        confirmation_policy = "v9_lane_specific_fresh_paired"
+        confirmations: Any = {"R": 1, "S": classifier_cfg.sweep_confirmations}
+        stable_leader: Any = "S_only"
+    else:
+        confirmation_policy = (
+            "distinct_evidence_states"
+            if classifier_cfg.distinct_evidence_confirmations
+            else "fresh_paired_observations"
+        )
+        confirmations = classifier_cfg.confirmations
+        stable_leader = classifier_cfg.require_stable_post_close_leader
     return {
         "strategy": classifier_cfg.strategy_version,
+        "strategy_family": settings.strategy_family,
+        "v9_live_enabled": settings.v9_live_enabled,
         "dry_run": settings.dry_run,
         "qty": settings.qty,
         "assets": list(settings.assets),
@@ -3184,17 +3225,16 @@ def _status_payload(settings: Settings, store: StateStore) -> Dict[str, Any]:
             int(classifier_cfg.post_close_start_s * 1000),
             int(classifier_cfg.post_close_end_s * 1000),
         ],
-        "confirmations": classifier_cfg.confirmations,
+        "confirmations": confirmations,
         "confirmation_spacing_ms": int(
             classifier_cfg.confirmation_spacing_s * 1000
         ),
-        "confirmation_policy": (
-            "distinct_evidence_states"
-            if classifier_cfg.distinct_evidence_confirmations
-            else "fresh_paired_observations"
-        ),
+        "confirmation_policy": confirmation_policy,
+        "lane_confirmations": {"R": 1, "S": classifier_cfg.sweep_confirmations}
+        if settings.strategy_family == "v9"
+        else None,
         "require_loser_refill_failure": classifier_cfg.require_loser_refill_failure,
-        "require_stable_post_close_leader": classifier_cfg.require_stable_post_close_leader,
+        "require_stable_post_close_leader": stable_leader,
         "max_daily_loss": settings.max_daily_loss,
         "max_open_positions": settings.max_open_positions,
         "max_consecutive_losses": settings.max_consecutive_losses,

@@ -7,6 +7,8 @@ def _clear_env(monkeypatch):
     monkeypatch.setattr("aftertake.config.load_dotenv", lambda *args, **kwargs: None)
     for name in (
         "AFTERTAKE_DRY_RUN",
+        "AFTERTAKE_STRATEGY",
+        "AFTERTAKE_V9_LIVE_ENABLED",
         "AFTERTAKE_ASSET",
         "AFTERTAKE_QTY",
         "AFTERTAKE_OUT_DIR",
@@ -38,6 +40,8 @@ def test_defaults_are_aftertake_only(monkeypatch):
     settings = Settings.from_env()
 
     assert settings.dry_run is True
+    assert settings.strategy_family == "v8"
+    assert settings.v9_live_enabled is False
     assert settings.asset == "BTC"
     assert settings.qty == 5
     assert settings.live_max_account_risk_fraction == 0.5
@@ -78,6 +82,14 @@ def test_live_requires_canonical_clob_identity(monkeypatch):
     _clear_env(monkeypatch)
     monkeypatch.setenv("AFTERTAKE_DRY_RUN", "false")
     with pytest.raises(ValueError, match="POLYMARKET_PRIVATE_KEY"):
+        Settings.from_env()
+
+
+def test_v9_live_requires_explicit_feature_flag(monkeypatch):
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("AFTERTAKE_DRY_RUN", "false")
+    monkeypatch.setenv("AFTERTAKE_STRATEGY", "v9")
+    with pytest.raises(ValueError, match="V9 live trading requires"):
         Settings.from_env()
 
 

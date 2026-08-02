@@ -86,6 +86,8 @@ def _signature_type_from_env() -> Optional[int]:
 class Settings:
     # Aftertake strategy controls.
     dry_run: bool = True
+    strategy_family: str = "v8"
+    v9_live_enabled: bool = False
     asset: str = "BTC"
     assets: Tuple[str, ...] = DEFAULT_ASSETS
     qty: float = 5.0
@@ -159,6 +161,12 @@ class Settings:
             raise ValueError("AFTERTAKE_LIVE_QTY_FLOOR_STEP must be > 0")
         if self.dry_run_simulated_balance <= 0:
             raise ValueError("AFTERTAKE_DRY_RUN_SIM_BALANCE must be > 0")
+        strategy_family = str(self.strategy_family or "").strip().lower()
+        if strategy_family not in {"v8", "v9"}:
+            raise ValueError("AFTERTAKE_STRATEGY must be v8 or v9")
+        object.__setattr__(self, "strategy_family", strategy_family)
+        if strategy_family == "v9" and self.is_live and not self.v9_live_enabled:
+            raise ValueError("V9 live trading requires AFTERTAKE_V9_LIVE_ENABLED=true")
         parse_resolve_overrides(self.resolve_overrides)
         order_type = self.order_type.upper().strip()
         if order_type not in {"FAK", "FOK", "GTC", "GTD"}:
@@ -209,6 +217,8 @@ class Settings:
             assets = DEFAULT_ASSETS
         settings = cls(
             dry_run=_bool("AFTERTAKE_DRY_RUN", True),
+            strategy_family=os.getenv("AFTERTAKE_STRATEGY", "v8").strip().lower(),
+            v9_live_enabled=_bool("AFTERTAKE_V9_LIVE_ENABLED", False),
             asset=assets[0] if assets else "BTC",
             assets=assets,
             qty=_float("AFTERTAKE_QTY", 5.0),

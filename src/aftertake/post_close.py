@@ -31,6 +31,9 @@ class SideBook:
     best_ask: Optional[float]
     ask_size: float
     near_touch_bid_depth: float = 0.0
+    # V9 uses the executable ask ladder to model a marketable .99 ceiling.
+    # Existing V7/V8 callers remain top-of-book compatible when this is empty.
+    ask_levels: Tuple[Tuple[float, float], ...] = ()
 
     def __post_init__(self) -> None:
         # Backward-compatible test fixtures created before V6.4-strict did not

@@ -98,7 +98,16 @@ class _TokenBook:
                 size for price, size in self.bids.items() if price >= best_bid - near_touch_band
             )
         ask_size = self.asks.get(best_ask, 0.0) if best_ask is not None else 0.0
-        return SideBook(best_bid, bid_size, bid_depth, best_ask, ask_size, near_touch_bid_depth)
+        ask_levels = tuple(sorted((float(price), float(size)) for price, size in self.asks.items()))
+        return SideBook(
+            best_bid,
+            bid_size,
+            bid_depth,
+            best_ask,
+            ask_size,
+            near_touch_bid_depth,
+            ask_levels,
+        )
 
 
 class MarketBookStream:
