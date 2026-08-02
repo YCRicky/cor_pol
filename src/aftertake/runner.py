@@ -1485,6 +1485,7 @@ def run_round(
         yes_token_id=yes_token,
         no_token_id=no_token,
         on_book=classifier.record,
+        on_reset=classifier.reset,
         clock=clock,
         near_touch_band=classifier_cfg.near_touch_band,
         resolve_overrides=parse_resolve_overrides(settings.resolve_overrides),
@@ -1504,22 +1505,28 @@ def run_round(
             now = float(clock())
             current_generation = int(getattr(stream, "generation", stream_generation))
             if current_generation != stream_generation:
-                # A reconnect clears the stream's paired books. Do not let the
-                # classifier combine the old generation's pre-close evidence
-                # with a fresh snapshot from the new TCP connection.
-                classifier.reset()
+                reconnect_count = int(getattr(stream, "reconnect_count", 0))
+                # MarketBookStream clears the classifier synchronously at the
+                # generation boundary, before it can publish new books.  This
+                # loop only observes/report the transition.  Clearing here is
+                # racy because a fresh snapshot may already have arrived.
                 stream_generation = current_generation
                 _audit(
                     settings,
                     store,
-                    "market_stream_reconnected",
+                    (
+                        "market_stream_reconnected"
+                        if reconnect_count > 0
+                        else "market_stream_initialized"
+                    ),
                     {
                         "generation": stream_generation,
+                        "reconnect_count": reconnect_count,
                         "last_error": str(getattr(stream, "last_error", "") or ""),
                     },
                     slug,
                 )
-                if int(getattr(stream, "reconnect_count", 0)) > 0:
+                if reconnect_count > 0:
                     stream_health_confirmed = False
                     stream_error = str(
                         getattr(stream, "last_error", "") or "market stream disconnected"
@@ -1536,7 +1543,7 @@ def run_round(
                             "reason": "market stream reconnecting",
                             "component": stream_component,
                             "generation": stream_generation,
-                            "reconnect_count": int(getattr(stream, "reconnect_count", 0)),
+                            "reconnect_count": reconnect_count,
                             "error_message": stream_error,
                         },
                         slug=slug,

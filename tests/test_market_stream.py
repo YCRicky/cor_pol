@@ -61,6 +61,28 @@ def test_market_stream_builds_a_paired_book_from_official_book_and_price_change_
     assert snapshots[-1].no_updated_at == 1_000.25
 
 
+def test_generation_reset_reaches_consumer_before_new_books_are_published():
+    events = []
+    stream = MarketBookStream(
+        yes_token_id="yes-token",
+        no_token_id="no-token",
+        on_book=lambda _snapshot: events.append("book"),
+        on_reset=lambda: events.append("reset"),
+    )
+
+    stream._reset_books()
+    stream.process_message(
+        _book("yes-token", [{"price": "0.48", "size": "20"}], [{"price": "0.50", "size": "30"}]),
+        received_at=1_000.10,
+    )
+    stream.process_message(
+        _book("no-token", [{"price": "0.50", "size": "25"}], [{"price": "0.52", "size": "20"}]),
+        received_at=1_000.11,
+    )
+
+    assert events == ["reset", "book"]
+
+
 def test_market_stream_removes_zero_sized_level_and_accepts_legacy_message_shape():
     snapshots = []
     stream = MarketBookStream(

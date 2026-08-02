@@ -254,6 +254,140 @@ def test_run_round_does_not_arm_market_data_watchdog_for_quiet_book(tmp_path):
         store.close()
 
 
+def test_initial_stream_generation_transition_does_not_discard_qualifying_books(tmp_path):
+    """The socket thread may publish its first books before runner observes generation 1."""
+
+    streams = []
+
+    class StartupRaceStream(PairedStream):
+        def __init__(self, **kwargs):
+            self._on_reset = kwargs.get("on_reset")
+            super().__init__(**kwargs)
+            self.generation = 0
+
+        def start(self):
+            # Model start() returning before the socket thread resets the book
+            # generation and receives its initial paired snapshot.
+            return None
+
+        def publish_initial_generation(self):
+            self._on_reset()
+            super().start()
+            self.generation = 1
+
+    def stream_factory(**kwargs):
+        stream = StartupRaceStream(**kwargs)
+        streams.append(stream)
+        return stream
+
+    class StartupRaceClock:
+        def __init__(self):
+            self.now = 1049.0
+            self.published = False
+
+        def __call__(self):
+            return self.now
+
+        def sleep(self, seconds):
+            if not self.published:
+                streams[0].publish_initial_generation()
+                self.published = True
+                self.now = 1200.22
+                return
+            self.now += seconds
+
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        clock = StartupRaceClock()
+        settings = Settings(
+            dry_run=True,
+            out_dir=tmp_path / "out",
+            state_db=tmp_path / "state.sqlite3",
+        )
+        decisions = run_round(
+            settings=settings,
+            store=store,
+            public=FakePublic(),
+            executor=OrderExecutor(settings, store),
+            live_gateway=None,
+            round_start=900,
+            clock=clock,
+            sleep=clock.sleep,
+            stream_factory=stream_factory,
+        )
+
+        assert any(item.action == "enter" and item.side == "NO" for item in decisions)
+    finally:
+        store.close()
+
+
+def test_reconnect_generation_transition_does_not_discard_fresh_books(tmp_path):
+    """Fresh books can arrive before runner observes the reconnect generation."""
+
+    streams = []
+
+    class ReconnectRaceStream(PairedStream):
+        def __init__(self, **kwargs):
+            self._on_reset = kwargs.get("on_reset")
+            super().__init__(**kwargs)
+            self.generation = 1
+            self.reconnect_count = 0
+
+        def start(self):
+            return None
+
+        def publish_reconnected_generation(self):
+            self._on_reset()
+            super().start()
+            self.generation = 2
+            self.reconnect_count = 1
+
+    def stream_factory(**kwargs):
+        stream = ReconnectRaceStream(**kwargs)
+        streams.append(stream)
+        return stream
+
+    class ReconnectRaceClock:
+        def __init__(self):
+            self.now = 1049.0
+            self.published = False
+
+        def __call__(self):
+            return self.now
+
+        def sleep(self, seconds):
+            if not self.published:
+                streams[0].publish_reconnected_generation()
+                self.published = True
+                self.now = 1200.22
+                return
+            self.now += seconds
+
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        clock = ReconnectRaceClock()
+        settings = Settings(
+            dry_run=True,
+            out_dir=tmp_path / "out",
+            state_db=tmp_path / "state.sqlite3",
+        )
+        decisions = run_round(
+            settings=settings,
+            store=store,
+            public=FakePublic(),
+            executor=OrderExecutor(settings, store),
+            live_gateway=None,
+            round_start=900,
+            clock=clock,
+            sleep=clock.sleep,
+            stream_factory=stream_factory,
+        )
+
+        assert any(item.action == "enter" and item.side == "NO" for item in decisions)
+    finally:
+        store.close()
+
+
 def test_runtime_status_reports_active_v8_guards(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     try:

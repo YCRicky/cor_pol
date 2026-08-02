@@ -116,6 +116,7 @@ class MarketBookStream:
         yes_token_id: str,
         no_token_id: str,
         on_book: Callable[[PairedBook], None],
+        on_reset: Optional[Callable[[], None]] = None,
         clock: Callable[[], float] = time.time,
         url: str = MARKET_WS_URL,
         near_touch_band: float = 0.02,
@@ -124,6 +125,7 @@ class MarketBookStream:
         self.yes_token_id = str(yes_token_id)
         self.no_token_id = str(no_token_id)
         self._on_book = on_book
+        self._on_reset = on_reset
         self._clock = clock
         self._url = url
         self._near_touch_band = near_touch_band
@@ -249,6 +251,12 @@ class MarketBookStream:
             self._ready.clear()
             self._last_market_message_mono = 0.0
             self._generation += 1
+        # Clear downstream observations at the exact generation boundary,
+        # before this stream can publish a snapshot from the new socket.  A
+        # polling consumer cannot safely do this later: the new snapshot may
+        # already have arrived by the time it observes the generation change.
+        if self._on_reset is not None:
+            self._on_reset()
 
     def _raise_if_market_data_stale(self, now_mono: float, connection_started: float) -> None:
         with self._lock:
