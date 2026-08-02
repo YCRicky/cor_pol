@@ -68,6 +68,7 @@ def test_active_post_close_profile_is_v8_clob_refill_guard():
     assert cfg.post_close_end_s == 0.250
     assert cfg.confirmations == 2
     assert cfg.confirmation_spacing_s == 0.0
+    assert cfg.distinct_evidence_confirmations is False
     assert cfg.require_loser_refill_failure is True
     assert cfg.require_stable_post_close_leader is True
 
@@ -309,6 +310,47 @@ def test_v7_does_not_count_an_identical_repeated_snapshot_as_confirmation():
     assert decision.action == "hold"
     assert decision.reason == "bid_support_not_yet_persistent"
     assert decision.confirmations == 1
+
+
+def test_v8_counts_fresh_unchanged_winner_book_as_persistent_support():
+    classifier = PostCloseWinnerClassifier(classifier_family_config("v8"))
+    for book in (
+        paired(999.70, 0.47, 0.50, 0.51, 0.54, yes_near=20, no_near=20),
+        paired(999.82, 0.48, 0.51, 0.50, 0.53, yes_near=20, no_near=20),
+        paired(999.95, 0.49, 0.52, 0.50, 0.53, yes_near=20, no_near=20),
+        paired(
+            1_000.060,
+            0.70,
+            0.99,
+            0.20,
+            0.99,
+            yes_size=20,
+            no_size=2,
+            yes_near=20,
+            no_near=2,
+        ),
+        paired(
+            1_000.064,
+            0.70,
+            0.99,
+            0.20,
+            0.99,
+            yes_size=20,
+            no_size=2,
+            yes_near=20,
+            no_near=2,
+        ),
+    ):
+        classifier.record(book)
+
+    decision = classifier.evaluate(round_end_ts=ROUND_END, now_ts=1_000.064, qty=5.0)
+
+    assert decision.action == "enter"
+    assert decision.side == "YES"
+    assert decision.entry_ask == 0.99
+    assert decision.confirmations == 2
+    assert decision.audit["confirmation_timestamps"] == [1_000.060, 1_000.064]
+    assert decision.audit["confirmation_policy"] == "fresh_paired_observations"
 
 
 def test_v7_waits_until_both_token_books_are_fresh_after_frontend_close():

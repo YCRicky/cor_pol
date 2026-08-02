@@ -3188,6 +3188,11 @@ def _status_payload(settings: Settings, store: StateStore) -> Dict[str, Any]:
         "confirmation_spacing_ms": int(
             classifier_cfg.confirmation_spacing_s * 1000
         ),
+        "confirmation_policy": (
+            "distinct_evidence_states"
+            if classifier_cfg.distinct_evidence_confirmations
+            else "fresh_paired_observations"
+        ),
         "require_loser_refill_failure": classifier_cfg.require_loser_refill_failure,
         "require_stable_post_close_leader": classifier_cfg.require_stable_post_close_leader,
         "max_daily_loss": settings.max_daily_loss,

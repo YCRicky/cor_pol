@@ -7,6 +7,7 @@ import pytest
 
 import aftertake.market_stream as market_stream_module
 from aftertake.market_stream import MarketBookStream
+from aftertake.post_close import PostCloseWinnerClassifier, classifier_family_config
 
 
 def _book(token_id, bids, asks, timestamp="1000000"):
@@ -59,6 +60,51 @@ def test_market_stream_builds_a_paired_book_from_official_book_and_price_change_
     assert snapshots[-1].source_timestamp == 1_780_000_250.0
     assert snapshots[-1].yes_updated_at == 1_000.10
     assert snapshots[-1].no_updated_at == 1_000.25
+
+
+def test_identical_fresh_market_events_confirm_stable_v8_winner_support():
+    classifier = PostCloseWinnerClassifier(classifier_family_config("v8"))
+    stream = MarketBookStream(
+        yes_token_id="yes-token",
+        no_token_id="no-token",
+        on_book=classifier.record,
+    )
+
+    stream.process_message(
+        _book("yes-token", [{"price": "0.47", "size": "20"}], [{"price": "0.50", "size": "20"}]),
+        received_at=999.70,
+    )
+    stream.process_message(
+        _book("no-token", [{"price": "0.51", "size": "20"}], [{"price": "0.54", "size": "20"}]),
+        received_at=999.71,
+    )
+    stream.process_message(
+        _book("yes-token", [{"price": "0.48", "size": "20"}], [{"price": "0.51", "size": "20"}]),
+        received_at=999.82,
+    )
+    stream.process_message(
+        _book("no-token", [{"price": "0.50", "size": "20"}], [{"price": "0.53", "size": "20"}]),
+        received_at=999.95,
+    )
+
+    stream.process_message(
+        _book("yes-token", [{"price": "0.70", "size": "20"}], [{"price": "0.99", "size": "20"}]),
+        received_at=1_000.055,
+    )
+    stable_loser = _book(
+        "no-token",
+        [{"price": "0.20", "size": "2"}],
+        [{"price": "0.99", "size": "20"}],
+    )
+    stream.process_message(stable_loser, received_at=1_000.060)
+    stream.process_message(stable_loser, received_at=1_000.064)
+
+    decision = classifier.evaluate(round_end_ts=1_000.0, now_ts=1_000.064, qty=5.0)
+
+    assert decision.action == "enter"
+    assert decision.side == "YES"
+    assert decision.entry_ask == 0.99
+    assert decision.audit["confirmation_timestamps"] == [1_000.060, 1_000.064]
 
 
 def test_generation_reset_reaches_consumer_before_new_books_are_published():

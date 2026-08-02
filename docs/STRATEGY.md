@@ -6,7 +6,7 @@ not a price feed and not a pre-close direction predictor.
 Current strategy version:
 
 ```text
-aftertake_v8_clob_refill_guard_250ms
+aftertake_v8_1_stable_book_refill_guard_250ms
 ```
 
 ## Scene gate
@@ -31,9 +31,10 @@ in audit, but they are not hard rejections by themselves.
 
 Between T+50 ms and T+250 ms after frontend close, both outcome-token books
 must first have a fresh post-close update. The classifier then requires two
-distinct executable top/depth states with the same post-close leader. There is
-no fixed 100 ms sleep: identical repeated snapshots do not count, but a real
-book transition can confirm immediately.
+separately received fresh paired observations with the same post-close leader.
+There is no fixed 100 ms sleep. An unchanged winner-side book counts as
+persistent support because the order remained present across observations;
+withdrawal, decay, leader reversal and loser refill are still hard rejections.
 
 V8 locks to the first observable post-close leader. If the leader reverses at
 any time inside the decision sequence, the round is permanently rejected. This

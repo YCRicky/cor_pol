@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 V7_STRATEGY_VERSION = "aftertake_v7_event_driven_one_sided_vacuum"
-V8_STRATEGY_VERSION = "aftertake_v8_clob_refill_guard_250ms"
+V8_STRATEGY_VERSION = "aftertake_v8_1_stable_book_refill_guard_250ms"
 ACTIVE_CLASSIFIER_FAMILY = "v8"
 STRATEGY_VERSION = V8_STRATEGY_VERSION
 
@@ -128,7 +128,12 @@ def classifier_family_config(family: str) -> PostCloseConfig:
         return PostCloseConfig(
             post_close_end_s=0.250,
             strategy_version=V8_STRATEGY_VERSION,
-            entry_reason="v8_clob_refill_guard_250ms",
+            entry_reason="v8_1_stable_book_refill_guard_250ms",
+            # Two separately received, fresh paired books prove that support
+            # remained present even when the executable top/depth values did
+            # not move. Withdrawal, decay, leader reversal and loser refill
+            # are still rejected by the gates below.
+            distinct_evidence_confirmations=False,
             require_loser_refill_failure=True,
             require_stable_post_close_leader=True,
         )
@@ -355,6 +360,11 @@ class PostCloseWinnerClassifier:
             books = tuple(self._books)
         audit = self._base_audit(round_end_ts, now_ts, books)
         audit["timing"] = {"post_start": start, "post_end": end}
+        audit["confirmation_policy"] = (
+            "distinct_evidence_states"
+            if self.cfg.distinct_evidence_confirmations
+            else "fresh_paired_observations"
+        )
         if now_ts < start:
             return self._hold("post_close_window_not_open", audit)
         if now_ts > end:

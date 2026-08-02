@@ -15,6 +15,7 @@ from aftertake.pm_client import (
     GeoStatus,
     LivePreflight,
     MarketMetadata,
+    V2ClobGateway,
 )
 from aftertake.post_close import PairedBook, SideBook
 from aftertake.risk import RiskRejected, check_entry_risk
@@ -122,6 +123,27 @@ class ReadyEmptyStream:
 class DeepSupportPairedStream(PairedStream):
     no_bid_size = 40
     no_near_depth = 40
+
+
+class StableWinnerAsk99PairedStream(PairedStream):
+    """Two fresh post-close events with unchanged executable winner support."""
+
+    def start(self):
+        def add(ts, yes_bid, yes_ask, no_bid, no_ask, *, yes_size, no_size, yes_near, no_near):
+            self._on_book(
+                PairedBook(
+                    observed_at=ts,
+                    yes=SideBook(yes_bid, yes_size, yes_size, yes_ask, 20, yes_near),
+                    no=SideBook(no_bid, no_size, no_size, no_ask, 20, no_near),
+                )
+            )
+
+        add(1199.70, 0.47, 0.50, 0.51, 0.54, yes_size=20, no_size=20, yes_near=20, no_near=20)
+        add(1199.82, 0.48, 0.51, 0.50, 0.53, yes_size=20, no_size=20, yes_near=20, no_near=20)
+        add(1199.95, 0.49, 0.52, 0.50, 0.53, yes_size=20, no_size=20, yes_near=20, no_near=20)
+        for ts in (1200.060, 1200.064):
+            add(ts, 0.20, 0.99, 0.70, 0.99, yes_size=2, no_size=20, yes_near=2, no_near=20)
+        self.ready = True
 
 
 class ResidualTenSupportPairedStream(PairedStream):
@@ -399,10 +421,11 @@ def test_runtime_status_reports_active_v8_guards(tmp_path):
 
         status = runner_module._status_payload(settings, store)
 
-        assert status["strategy"] == "aftertake_v8_clob_refill_guard_250ms"
+        assert status["strategy"] == "aftertake_v8_1_stable_book_refill_guard_250ms"
         assert status["entry_window_ms"] == [50, 250]
         assert status["confirmations"] == 2
         assert status["confirmation_spacing_ms"] == 0
+        assert status["confirmation_policy"] == "fresh_paired_observations"
         assert status["require_loser_refill_failure"] is True
         assert status["require_stable_post_close_leader"] is True
     finally:
@@ -461,6 +484,107 @@ def test_live_round_emits_only_execution_lifecycle_messages(tmp_path):
         assert "reconcile_duration_ms=" in notifier.messages[0]
         assert "Price: take=0.6400 avg=0.6400 available=20.0000" in notifier.messages[0]
         assert store.open_positions()[0].raw["timing"]["book_observed_ts"] == 1200.22
+    finally:
+        store.close()
+
+
+def test_live_round_reaches_single_gtc_post_through_v2_gateway(tmp_path):
+    class Value:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class Client:
+        def __init__(self):
+            self.posts = []
+
+        def get_clob_market_info(self, condition_id):
+            return {
+                "ao": True,
+                "mts": "0.01",
+                "mos": "1",
+                "t": [
+                    {"t": "up-token", "o": "Up"},
+                    {"t": "down-token", "o": "Down"},
+                ],
+                "fd": {"r": 0.0, "e": 1.0},
+            }
+
+        def get_closed_only_mode(self):
+            return False
+
+        def get_balance_allowance(self, _params):
+            return {
+                "balance": "100000000",
+                "allowances": {"exchange": "100000000"},
+            }
+
+        def create_order(self, args, options=None):
+            return {"args": args.kwargs, "options": options.kwargs}
+
+        def post_order(self, order, *, order_type, post_only, defer_exec):
+            self.posts.append(
+                {
+                    "order": order,
+                    "order_type": order_type,
+                    "post_only": post_only,
+                    "defer_exec": defer_exec,
+                }
+            )
+            return {"orderID": "order-v2-1"}
+
+        def get_order(self, order_id):
+            return {
+                "id": order_id,
+                "status": "matched",
+                "size_matched": "20",
+                "average_price": "0.64",
+            }
+
+    client = Client()
+    gateway = V2ClobGateway(
+        client,
+        {
+            "BalanceAllowanceParams": Value,
+            "OrderArgs": Value,
+            "PartialCreateOrderOptions": Value,
+            "OrderPayload": Value,
+            "TradeParams": Value,
+            "BUY": "BUY",
+            "OrderType": type("OrderType", (), {"GTC": "GTC"}),
+            "AssetType": type("AssetType", (), {"COLLATERAL": "COLLATERAL"}),
+        },
+    )
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        settings = Settings(
+            dry_run=False,
+            order_type="GTC",
+            out_dir=tmp_path / "out",
+            state_db=tmp_path / "state.sqlite3",
+        )
+        timestamps = iter((1190.0, 1190.1, 1200.22, 1200.24))
+
+        decisions = run_round(
+            settings=settings,
+            store=store,
+            public=LivePublic(),
+            executor=OrderExecutor(settings, store, gateway=gateway),
+            live_gateway=gateway,
+            round_start=900,
+            clock=lambda: next(timestamps, 1200.24),
+            sleep=lambda _seconds: None,
+            notifier=CaptureNotifier(),
+            stream_factory=StableWinnerAsk99PairedStream,
+        )
+
+        assert any(item.action == "enter" for item in decisions)
+        assert store.market_state("btc-updown-5m-900") == "open"
+        assert len(client.posts) == 1
+        assert client.posts[0]["order_type"] == "GTC"
+        assert client.posts[0]["post_only"] is False
+        assert client.posts[0]["defer_exec"] is False
+        assert client.posts[0]["order"]["args"]["token_id"] == "down-token"
+        assert client.posts[0]["order"]["args"]["price"] == 0.99
     finally:
         store.close()
 
