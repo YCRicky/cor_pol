@@ -119,6 +119,49 @@ def test_heartbeat_loop_keeps_delayed_success_and_adopts_returned_id():
     assert loop.last_success_at > 0
 
 
+def test_heartbeat_late_recovery_waits_for_next_cadence_instead_of_catching_up():
+    calls = []
+    recovered = threading.Event()
+    catch_up = threading.Event()
+    fatal_reasons = []
+    slow_completed_at = [None]
+    catch_up_gap = []
+
+    loop = HeartbeatLoop(
+        object(),
+        0.02,
+        fatal_callback=lambda reason, _payload: fatal_reasons.append(reason),
+    )
+
+    def post_heartbeat():
+        calls.append(time.monotonic())
+        if len(calls) == 1:
+            return {"heartbeat_id": "h"}
+        if len(calls) == 2:
+            raise TimeoutError("heartbeat request timed out")
+        if len(calls) == 3:
+            time.sleep(0.06)
+            slow_completed_at[0] = time.monotonic()
+            return {"heartbeat_id": "h"}
+        catch_up_gap.append(time.monotonic() - slow_completed_at[0])
+        catch_up.set()
+        return {"heartbeat_id": "h"}
+
+    loop._post_heartbeat_bounded = post_heartbeat
+    loop.hard_failure_s = 1.0
+    loop.status_callback = lambda kind, _payload: (
+        recovered.set() if kind == "heartbeat_recovered" else None
+    )
+    loop.start()
+    try:
+        assert recovered.wait(1.0)
+        assert catch_up.wait(0.2)
+        assert catch_up_gap[0] >= 0.015
+        assert fatal_reasons == []
+    finally:
+        loop.stop()
+
+
 def test_heartbeat_single_timeout_consumes_late_success_without_fatal_restart():
     request_started = threading.Event()
     late_success = threading.Event()

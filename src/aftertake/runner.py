@@ -174,6 +174,8 @@ class RuntimeWatchdog:
         self._last_progress = self._monotonic()
         self._stage = "boot"
         self._thread: Optional[threading.Thread] = None
+        self._restart_requested = threading.Event()
+        self._exit_requested = threading.Event()
 
     def set_fatal_callback(
         self, callback: Optional[Callable[[str, Dict[str, Any]], None]]
@@ -243,22 +245,56 @@ class RuntimeWatchdog:
                     if callback is not None:
                         callback("runtime watchdog stall", dict(stall_payload))
 
-                _run_diagnostics_then_restart(
-                    lambda: self._exit_fn(1),
-                    persist_stall_diagnostics,
+                self.request_restart(
+                    "runtime watchdog stall",
+                    payload,
+                    diagnostics=persist_stall_diagnostics,
                 )
                 return
+
+    def restart_after_diagnostics(self) -> None:
+        """Exit once after an outer fatal path has persisted its diagnostics."""
+
+        with self._lock:
+            if self._exit_requested.is_set():
+                return
+            self._exit_requested.set()
+        self._exit_fn(1)
+
+    def request_restart(
+        self,
+        reason: str = "runtime restart requested",
+        payload: Optional[Dict[str, Any]] = None,
+        *,
+        diagnostics: Optional[Callable[[], None]] = None,
+    ) -> None:
+        """Persist one fatal cause, then request exactly one process exit."""
+
+        with self._lock:
+            if self._restart_requested.is_set():
+                return
+            self._restart_requested.set()
+
+        restart_payload = dict(payload or {})
+        restart_payload.setdefault("action", "process_restart_requested")
+
+        def persist_restart() -> None:
+            if diagnostics is not None:
+                diagnostics()
+                return
+            callback = self._fatal_callback
+            if callback is not None:
+                callback(str(reason), dict(restart_payload))
+
+        _run_diagnostics_then_restart(
+            self.restart_after_diagnostics,
+            persist_restart,
+        )
 
     def stop(self) -> None:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=max(1.0, self.interval_s + 1.0))
-
-    def request_restart(self) -> None:
-        """Fail closed immediately when a worker cannot be cancelled safely."""
-
-        self._exit_fn(1)
-
 
 def _resolve_code_sha(source_file: Optional[Path] = None) -> str:
     """Return the checked-out revision for this installed source, if available."""
@@ -3392,7 +3428,11 @@ def _run_round_loop(
         store=store,
         public=public,
         notifier=notifier,
-        restart_fn=(runtime_watchdog.request_restart if runtime_watchdog is not None else lambda: os._exit(1)),
+        restart_fn=(
+            runtime_watchdog.restart_after_diagnostics
+            if runtime_watchdog is not None
+            else lambda: os._exit(1)
+        ),
     )
 
     while forever or completed < max(1, rounds):
@@ -3409,7 +3449,7 @@ def _run_round_loop(
                     notifier=notifier,
                     executor=executor,
                     restart_fn=(
-                        runtime_watchdog.request_restart
+                        runtime_watchdog.restart_after_diagnostics
                         if runtime_watchdog is not None
                         else None
                     ),
@@ -3516,7 +3556,11 @@ def _run_round_loop(
                 round_start=start,
                 notifier=notifier,
                 error_state=active_error_components,
-                restart_fn=(runtime_watchdog.request_restart if runtime_watchdog is not None else None),
+                restart_fn=(
+                    runtime_watchdog.restart_after_diagnostics
+                    if runtime_watchdog is not None
+                    else None
+                ),
             )
             _audit(
                 settings,
@@ -3545,26 +3589,32 @@ def _run_round_loop(
                     # process instead of allowing a late SDK return to submit
                     # against the next round; SQLite recovery handles any
                     # reserved intent conservatively on the fresh boot.
-                    runtime_watchdog.request_restart()
+                    runtime_watchdog.request_restart(
+                        "asset supervisor timeout",
+                        {
+                            "assets": timed_out_assets,
+                            "reason": "worker_timeout_uncancellable",
+                            "stage": "active_round",
+                        },
+                    )
             transport_failed_assets = [
                 asset
                 for asset, decisions in round_results.items()
                 if any("transport_error" in str(item.reason) for item in decisions)
             ]
             if settings.is_live and transport_failed_assets and not timed_out_assets:
-                # py-clob-client-v2 uses one module-global httpx pool, so
-                # rebuilding only our gateway wrapper cannot replace a poisoned
-                # transport. Persist ambiguous risk, alert, then let systemd
-                # recreate the process and SDK pool; never retry this market.
+                # Completed asset workers have no uncancellable call left behind.
+                # Keep those assets unhealthy and let the next round retry them;
+                # a transient transport error must not restart healthy assets.
                 _audit(
                     settings,
                     store,
-                    "live_transport_restart",
-                    {"assets": transport_failed_assets},
+                    "live_transport_isolated",
+                    {
+                        "assets": transport_failed_assets,
+                        "reason": "completed asset-local transport errors",
+                    },
                 )
-                if runtime_watchdog is not None:
-                    runtime_watchdog.request_restart()
-                    return
             if runtime_watchdog is not None:
                 runtime_watchdog.beat("round_complete")
         except Exception as exc:
@@ -3574,7 +3624,14 @@ def _run_round_loop(
                 # The asset supervisor may have detached a worker that raised
                 # a non-transport exception. Do not keep running alongside an
                 # uncancellable worker with shared state/client objects.
-                runtime_watchdog.request_restart()
+                runtime_watchdog.request_restart(
+                    "round runtime error",
+                    {
+                        "error_type": type(exc).__name__,
+                        "error_message": _safe_transport_message(exc),
+                        "stage": "active_round",
+                    },
+                )
         finally:
             # Network maintenance runs on one coalescing daemon worker. It may
             # overlap the quiet part of the next market, but can never hold the
@@ -3892,14 +3949,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     notifier = Notifier(token=settings.telegram_token, chat_id=settings.telegram_chat_id)
 
     def persist_runtime_watchdog_alert(reason: str, payload: Dict[str, Any]) -> None:
+        is_stall = reason == "runtime watchdog stall"
         alert_payload = {
             **payload,
             "reason": reason,
             "component": "runtime_watchdog",
-            "error_type": "RuntimeStall",
-            "error_message": "runtime watchdog detected no progress",
+            "error_type": payload.get(
+                "error_type", "RuntimeStall" if is_stall else "ProcessRestart"
+            ),
+            "error_message": payload.get("error_message") or reason,
         }
-        _audit(settings, store, "runtime_watchdog_stall", alert_payload)
+        _audit(
+            settings,
+            store,
+            "runtime_watchdog_stall" if is_stall else "process_restart_requested",
+            alert_payload,
+        )
         _transition_component_and_notify(
             store=store,
             component="runtime_watchdog",

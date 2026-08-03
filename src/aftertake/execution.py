@@ -399,7 +399,10 @@ class HeartbeatLoop:
                         {"reason": "CLOB heartbeat restored", "heartbeat_id": self._heartbeat_id},
                     )
                 had_error = False
-                next_due += self.interval_s
+                # Start the next cadence from completion, not from the stale
+                # scheduled due time. A slow-but-successful request must not
+                # trigger an immediate catch-up request storm.
+                next_due = time.monotonic() + self.interval_s
             except Exception as exc:  # execution reconciliation will fail closed
                 # Polymarket returns the replacement heartbeat_id alongside a
                 # 400 when the previous id expired.  Keeping the old id here
@@ -447,10 +450,7 @@ class HeartbeatLoop:
                     # SDK request while the original call can still return.
                     next_due = now_mono + min(0.25, self.interval_s)
                 else:
-                    next_due += self.interval_s
-            # If a call consumed the full cadence, retry immediately rather
-            # than adding request latency to every heartbeat interval.
-            next_due = max(next_due, time.monotonic())
+                    next_due = now_mono + self.interval_s
 
     def stop(self) -> None:
         self._stop.set()

@@ -1056,7 +1056,10 @@ def test_unhandled_asset_transport_failure_isolated_and_rebuilds_runtime(tmp_pat
             def beat(self, _stage):
                 return None
 
-            def request_restart(self):
+            def request_restart(self, *_args, **_kwargs):
+                restart_requested.append(True)
+
+            def restart_after_diagnostics(self):
                 restart_requested.append(True)
 
         def live_runtime(*_args):
@@ -1093,8 +1096,8 @@ def test_unhandled_asset_transport_failure_isolated_and_rebuilds_runtime(tmp_pat
         )
 
         assert runtime_calls == ["runtime"]
-        assert restart_requested == [True]
-        assert len(asset_result_rounds) == 1
+        assert restart_requested == []
+        assert len(asset_result_rounds) == 2
         assert all(sorted(results) == ["BTC", "ETH", "XRP"] for results in asset_result_rounds)
         assert all(thread.startswith("aftertake-asset") for thread in worker_threads)
         for results in asset_result_rounds:
@@ -1105,7 +1108,7 @@ def test_unhandled_asset_transport_failure_isolated_and_rebuilds_runtime(tmp_pat
                 "asset_round_transport_error",
             )
         alerts = [message for message in notifier.messages if message.startswith("[Aftertake] ALERT")]
-        assert len(alerts) == 1
+        assert len(alerts) == 2
         assert any(message.startswith("[Aftertake] RUNTIME_READY") for message in notifier.messages)
         assert store._conn.execute(
             "SELECT COUNT(*) FROM audit_events WHERE kind = 'round_runtime_error'"
@@ -1114,7 +1117,10 @@ def test_unhandled_asset_transport_failure_isolated_and_rebuilds_runtime(tmp_pat
             """SELECT slug, payload_json FROM audit_events
                WHERE kind = 'asset_transport_error' ORDER BY id"""
         ).fetchall()
-        assert [audit["slug"] for audit in audits] == ["eth-updown-5m-900"]
+        assert [audit["slug"] for audit in audits] == [
+            "eth-updown-5m-900",
+            "eth-updown-5m-1200",
+        ]
         for audit in audits:
             assert json.loads(audit["payload_json"]) == {
                 "asset": "ETH",
@@ -1324,6 +1330,31 @@ def test_runtime_watchdog_persists_fatal_diagnostics_before_restart():
         assert events == ["alert", "restart"]
     finally:
         watchdog.stop()
+
+
+def test_runtime_watchdog_manual_restart_persists_fatal_once_before_exit():
+    events = []
+    watchdog = RuntimeWatchdog(
+        stale_after_s=1.0,
+        interval_s=1.0,
+        exit_fn=lambda _code: events.append("restart"),
+        fatal_callback=lambda reason, payload: events.append(("alert", reason, payload)),
+    )
+
+    watchdog.request_restart(
+        "asset supervisor timeout",
+        {"asset": "ETH", "action": "process_restart_requested"},
+    )
+    watchdog.request_restart(
+        "asset supervisor timeout",
+        {"asset": "ETH", "action": "process_restart_requested"},
+    )
+
+    assert [event if isinstance(event, str) else event[0] for event in events] == [
+        "alert",
+        "restart",
+    ]
+    assert events[0][1] == "asset supervisor timeout"
 
 
 def test_runtime_watchdog_does_not_restart_while_waiting_for_boundary():
