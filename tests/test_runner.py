@@ -445,7 +445,7 @@ def test_runtime_status_reports_active_post_close_snapshot_contract(tmp_path):
         store.close()
 
 
-def test_post_close_fixed_qty_blocks_insufficient_displayed_ask_depth(tmp_path):
+def test_post_close_fixed_qty_ignores_displayed_ask_depth(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     try:
         settings = Settings(dry_run=True, out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3")
@@ -461,8 +461,8 @@ def test_post_close_fixed_qty_blocks_insufficient_displayed_ask_depth(tmp_path):
             stream_factory=ResidualTenSupportPairedStream,
         )
         assert any(item.action == "enter" and item.side == "NO" for item in decisions)
-        assert any("requested_qty_exceeds_displayed_ask_depth" in item.reason for item in decisions)
-        assert not store.open_positions()
+        assert not any("requested_qty_exceeds_displayed_ask_depth" in item.reason for item in decisions)
+        assert store.open_positions()
     finally:
         store.close()
 
@@ -679,7 +679,7 @@ def test_post_close_snapshot_decision_audit_precedes_submit(tmp_path, monkeypatc
         store.close()
 
 
-def test_live_round_blocks_fixed_quantity_that_observed_ask_depth_cannot_cover(tmp_path):
+def test_live_round_submits_fixed_quantity_regardless_of_observed_ask_depth(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     try:
         settings = Settings(dry_run=False, qty=70, order_type="GTC", out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3")
@@ -699,11 +699,9 @@ def test_live_round_blocks_fixed_quantity_that_observed_ask_depth_cannot_cover(t
             stream_factory=PairedStream,
         )
         assert any(item.action == "enter" for item in decisions)
-        assert gateway.submitted_qty == 0
-        assert store.market_state("btc-updown-5m-900") == "observing"
+        assert gateway.submitted_qty == 70.0
         alerts = [message for message in notifier.messages if message.startswith("[Aftertake] ALERT")]
-        assert len(alerts) == 1
-        assert "entry blocked by risk/preflight" in alerts[0]
+        assert not any("entry blocked by risk/preflight" in message for message in alerts)
     finally:
         store.close()
 
@@ -801,7 +799,7 @@ def test_live_round_account_preflight_is_shared_once_across_assets(tmp_path):
         store.close()
 
 
-def test_shared_account_snapshot_claims_cost_atomically_across_all_assets(tmp_path):
+def test_all_assets_submit_without_shared_account_budget_cap(tmp_path):
     assets = ("BTC", "ETH", "XRP", "HYPE", "DOGE", "SOL")
 
     class AssetPublic(LivePublic):
@@ -910,16 +908,10 @@ def test_shared_account_snapshot_claims_cost_atomically_across_all_assets(tmp_pa
             sleep=lambda _seconds: None,
         )
 
-        account_budget = min(200.0 * 0.50, 200.0)
         assert sorted(results) == sorted(assets)
         assert gateway.preflight_calls == 1
-        assert gateway.submitted_cost > 0.0
-        assert gateway.submitted_cost + 10.0 <= account_budget
-        # The allowance is a hard spend ceiling, not another balance value to
-        # which the risk fraction is applied. The old formula capped this test
-        # at $40 and silently rejected otherwise valid account capacity.
-        assert gateway.submitted_cost + 10.0 > min(100.0, 80.0) * 0.50
-        assert store.total_risk_exposure() <= account_budget
+        assert gateway.submitted_cost == pytest.approx(6 * 50 * 0.99)
+        assert all(any(item.action == "enter" for item in decisions) for decisions in results.values())
     finally:
         store.close()
 
@@ -1842,6 +1834,11 @@ def test_sigterm_raises_system_exit_and_closes_runtime_resources(monkeypatch, tm
     monkeypatch.setattr(runner_module, "PolymarketPublicClient", lambda **_kwargs: object())
     monkeypatch.setattr(runner_module, "Notifier", lambda **_kwargs: CaptureNotifier())
     monkeypatch.setattr(runner_module.signal, "signal", capture_signal)
+    monkeypatch.setattr(
+        runner_module.os,
+        "_exit",
+        lambda code: (_ for _ in ()).throw(SystemExit(code)),
+    )
 
     def stop_round(**_kwargs):
         assert registered

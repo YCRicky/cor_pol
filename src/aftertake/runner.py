@@ -18,6 +18,7 @@ import signal
 import sys
 import threading
 import time
+from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -1986,11 +1987,12 @@ def _run_post_close_snapshot_round(
     metadata = _build_dry_metadata(market)
     notifier = notifier or Notifier(token=settings.telegram_token, chat_id=settings.telegram_chat_id)
 
-    latest_observation: Optional[Any] = None
+    # Keep enough recent causal snapshots to tolerate clock/order skew while
+    # remaining strictly memory bounded on high-frequency markets.
+    observations = deque(maxlen=256)
     observations_lock = threading.Lock()
 
     def record_book(book: Any) -> None:
-        nonlocal latest_observation
         try:
             observed_at = float(book.observed_at)
         except (AttributeError, TypeError, ValueError):
@@ -1998,17 +2000,13 @@ def _run_post_close_snapshot_round(
         if not (observed_at == observed_at and abs(observed_at) != float("inf")):
             return
         with observations_lock:
-            if latest_observation is not None and observed_at <= float(latest_observation.observed_at):
+            if observations and observed_at <= float(observations[-1].observed_at):
                 return
-            # The strategy consumes only the newest causal snapshot at T+500ms.
-            # Retaining the full high-frequency stream wastes memory and can
-            # trigger the EC2 OOM killer without changing the decision.
-            latest_observation = book
+            observations.append(book)
 
     def reset_books() -> None:
-        nonlocal latest_observation
         with observations_lock:
-            latest_observation = None
+            observations.clear()
 
     stream = stream_factory(
         yes_token_id=yes_token,
@@ -2222,9 +2220,7 @@ def _run_post_close_snapshot_round(
                     )
                     break
                 with observations_lock:
-                    decision_observations = (
-                        (latest_observation,) if latest_observation is not None else ()
-                    )
+                    decision_observations = tuple(observations)
                 decision_ts = now
                 decision = select_post_close_snapshot_signal(
                     decision_observations,
@@ -3746,7 +3742,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     previous_sigterm_handler = signal.getsignal(signal.SIGTERM)
 
     def handle_sigterm(_signum: int, _frame: Any) -> None:
-        raise SystemExit(0)
+        # Network/SDK workers cannot be cancelled safely and Python waits for
+        # ThreadPoolExecutor threads during interpreter shutdown.  Exit the
+        # service immediately so systemd never has to escalate SIGTERM to
+        # SIGKILL after TimeoutStopSec.
+        os._exit(0)
 
     signal.signal(signal.SIGTERM, handle_sigterm)
     # Start the process watchdog before any output-directory, SQLite, BOOT
