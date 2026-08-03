@@ -8,6 +8,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
+from .post_close_snapshot import (
+    POST_CLOSE_SNAPSHOT_DELAY_S,
+    POST_CLOSE_SNAPSHOT_LIMIT_PRICE,
+    POST_CLOSE_SNAPSHOT_MAX_LATENESS_S,
+    POST_CLOSE_SNAPSHOT_PAIRED_MAX_AGE_S,
+)
 from .resolver import parse_resolve_overrides
 
 POLYGON_CHAIN_ID = 137
@@ -90,7 +96,15 @@ class Settings:
     v9_live_enabled: bool = False
     asset: str = "BTC"
     assets: Tuple[str, ...] = DEFAULT_ASSETS
-    qty: float = 5.0
+    # The live close+500ms contract is a fixed 50-share order.  An explicit
+    # AFTERTAKE_QTY override remains visible and is rejected by deployment if
+    # it is not the contract value; it is never silently converted at runtime.
+    qty: float = 50.0
+    post_close_snapshot_delay_s: float = POST_CLOSE_SNAPSHOT_DELAY_S
+    post_close_leader_bid_threshold: float = 0.80
+    post_close_paired_max_age_s: float = POST_CLOSE_SNAPSHOT_PAIRED_MAX_AGE_S
+    post_close_snapshot_max_lateness_s: float = POST_CLOSE_SNAPSHOT_MAX_LATENESS_S
+    post_close_limit_price: float = POST_CLOSE_SNAPSHOT_LIMIT_PRICE
     out_dir: Path = Path("out")
     max_daily_loss: float = 25.0
     max_open_positions: int = 3
@@ -161,6 +175,16 @@ class Settings:
             raise ValueError("AFTERTAKE_LIVE_QTY_FLOOR_STEP must be > 0")
         if self.dry_run_simulated_balance <= 0:
             raise ValueError("AFTERTAKE_DRY_RUN_SIM_BALANCE must be > 0")
+        if self.post_close_snapshot_delay_s <= 0:
+            raise ValueError("AFTERTAKE_POST_CLOSE_SNAPSHOT_DELAY_S must be > 0")
+        if not 0 < self.post_close_leader_bid_threshold < 1:
+            raise ValueError("AFTERTAKE_POST_CLOSE_LEADER_BID_THRESHOLD must be in (0, 1)")
+        if not 0 < self.post_close_paired_max_age_s <= 1:
+            raise ValueError("AFTERTAKE_POST_CLOSE_PAIRED_MAX_AGE_S must be in (0, 1]")
+        if not 0 <= self.post_close_snapshot_max_lateness_s <= 1:
+            raise ValueError("AFTERTAKE_POST_CLOSE_SNAPSHOT_MAX_LATENESS_S must be in [0, 1]")
+        if not 0 < self.post_close_limit_price < 1:
+            raise ValueError("AFTERTAKE_POST_CLOSE_LIMIT_PRICE must be in (0, 1)")
         strategy_family = str(self.strategy_family or "").strip().lower()
         if strategy_family not in {"v8", "v9"}:
             raise ValueError("AFTERTAKE_STRATEGY must be v8 or v9")
@@ -172,6 +196,8 @@ class Settings:
         if order_type not in {"FAK", "FOK", "GTC", "GTD"}:
             raise ValueError("AFTERTAKE_ORDER_TYPE must be one of FAK, FOK, GTC, GTD")
         object.__setattr__(self, "order_type", order_type)
+        if self.is_live and order_type != "GTC":
+            raise ValueError("post-close +500ms live entry requires AFTERTAKE_ORDER_TYPE=GTC")
         if not 0 < self.order_ttl_s <= 120:
             raise ValueError("internal order TTL must be in (0, 120]")
         if not 0 < self.reconcile_timeout_s <= 180:
@@ -221,7 +247,22 @@ class Settings:
             v9_live_enabled=_bool("AFTERTAKE_V9_LIVE_ENABLED", False),
             asset=assets[0] if assets else "BTC",
             assets=assets,
-            qty=_float("AFTERTAKE_QTY", 5.0),
+            qty=_float("AFTERTAKE_QTY", 50.0),
+            post_close_snapshot_delay_s=_float(
+                "AFTERTAKE_POST_CLOSE_SNAPSHOT_DELAY_S", POST_CLOSE_SNAPSHOT_DELAY_S
+            ),
+            post_close_leader_bid_threshold=_float(
+                "AFTERTAKE_POST_CLOSE_LEADER_BID_THRESHOLD", 0.80
+            ),
+            post_close_paired_max_age_s=_float(
+                "AFTERTAKE_POST_CLOSE_PAIRED_MAX_AGE_S", POST_CLOSE_SNAPSHOT_PAIRED_MAX_AGE_S
+            ),
+            post_close_snapshot_max_lateness_s=_float(
+                "AFTERTAKE_POST_CLOSE_SNAPSHOT_MAX_LATENESS_S", POST_CLOSE_SNAPSHOT_MAX_LATENESS_S
+            ),
+            post_close_limit_price=_float(
+                "AFTERTAKE_POST_CLOSE_LIMIT_PRICE", POST_CLOSE_SNAPSHOT_LIMIT_PRICE
+            ),
             out_dir=out_dir,
             state_db=out_dir / "aftertake.sqlite3",
             max_daily_loss=_float("AFTERTAKE_MAX_DAILY_LOSS", 25.0),

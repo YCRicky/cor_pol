@@ -1,13 +1,26 @@
 # Aftertake strategy
 
-Aftertake is a V8 event-driven post-frontend-close CLOB classifier,
-not a price feed and not a pre-close direction predictor.
+The live Aftertake path takes one paired YES/NO snapshot at close+500ms, then
+immediately submits one bounded GTC order. It is not a price feed and does not
+reclassify after the snapshot.
 
-Current strategy version:
+Current live strategy version:
 
 ```text
-aftertake_v8_1_stable_book_refill_guard_250ms
+aftertake_postclose_snapshot_v1_plus0_5_leader_bid_gt_080
 ```
+
+The live decision boundary is `close_epoch + 0.500s`. The latest locally
+received fresh paired snapshot is used; missing, tied, or stale bids HOLD. The
+higher best bid must be strictly greater than `0.80` (`0.80` is HOLD). Once
+frozen, later book changes cannot change the side. The runtime immediately
+makes at most one GTC marketable limit order at `0.99` for the configured fixed
+quantity (deployment default `50`), and only reconciles it through `close + 5s`.
+
+The remaining V8 post-close classifier sections below are archived research
+and replay semantics. They are not live entry gates.
+
+## Archived V8 post-close research
 
 ## Scene gate
 

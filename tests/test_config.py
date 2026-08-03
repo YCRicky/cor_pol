@@ -11,6 +11,11 @@ def _clear_env(monkeypatch):
         "AFTERTAKE_V9_LIVE_ENABLED",
         "AFTERTAKE_ASSET",
         "AFTERTAKE_QTY",
+        "AFTERTAKE_POST_CLOSE_SNAPSHOT_DELAY_S",
+        "AFTERTAKE_POST_CLOSE_LEADER_BID_THRESHOLD",
+        "AFTERTAKE_POST_CLOSE_PAIRED_MAX_AGE_S",
+        "AFTERTAKE_POST_CLOSE_SNAPSHOT_MAX_LATENESS_S",
+        "AFTERTAKE_POST_CLOSE_LIMIT_PRICE",
         "AFTERTAKE_OUT_DIR",
         "AFTERTAKE_MAX_DAILY_LOSS",
         "AFTERTAKE_MAX_OPEN_POSITIONS",
@@ -43,7 +48,12 @@ def test_defaults_are_aftertake_only(monkeypatch):
     assert settings.strategy_family == "v8"
     assert settings.v9_live_enabled is False
     assert settings.asset == "BTC"
-    assert settings.qty == 5
+    assert settings.qty == 50
+    assert settings.post_close_snapshot_delay_s == 0.5
+    assert settings.post_close_leader_bid_threshold == 0.80
+    assert settings.post_close_paired_max_age_s == 0.250
+    assert settings.post_close_snapshot_max_lateness_s == 0.250
+    assert settings.post_close_limit_price == 0.99
     assert settings.live_max_account_risk_fraction == 0.5
     assert settings.live_quantity_floor_step == 1.0
     assert settings.dry_run_simulated_balance == 100.0

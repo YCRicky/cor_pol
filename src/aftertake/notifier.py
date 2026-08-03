@@ -105,14 +105,17 @@ def _timing_line(payload: Dict[str, Any]) -> str:
 
 
 def _latency_line(payload: Dict[str, Any]) -> str:
-    return (
-        f"Latency: book_age_ms={_positive_number(payload.get('observed_book_age_ms'))} "
-        f"decision_to_submit_ms={_positive_number(payload.get('decision_to_submit_ms'))} "
-        f"submit_roundtrip_ms={_positive_number(payload.get('submit_roundtrip_ms'))} "
-        f"reconcile_duration_ms={_positive_number(payload.get('reconcile_duration_ms'))} "
-        f"itode={str(bool(payload.get('immediate_taker_order_delay_enabled'))).lower()} "
-        f"expected_taker_delay_ms={_positive_number(payload.get('expected_taker_delay_ms'))}"
-    )
+    fields = [
+        f"book_age_ms={_positive_number(payload.get('observed_book_age_ms'))}",
+        f"decision_to_submit_ms={_positive_number(payload.get('decision_to_submit_ms'))}",
+        f"submit_roundtrip_ms={_positive_number(payload.get('submit_roundtrip_ms'))}",
+        f"reconcile_duration_ms={_positive_number(payload.get('reconcile_duration_ms'))}",
+        f"itode={str(bool(payload.get('immediate_taker_order_delay_enabled'))).lower()}",
+        f"expected_taker_delay_ms={_positive_number(payload.get('expected_taker_delay_ms'))}",
+    ]
+    if "submit_lag_ms" in payload:
+        fields.insert(2, f"submit_lag_ms={_positive_number(payload.get('submit_lag_ms'))}")
+    return "Latency: " + " ".join(fields)
 
 
 def format_event(
@@ -142,7 +145,13 @@ def _format_event(kind: str, payload: Dict[str, Any], slug: str = "") -> str:
             f"mode={'SHADOW' if payload['dry_run'] else 'LIVE'} "
             f"qty={_number(payload['qty'])} assets={','.join(payload.get('assets', []))}\n"
             f"pid={_text(payload.get('pid'), 'unknown')} code_sha={_text(payload.get('code_sha'), 'unknown')}\n"
-            "multi-asset per-asset risk gates + SQLite recovery + CLOB V2 preflight"
+            "multi-asset per-asset risk gates + SQLite recovery + CLOB V2 preflight\n"
+            "postclose_snapshot="
+            f"delay={_positive_number(payload.get('post_close_snapshot_delay_s'), 3)}s "
+            f"leader_bid>{_number(payload.get('leader_bid_threshold'))} "
+            f"paired_age<={_positive_number(payload.get('paired_receive_max_age_s'), 3)}s "
+            f"lateness<={_positive_number(payload.get('max_decision_lateness_s'), 3)}s "
+            f"order={_text(payload.get('order_type'), 'GTC')}"
         )
     if kind == "preflight":
         return (
@@ -161,20 +170,51 @@ def _format_event(kind: str, payload: Dict[str, Any], slug: str = "") -> str:
             "[Aftertake] RUNTIME_READY\n"
             f"mode={'SHADOW' if payload['dry_run'] else 'LIVE'} "
             f"assets={','.join(payload.get('assets', []))}\n"
-            f"component=pm_runtime reason={reason}"
+            f"component=pm_runtime reason={reason}\n"
+            "postclose_snapshot="
+            f"delay={_positive_number(payload.get('post_close_snapshot_delay_s'), 3)}s "
+            f"leader_bid>{_number(payload.get('leader_bid_threshold'))} "
+            f"paired_age<={_positive_number(payload.get('paired_receive_max_age_s'), 3)}s "
+            f"lateness<={_positive_number(payload.get('max_decision_lateness_s'), 3)}s "
+            f"order={_text(payload.get('order_type'), 'GTC')}"
         )
-    if kind == "submitted":
+    if kind in {"post_close_snapshot_frozen", "post_close_snapshot_hold"}:
+        frozen = kind == "post_close_snapshot_frozen"
+        headline = "POST_CLOSE_SNAPSHOT_FROZEN" if frozen else "POST_CLOSE_SNAPSHOT_HOLD"
         return "\n".join(
             [
-                "[Aftertake] ORDER_SUBMITTED",
-                _market_line(payload, slug),
-                _order_line(payload, default_status="submitted"),
-                _qty_line(payload),
-                _price_line(payload, label="limit"),
-                _timing_line(payload),
-                _latency_line(payload),
+                f"[Aftertake] {headline}",
+                f"Market: slug={slug or _text(payload.get('slug'))} side={_text(payload.get('side'), 'NONE')}",
+                "Close: "
+                f"close_ts={_text(payload.get('close_ts'))} "
+                f"snapshot_ts={_text(payload.get('post_close_snapshot_ts'))} "
+                f"decision_ts={_text(payload.get('snapshot_decision_ts'))} "
+                f"snapshot_age_ms={_positive_number(payload.get('snapshot_age_ms'))}",
+                "Book: "
+                f"YES_bid={_number(payload.get('yes', {}).get('best_bid')) if isinstance(payload.get('yes'), dict) else 'n/a'} "
+                f"NO_bid={_number(payload.get('no', {}).get('best_bid')) if isinstance(payload.get('no'), dict) else 'n/a'} "
+                f"threshold={_number(payload.get('leader_bid_threshold'))}",
+                f"Decision: action={_text(payload.get('action'))} reason={_text(payload.get('reason'))} "
+                f"strategy={_text(payload.get('strategy_version'))}",
             ]
         )
+    if kind == "submitted":
+        lines = [
+            "[Aftertake] ORDER_SUBMITTED",
+            _market_line(payload, slug),
+            _order_line(payload, default_status="submitted"),
+            _qty_line(payload),
+            _price_line(payload, label="limit"),
+        ]
+        if any(key in payload for key in ("scheduled_close_ts", "actual_submit_ts", "submit_lag_ms")):
+            lines.append(
+                "Schedule: "
+                f"close_ts={_text(payload.get('scheduled_close_ts'))} "
+                f"actual_submit_ts={_text(payload.get('actual_submit_ts'), payload.get('event_ts'))} "
+                f"submit_lag_ms={_positive_number(payload.get('submit_lag_ms'))}"
+            )
+        lines.extend((_timing_line(payload), _latency_line(payload)))
+        return "\n".join(lines)
     if kind == "recovery":
         return (
             "[Aftertake] ORDER_RECOVERY\n"

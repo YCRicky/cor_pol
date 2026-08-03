@@ -45,6 +45,21 @@ ensure_env_kv() {
   rm -f "${tmp}"
 }
 
+ensure_env_default() {
+  local key="$1"
+  local value="$2"
+  if ! grep -q -E "^[[:space:]]*${key}[[:space:]]*=" "${ENV_FILE}"; then
+    ensure_env_kv "${key}" "${value}"
+  fi
+}
+
+reject_legacy_timing_env() {
+  if grep -q -E "^[[:space:]]*AFTERTAKE_PRE_" "${ENV_FILE}"; then
+    echo "unsupported legacy pre-entry timing settings; refusing deployment" >&2
+    exit 2
+  fi
+}
+
 comment_out_legacy_env() {
   local key="$1"
   local tmp
@@ -57,11 +72,57 @@ comment_out_legacy_env() {
 normalize_runtime_env() {
   # Non-secret deployment policy. Keep credentials untouched, but prevent stale
   # legacy single-asset settings from silently turning live back into BTC-only.
+  reject_legacy_timing_env
   ensure_env_kv AFTERTAKE_ASSETS BTC,ETH,XRP,HYPE,DOGE,SOL
-  ensure_env_kv AFTERTAKE_ORDER_TYPE GTC
+  ensure_env_default AFTERTAKE_QTY 50
+  ensure_env_default AFTERTAKE_ORDER_TYPE GTC
+  ensure_env_default AFTERTAKE_POST_CLOSE_SNAPSHOT_DELAY_S 0.5
+  ensure_env_default AFTERTAKE_POST_CLOSE_LEADER_BID_THRESHOLD 0.80
+  ensure_env_default AFTERTAKE_POST_CLOSE_PAIRED_MAX_AGE_S 0.250
+  ensure_env_default AFTERTAKE_POST_CLOSE_SNAPSHOT_MAX_LATENESS_S 0.250
+  ensure_env_default AFTERTAKE_POST_CLOSE_LIMIT_PRICE 0.99
   if grep -q -E "^[[:space:]]*AFTERTAKE_ASSET[[:space:]]*=" "${ENV_FILE}"; then
     comment_out_legacy_env AFTERTAKE_ASSET
   fi
+}
+
+require_post_close_contract() {
+  local qty order_type delay threshold paired_age lateness limit
+  qty="$(read_env AFTERTAKE_QTY)"
+  order_type="$(read_env AFTERTAKE_ORDER_TYPE)"
+  delay="$(read_env AFTERTAKE_POST_CLOSE_SNAPSHOT_DELAY_S)"
+  threshold="$(read_env AFTERTAKE_POST_CLOSE_LEADER_BID_THRESHOLD)"
+  paired_age="$(read_env AFTERTAKE_POST_CLOSE_PAIRED_MAX_AGE_S)"
+  lateness="$(read_env AFTERTAKE_POST_CLOSE_SNAPSHOT_MAX_LATENESS_S)"
+  limit="$(read_env AFTERTAKE_POST_CLOSE_LIMIT_PRICE)"
+  case "${qty}" in
+    50|50.0|50.00) ;;
+    *) echo "AFTERTAKE_QTY must be 50 for the close+500ms live contract; found '${qty}'. Refusing deployment." >&2; exit 2 ;;
+  esac
+  test "${order_type}" = "GTC" || {
+    echo "AFTERTAKE_ORDER_TYPE must be GTC for the close+500ms live contract; found '${order_type}'. Refusing deployment" >&2
+    exit 2
+  }
+  case "${delay}" in
+    0.5|0.50|0.500) ;;
+    *) echo "AFTERTAKE_POST_CLOSE_SNAPSHOT_DELAY_S must be 0.5; found '${delay}'. Refusing deployment." >&2; exit 2 ;;
+  esac
+  case "${threshold}" in
+    0.8|0.80|0.800) ;;
+    *) echo "AFTERTAKE_POST_CLOSE_LEADER_BID_THRESHOLD must be 0.80; found '${threshold}'. Refusing deployment." >&2; exit 2 ;;
+  esac
+  case "${paired_age}" in
+    0.25|0.250|0.2500) ;;
+    *) echo "AFTERTAKE_POST_CLOSE_PAIRED_MAX_AGE_S must be 0.250; found '${paired_age}'. Refusing deployment." >&2; exit 2 ;;
+  esac
+  case "${lateness}" in
+    0.25|0.250|0.2500) ;;
+    *) echo "AFTERTAKE_POST_CLOSE_SNAPSHOT_MAX_LATENESS_S must be 0.250; found '${lateness}'. Refusing deployment." >&2; exit 2 ;;
+  esac
+  case "${limit}" in
+    0.99|0.990) ;;
+    *) echo "AFTERTAKE_POST_CLOSE_LIMIT_PRICE must be 0.99; found '${limit}'. Refusing deployment." >&2; exit 2 ;;
+  esac
 }
 
 require_env() {
@@ -72,6 +133,7 @@ require_env() {
 }
 
 normalize_runtime_env
+require_post_close_contract
 
 install -d -o ubuntu -g ubuntu -m 0750 "${OUT_DIR}"
 test -w "${OUT_DIR}" || { echo "runtime output directory is not writable: ${OUT_DIR}" >&2; exit 2; }

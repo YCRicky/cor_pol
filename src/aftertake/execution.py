@@ -816,7 +816,13 @@ class OrderExecutor:
                     "order_id": order_id,
                     "requested_qty": record.requested_qty,
                     "requested_price": record.requested_price,
+                    "order_type": self.settings.order_type,
                     "event_ts": submit_end_wall,
+                    "scheduled_close_ts": timing.get("scheduled_close_ts"),
+                    "actual_submit_ts": timing.get("submit_start_ts"),
+                    "submit_lag_ms": timing.get("submit_lag_ms"),
+                    "snapshot_decision_ts": timing.get("snapshot_decision_ts"),
+                    "post_close_snapshot_ts": timing.get("post_close_snapshot_ts"),
                     "decision_to_submit_ms": timing.get("decision_to_submit_ms", -1.0),
                     "submit_roundtrip_ms": timing.get("submit_roundtrip_ms", -1.0),
                     "observed_book_age_ms": timing.get("observed_book_age_ms", -1.0),
@@ -1251,6 +1257,11 @@ class OrderExecutor:
         except (TypeError, ValueError):
             timing["observed_book_age_ms"] = -1.0
         timing["submit_roundtrip_ms"] = max(0.0, (float(submit_end_mono) - float(submit_start_mono)) * 1000.0)
+        scheduled_close = timing.get("scheduled_close_ts")
+        try:
+            timing["submit_lag_ms"] = max(0.0, (float(submit_start_wall) - float(scheduled_close)) * 1000.0)
+        except (TypeError, ValueError):
+            timing["submit_lag_ms"] = -1.0
         return timing
 
     def _merge_reconcile_timing(

@@ -1,10 +1,10 @@
-"""Aftertake runtime: post-close CLOB book classification and safe execution.
+"""Aftertake runtime: close+500ms signal freeze and safe GTC execution.
 
-Aftertake never predicts direction before the market frontend closes.  It keeps
-the public Polymarket CLOB WebSocket warm, then considers only a winner side
-with persistent bid support and a still-displayed residual ask.  All account
-checks happen before the close; the critical path is one SQLite reservation and
-one bounded GTC submission.
+The live path selects one paired YES/NO leader at close+0.5s, freezes that
+side, and immediately submits one marketable GTC limit.  Later book changes
+are never fed back into the live classifier.  Historical post-close/V9
+modules remain available to research callers but are intentionally outside
+this runtime path.
 """
 
 from __future__ import annotations
@@ -45,6 +45,10 @@ from .post_close import (
     PostCloseWinnerClassifier,
     active_classifier_config,
 )
+from .post_close_snapshot import (
+    PostCloseSnapshotConfig,
+    select_post_close_snapshot_signal,
+)
 from .resolver import parse_resolve_overrides
 from .risk import RiskRejected, check_entry_risk
 from .rounds import CRYPTO_5M_WINDOW_S
@@ -70,9 +74,11 @@ RUNTIME_WAITING_STAGE_TIMEOUT_S = 360.0
 RUNTIME_ACTIVE_STAGE_TIMEOUT_S = 600.0
 MAINTENANCE_TIMEOUT_S = 240.0
 OBSERVABILITY_RESTART_GRACE_S = 2.0
-# This only bounds how long the runner waits to re-check an already-recorded
-# websocket observation. Event confirmation and all thresholds remain in
-# PostCloseConfig.
+# This only bounds the scheduler's wait for the fixed close+0.5 target. It is
+# not a confirmation interval and it cannot trigger another classification.
+POST_CLOSE_SNAPSHOT_SCHEDULER_POLL_INTERVAL_S = 0.050
+# Kept only for the explicitly non-live legacy replay helper below; the public
+# run_round entry point never calls that helper.
 POST_CLOSE_POLL_INTERVAL_S = 0.005
 # Six assets share one conservative SDK client. Account preflight plus bounded
 # sequential metadata retries can consume roughly 75 seconds at their documented
@@ -879,6 +885,12 @@ def _latency_payload_from_result(result: OrderResult) -> Dict[str, Any]:
         "book_observed_ts",
         "decision_ts",
         "round_end_ts",
+        "scheduled_close_ts",
+        "actual_submit_ts",
+        "submit_lag_ms",
+        "snapshot_decision_ts",
+        "decision_cutoff_ts",
+        "post_close_snapshot_age_ms",
         "seconds_after_close_at_decision",
         "submit_start_ts",
         "submit_end_ts",
@@ -997,7 +1009,27 @@ def _settlement_semantics_label(market: GammaMarket) -> str:
     return "unverified"
 
 
+def _post_close_snapshot_config_for_settings(settings: Settings) -> PostCloseSnapshotConfig:
+    """Build the one live close+500ms classifier contract from settings."""
+
+    config = PostCloseSnapshotConfig(
+        snapshot_delay_s=settings.post_close_snapshot_delay_s,
+        leader_bid_threshold=settings.post_close_leader_bid_threshold,
+        paired_max_age_s=settings.post_close_paired_max_age_s,
+        max_decision_lateness_s=settings.post_close_snapshot_max_lateness_s,
+        limit_price=settings.post_close_limit_price,
+    )
+    config.validate()
+    return config
+
+
 def _classifier_config_for_settings(settings: Settings) -> Any:
+    """Compatibility selector for historical replay/status callers.
+
+    It is intentionally not consulted by ``run_round``.  Live entry uses the
+    close+500ms contract above; these imports remain for old offline tooling.
+    """
+
     if settings.strategy_family == "v9":
         return active_v9_config()
     return active_classifier_config()
@@ -1017,17 +1049,10 @@ def _build_dry_metadata(market: GammaMarket) -> MarketMetadata:
 
 
 def _required_cash(settings: Settings, metadata: MarketMetadata) -> float:
-    """Reserve enough cash for the smallest legal live order before close.
+    """Reserve enough cash for the fixed close+500ms order."""
 
-    Dynamic live sizing happens only after the residual ask is observed.  This
-    pre-close check deliberately avoids the old fixed-qty/max-ask ceiling while
-    still proving the account is not empty or approval-less before the critical
-    50--1000ms post-close window.
-    """
-
-    del settings
-    price = 0.99
-    qty = metadata.min_order_size
+    price = float(settings.post_close_limit_price)
+    qty = float(settings.qty)
     return (
         price * qty
         + fee_total(price, qty, metadata.fee_rate, metadata.fee_exponent)
@@ -1131,6 +1156,41 @@ class _RoundAccountPreflight:
                 risk_budget=remaining,
             )
             return sizing, claim_id
+
+    def claim_fixed_entry(
+        self,
+        *,
+        price: float,
+        qty: float,
+        metadata: MarketMetadata,
+    ) -> tuple[float, int]:
+        """Reserve shared round budget without dynamic quantity reduction."""
+
+        with self._lock:
+            preflight = self.snapshot()
+            collateral = preflight.collateral
+            total_budget = min(
+                float(collateral.balance)
+                * float(self._settings.live_max_account_risk_fraction),
+                float(collateral.allowance),
+            )
+            remaining = max(
+                0.0,
+                total_budget
+                - self._existing_exposure
+                - sum(self._claimed_costs.values()),
+            )
+            estimated_cost = (
+                float(price) * float(qty)
+                + fee_total(price, qty, metadata.fee_rate, metadata.fee_exponent)
+                + builder_fee_total(price, qty, metadata.builder_taker_fee_bps)
+            )
+            if remaining <= 0 or estimated_cost > remaining + 1e-9:
+                raise RiskRejected("shared_account_risk_budget_exceeded")
+            claim_id = self._next_claim_id
+            self._next_claim_id += 1
+            self._claimed_costs[claim_id] = estimated_cost
+            return estimated_cost, claim_id
 
     def release_claim(self, claim_id: int) -> None:
         """Release a claim only when no durable order intent was created."""
@@ -1462,7 +1522,7 @@ def _entry_qty_for_decision(
     return sizing.qty, sizing, None
 
 
-def run_round(
+def _legacy_post_close_round(
     *,
     settings: Settings,
     store: StateStore,
@@ -1905,6 +1965,560 @@ def run_round(
     return decisions
 
 
+def _run_post_close_snapshot_round(
+    *,
+    settings: Settings,
+    store: StateStore,
+    public: PolymarketPublicClient,
+    executor: OrderExecutor,
+    live_gateway: Optional[V2ClobGateway],
+    round_start: int,
+    asset: Optional[str] = None,
+    round_preflight: Optional[_RoundAccountPreflight] = None,
+    clock: Callable[[], float] = time.time,
+    sleep: Callable[[float], None] = time.sleep,
+    notifier: Optional[Notifier] = None,
+    stream_factory: Callable[..., MarketBookStream] = MarketBookStream,
+    restart_fn: Optional[Callable[[], None]] = None,
+) -> List[PostCloseDecision]:
+    """Run the sole live entry path: snapshot at close+500ms, submit once."""
+
+    active_asset = str(asset or settings.asset).upper().strip()
+    slug, expected_start, round_end = current_crypto_5m_slug(active_asset, round_start)
+    if expected_start != int(round_start):
+        raise ValueError("run_round requires a 5-minute boundary")
+    if settings.strategy_family == "v9" and settings.is_live and not settings.v9_live_enabled:
+        raise LivePreflightError("V9 live trading requires AFTERTAKE_V9_LIVE_ENABLED=true")
+    if str(settings.order_type).upper().strip() != "GTC":
+        raise LivePreflightError("post-close live entry requires AFTERTAKE_ORDER_TYPE=GTC")
+    post_close_cfg = _post_close_snapshot_config_for_settings(settings)
+    market = public.market_by_slug(slug)
+    if not market.condition_id:
+        raise LivePreflightError("Gamma market has no condition ID")
+    store.observe_market(slug, market.condition_id, round_start)
+    yes_token = market.token_for_side("YES")
+    no_token = market.token_for_side("NO")
+    metadata = _build_dry_metadata(market)
+    notifier = notifier or Notifier(token=settings.telegram_token, chat_id=settings.telegram_chat_id)
+
+    observations: List[Any] = []
+    observations_lock = threading.Lock()
+
+    def record_book(book: Any) -> None:
+        try:
+            observed_at = float(book.observed_at)
+        except (AttributeError, TypeError, ValueError):
+            return
+        if not (observed_at == observed_at and abs(observed_at) != float("inf")):
+            return
+        with observations_lock:
+            if observations and observed_at <= float(observations[-1].observed_at):
+                return
+            observations.append(book)
+
+    def reset_books() -> None:
+        with observations_lock:
+            observations.clear()
+
+    stream = stream_factory(
+        yes_token_id=yes_token,
+        no_token_id=no_token,
+        on_book=record_book,
+        on_reset=reset_books,
+        clock=clock,
+        near_touch_band=0.02,
+        resolve_overrides=parse_resolve_overrides(settings.resolve_overrides),
+    )
+    decisions: List[PostCloseDecision] = []
+    preflight_done = settings.dry_run
+    live_preflight: Optional[LivePreflight] = None
+    preflight_at = float(round_end) - LIVE_PREFLIGHT_LEAD_S
+    snapshot_target_ts = float(round_end) + post_close_cfg.snapshot_delay_s
+    stream_health_confirmed = False
+    stream_component = "market_stream:%s" % active_asset
+    frozen_decision: Optional[PostCloseDecision] = None
+    snapshot_decision_ts: Optional[float] = None
+    round_claim_id: Optional[int] = None
+    claim_committed = False
+
+    def audit_post_close_snapshot(decision: PostCloseDecision, event_ts: float) -> None:
+        payload = {
+            **dict(decision.audit or {}),
+            "action": decision.action,
+            "reason": decision.reason,
+            "side": decision.side,
+            "winner_bid": decision.winner_bid,
+            "loser_bid": decision.loser_bid,
+            "entry_ask": decision.entry_ask,
+            "entry_ask_size": decision.entry_ask_size,
+            "snapshot_decision_ts": event_ts,
+            "post_close_snapshot_ts": (decision.audit or {}).get(
+                "post_close_snapshot_ts", snapshot_target_ts
+            ),
+            "code_sha": _resolve_code_sha(),
+        }
+        kind = (
+            "post_close_snapshot_frozen"
+            if decision.action == "enter"
+            else "post_close_snapshot_hold"
+        )
+        _audit(settings, store, kind, payload, slug)
+        _safe_notify(notifier, settings, store, kind, payload, slug)
+
+    def hold(reason: str, *, event_ts: float, audit: Optional[Dict[str, Any]] = None, side: str = "") -> None:
+        decision = PostCloseDecision("hold", reason, side=side, audit=audit or {})
+        decisions.append(decision)
+        audit_post_close_snapshot(decision, event_ts)
+
+    stream.start()
+    stream_generation = int(getattr(stream, "generation", 0))
+    try:
+        while True:
+            now = float(clock())
+            current_generation = int(getattr(stream, "generation", stream_generation))
+            if current_generation != stream_generation:
+                reconnect_count = int(getattr(stream, "reconnect_count", 0))
+                stream_generation = current_generation
+                _audit(
+                    settings,
+                    store,
+                    "market_stream_reconnected" if reconnect_count > 0 else "market_stream_initialized",
+                    {
+                        "generation": stream_generation,
+                        "reconnect_count": reconnect_count,
+                        "last_error": str(getattr(stream, "last_error", "") or ""),
+                    },
+                    slug,
+                )
+                if reconnect_count > 0:
+                    stream_health_confirmed = False
+                    stream_error = str(
+                        getattr(stream, "last_error", "") or "market stream disconnected"
+                    )
+                    _transition_component_and_notify(
+                        store=store,
+                        component=stream_component,
+                        status="unhealthy",
+                        detail=stream_error,
+                        notifier=notifier,
+                        settings=settings,
+                        kind="alert",
+                        payload={
+                            "reason": "market stream reconnecting",
+                            "component": stream_component,
+                            "generation": stream_generation,
+                            "reconnect_count": reconnect_count,
+                            "error_message": stream_error,
+                        },
+                        slug=slug,
+                        notify_on_no_transition=True,
+                    )
+            if getattr(stream, "ready", False) and not stream_health_confirmed:
+                stream_health_confirmed = True
+                _transition_component_and_notify(
+                    store=store,
+                    component=stream_component,
+                    status="healthy",
+                    detail="fresh paired book restored",
+                    notifier=notifier,
+                    settings=settings,
+                    kind="recovery_success",
+                    payload={
+                        "component": stream_component,
+                        "reason": "fresh paired book restored",
+                        "details": "generation=%s reconnect_count=%s"
+                        % (current_generation, int(getattr(stream, "reconnect_count", 0))),
+                    },
+                    slug=slug,
+                )
+
+            if now < preflight_at:
+                sleep(min(0.5, max(0.0, preflight_at - now)))
+                continue
+
+            if frozen_decision is None and not getattr(stream, "ready", False):
+                if now >= snapshot_target_ts:
+                    hold(
+                        "market_stream_not_ready_at_post_close_snapshot",
+                        event_ts=now,
+                        audit={
+                            "strategy_version": post_close_cfg.strategy_version,
+                            "close_ts": round_end,
+                            "post_close_snapshot_ts": snapshot_target_ts,
+                            "paired_max_age_s": post_close_cfg.paired_max_age_s,
+                            "source_timestamp_used_for_gate": False,
+                            "stream_ready": False,
+                        },
+                    )
+                    _transition_component_and_notify(
+                        store=store,
+                        component=stream_component,
+                        status="unhealthy",
+                        detail="paired book was not ready at close+0.5s",
+                        notifier=notifier,
+                        settings=settings,
+                        kind="alert",
+                        payload={
+                            "reason": "paired book was not ready at close+0.5s",
+                            "component": stream_component,
+                        },
+                        slug=slug,
+                        notify_on_no_transition=True,
+                    )
+                    break
+                sleep(min(POST_CLOSE_SNAPSHOT_SCHEDULER_POLL_INTERVAL_S, snapshot_target_ts - now))
+                continue
+
+            if not preflight_done:
+                if now > snapshot_target_ts + post_close_cfg.max_decision_lateness_s:
+                    hold(
+                        "post_close_snapshot_decision_too_late",
+                        event_ts=now,
+                        audit={
+                            "strategy_version": post_close_cfg.strategy_version,
+                            "close_ts": round_end,
+                            "post_close_snapshot_ts": snapshot_target_ts,
+                            "decision_cutoff_ts": snapshot_target_ts + post_close_cfg.max_decision_lateness_s,
+                            "component": "account_preflight",
+                        },
+                    )
+                    break
+                if live_gateway is None:
+                    raise RuntimeError("live Aftertake requires a CLOB V2 gateway")
+                phase = "account_preflight" if round_preflight is not None else "market_metadata"
+                try:
+                    if round_preflight is not None:
+                        live_preflight = round_preflight.snapshot()
+                        phase = "market_metadata"
+                    metadata = live_gateway.market_metadata(market.condition_id)
+                    _metadata_token_matches(market, metadata, "YES")
+                    _metadata_token_matches(market, metadata, "NO")
+                    required_cash = _required_cash(settings, metadata)
+                    if round_preflight is not None:
+                        _check_preflight_collateral(live_preflight, required_cash)
+                    else:
+                        geo = public.geoblock_status(settings.geo_endpoint)
+                        live_preflight = live_gateway.preflight(geo, required_cash)
+                    if settings.qty < metadata.min_order_size:
+                        raise RiskRejected("requested_qty_below_market_minimum")
+                except Exception as exc:
+                    _audit_asset_transport_error(
+                        settings,
+                        store,
+                        asset=active_asset,
+                        slug=slug,
+                        phase=phase,
+                        exc=exc,
+                        notifier=notifier,
+                    )
+                    if not _is_transient_transport_error(exc):
+                        raise
+                    hold("%s_transport_error" % phase, event_ts=float(clock()))
+                    break
+                preflight_done = True
+                continue
+
+            if frozen_decision is None:
+                if now < snapshot_target_ts:
+                    sleep(
+                        min(
+                            POST_CLOSE_SNAPSHOT_SCHEDULER_POLL_INTERVAL_S,
+                            snapshot_target_ts - now,
+                        )
+                    )
+                    continue
+                if now > snapshot_target_ts + post_close_cfg.max_decision_lateness_s:
+                    hold(
+                        "post_close_snapshot_decision_too_late",
+                        event_ts=now,
+                        audit={
+                            "strategy_version": post_close_cfg.strategy_version,
+                            "close_ts": round_end,
+                            "post_close_snapshot_ts": snapshot_target_ts,
+                            "decision_cutoff_ts": snapshot_target_ts + post_close_cfg.max_decision_lateness_s,
+                        },
+                    )
+                    break
+                with observations_lock:
+                    decision_observations = tuple(observations)
+                decision_ts = now
+                decision = select_post_close_snapshot_signal(
+                    decision_observations,
+                    round_end_ts=round_end,
+                    decision_ts=decision_ts,
+                    config=post_close_cfg,
+                )
+                decisions.append(decision)
+                snapshot_decision_ts = decision_ts
+                audit_post_close_snapshot(decision, decision_ts)
+                if decision.action != "enter":
+                    break
+                frozen_decision = decision
+                # No subsequent websocket event can change the frozen side.
+                # Fall through in this same control flow to the one submission.
+
+            if now > snapshot_target_ts + post_close_cfg.max_decision_lateness_s:
+                hold(
+                    "post_close_snapshot_decision_too_late",
+                    event_ts=now,
+                    side=frozen_decision.side,
+                    audit={
+                        **dict(frozen_decision.audit or {}),
+                        "close_ts": round_end,
+                        "decision_cutoff_ts": snapshot_target_ts + post_close_cfg.max_decision_lateness_s,
+                        "snapshot_decision_ts": snapshot_decision_ts,
+                    },
+                )
+                break
+
+            try:
+                entry_qty = float(settings.qty)
+                entry_price = float(post_close_cfg.limit_price)
+                displayed_ask_size = float(frozen_decision.entry_ask_size)
+                check_entry_risk(
+                    settings=settings,
+                    store=store,
+                    slug=slug,
+                    price=entry_price,
+                    qty=entry_qty,
+                    displayed_ask_size=displayed_ask_size,
+                    now_ts=now,
+                )
+                token_id = _metadata_token_matches(market, metadata, frozen_decision.side)
+                if settings.is_live and entry_qty < metadata.min_order_size:
+                    raise RiskRejected("requested_qty_below_market_minimum")
+                estimated_cost = (
+                    entry_price * entry_qty
+                    + fee_total(entry_price, entry_qty, metadata.fee_rate, metadata.fee_exponent)
+                    + builder_fee_total(entry_price, entry_qty, metadata.builder_taker_fee_bps)
+                )
+                if settings.dry_run:
+                    simulated_budget = (
+                        float(settings.dry_run_simulated_balance)
+                        * float(settings.live_max_account_risk_fraction)
+                    )
+                    if estimated_cost > simulated_budget + 1e-9:
+                        raise RiskRejected("dry_run_fixed_qty_exceeds_risk_budget")
+                elif round_preflight is not None:
+                    _, round_claim_id = round_preflight.claim_fixed_entry(
+                        price=entry_price,
+                        qty=entry_qty,
+                        metadata=metadata,
+                    )
+                else:
+                    if live_preflight is None:
+                        raise LivePreflightError("live_preflight_snapshot_missing")
+                    account_budget = min(
+                        float(live_preflight.collateral.balance)
+                        * float(settings.live_max_account_risk_fraction),
+                        float(live_preflight.collateral.allowance),
+                    )
+                    if estimated_cost > account_budget + 1e-9:
+                        raise RiskRejected("account_risk_budget_exceeded")
+                record = store.reserve_entry(
+                    slug=slug,
+                    condition_id=market.condition_id,
+                    round_start=round_start,
+                    token_id=token_id,
+                    side=frozen_decision.side,
+                    requested_qty=entry_qty,
+                    requested_price=entry_price,
+                    fee_rate=metadata.fee_rate,
+                    fee_exponent=metadata.fee_exponent,
+                    builder_taker_fee_bps=metadata.builder_taker_fee_bps,
+                )
+                if record is None:
+                    hold("market_already_reserved", event_ts=now, side=frozen_decision.side)
+                    break
+                claim_committed = True
+                timing_context = {
+                    "asset": active_asset,
+                    "round_start": int(round_start),
+                    "round_end_ts": float(round_end),
+                    "scheduled_close_ts": float(round_end),
+                    "decision_cutoff_ts": float(
+                        snapshot_target_ts + post_close_cfg.max_decision_lateness_s
+                    ),
+                    "decision_ts": float(snapshot_decision_ts if snapshot_decision_ts is not None else snapshot_target_ts),
+                    "snapshot_decision_ts": float(
+                        snapshot_decision_ts if snapshot_decision_ts is not None else snapshot_target_ts
+                    ),
+                    "post_close_snapshot_ts": float(snapshot_target_ts),
+                    "seconds_after_close_at_decision": float(
+                        (snapshot_decision_ts if snapshot_decision_ts is not None else snapshot_target_ts)
+                        - round_end
+                    ),
+                    "book_observed_ts": (frozen_decision.audit or {}).get("snapshot_observed_ts"),
+                    "post_close_snapshot_age_ms": (frozen_decision.audit or {}).get("snapshot_age_ms"),
+                    "immediate_taker_order_delay_enabled": metadata.immediate_taker_order_delay_enabled,
+                    "expected_taker_delay_ms": metadata.expected_taker_delay_ms,
+                }
+                result = executor.execute_reserved(
+                    record,
+                    metadata,
+                    fast=True,
+                    timing_context=timing_context,
+                )
+                result_raw = result.raw or {}
+                result_timing = result_raw.get("timing") or {}
+                submitted = result_raw.get("submit")
+                if result.dry_run or isinstance(submitted, dict):
+                    _audit(
+                        settings,
+                        store,
+                        "order_submitted",
+                        {
+                            "slug": slug,
+                            "side": frozen_decision.side,
+                            "order_id": result.order_id,
+                            "order_type": "GTC",
+                            "requested_qty": entry_qty,
+                            "requested_price": entry_price,
+                            "status": result.status,
+                            "event_ts": result_timing.get("submit_end_ts") or result.event_ts,
+                            "scheduled_close_ts": round_end,
+                            "actual_submit_ts": result_timing.get("submit_start_ts"),
+                            "submit_lag_ms": result_timing.get("submit_lag_ms"),
+                            "snapshot_decision_ts": snapshot_decision_ts,
+                            "post_close_snapshot_ts": snapshot_target_ts,
+                            "no_live_order": result.dry_run,
+                        },
+                        slug,
+                    )
+                _audit(
+                    settings,
+                    store,
+                    "entry_result",
+                    {
+                        **asdict(result),
+                        "strategy": (frozen_decision.audit or {}).get(
+                            "strategy_version", post_close_cfg.strategy_version
+                        ),
+                        "winner_bid": frozen_decision.winner_bid,
+                        "loser_bid": frozen_decision.loser_bid,
+                        "confirmations": 0,
+                        "classifier_audit": frozen_decision.audit,
+                        "available_size": frozen_decision.entry_ask_size,
+                        "snapshot_decision_ts": snapshot_decision_ts,
+                        "post_close_snapshot_ts": snapshot_target_ts,
+                        "scheduled_close_ts": round_end,
+                        "simulated_take": result.dry_run,
+                        "no_live_order": result.dry_run,
+                    },
+                    slug,
+                )
+                _notify_order_result(
+                    notifier,
+                    settings,
+                    store,
+                    result,
+                    slug,
+                    available_size=frozen_decision.entry_ask_size,
+                    simulated_take=result.dry_run,
+                )
+                if (
+                    round_claim_id is not None
+                    and result.terminal
+                    and result.filled_qty <= 0
+                    and round_preflight is not None
+                ):
+                    round_preflight.release_claim(round_claim_id)
+                    round_claim_id = None
+                if settings.is_live and _restart_after_executor_timeout(
+                    settings=settings,
+                    store=store,
+                    notifier=notifier,
+                    executor=executor,
+                    restart_fn=restart_fn,
+                    component="clob_executor:%s" % active_asset,
+                    slug=slug,
+                ):
+                    decisions.append(PostCloseDecision("hold", "clob_worker_timeout", side=frozen_decision.side))
+                if (
+                    result.submission_state == "unknown"
+                    and bool(result_raw.get("ambiguous_submission"))
+                ) or bool(result_raw.get("reconcile_transport_error")):
+                    decisions.append(PostCloseDecision("hold", "submit_transport_error", side=frozen_decision.side))
+                break
+            except (RiskRejected, LivePreflightError) as exc:
+                _audit(
+                    settings,
+                    store,
+                    "entry_blocked",
+                    {
+                        "reason": str(exc),
+                        "side": frozen_decision.side,
+                        "requested_qty": settings.qty,
+                        "requested_price": post_close_cfg.limit_price,
+                        "snapshot_decision_ts": snapshot_decision_ts,
+                        "post_close_snapshot_ts": snapshot_target_ts,
+                    },
+                    slug,
+                )
+                _safe_notify(
+                    notifier,
+                    settings,
+                    store,
+                    "alert",
+                    {
+                        "reason": "entry blocked by risk/preflight",
+                        "component": "entry_risk",
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
+                    },
+                    slug,
+                )
+                decisions.append(PostCloseDecision("hold", str(exc), side=frozen_decision.side))
+                break
+            except Exception as exc:
+                _audit(settings, store, "entry_runtime_error", {"error": str(exc)}, slug)
+                _safe_notify(notifier, settings, store, "alert", {"reason": str(exc)}, slug)
+                decisions.append(PostCloseDecision("hold", "entry_runtime_error", side=frozen_decision.side))
+                break
+            finally:
+                if round_claim_id is not None and not claim_committed and round_preflight is not None:
+                    round_preflight.release_claim(round_claim_id)
+    finally:
+        stream.close()
+
+    return decisions
+
+
+def run_round(
+    *,
+    settings: Settings,
+    store: StateStore,
+    public: PolymarketPublicClient,
+    executor: OrderExecutor,
+    live_gateway: Optional[V2ClobGateway],
+    round_start: int,
+    asset: Optional[str] = None,
+    round_preflight: Optional[_RoundAccountPreflight] = None,
+    clock: Callable[[], float] = time.time,
+    sleep: Callable[[float], None] = time.sleep,
+    notifier: Optional[Notifier] = None,
+    stream_factory: Callable[..., MarketBookStream] = MarketBookStream,
+    restart_fn: Optional[Callable[[], None]] = None,
+) -> List[PostCloseDecision]:
+    """Public live entry point; historical classifiers are not called."""
+
+    return _run_post_close_snapshot_round(
+        settings=settings,
+        store=store,
+        public=public,
+        executor=executor,
+        live_gateway=live_gateway,
+        round_start=round_start,
+        asset=asset,
+        round_preflight=round_preflight,
+        clock=clock,
+        sleep=sleep,
+        notifier=notifier,
+        stream_factory=stream_factory,
+        restart_fn=restart_fn,
+    )
+
+
 def _run_asset_rounds(
     *,
     settings: Settings,
@@ -1966,7 +2580,7 @@ def _run_asset_rounds(
     round_completion_s = (
         float(round_start)
         + CRYPTO_5M_WINDOW_S
-        + float(active_classifier_config().post_close_end_s)
+        + 5.0
         + float(settings.reconcile_timeout_s)
         + ASSET_ROUND_COMPLETION_GRACE_S
         - time.time()
@@ -2156,9 +2770,9 @@ def _select_next_round_start(
         current = int(observed_now)
         active_start = current - current % 300
         active_end = active_start + 300
-        classifier_cfg = active_classifier_config()
+        snapshot_cfg = PostCloseSnapshotConfig()
         minimum_lead_s = max(
-            classifier_cfg.pre_close_window_s + classifier_cfg.pre_close_latest_max_age_s,
+            snapshot_cfg.snapshot_delay_s + snapshot_cfg.paired_max_age_s,
             LIVE_PREFLIGHT_LEAD_S,
         )
         if (
@@ -2851,6 +3465,7 @@ def _run_round_loop(
                     "assets": list(settings.assets),
                     "pid": os.getpid(),
                     "code_sha": _resolve_code_sha(),
+                    **_post_close_runtime_payload(settings),
                 }
                 _audit(settings, store, "runtime_ready", ready_payload)
                 _safe_notify(notifier, settings, store, "ready", ready_payload)
@@ -2867,6 +3482,7 @@ def _run_round_loop(
                 "assets": list(settings.assets),
                 "pid": os.getpid(),
                 "code_sha": _resolve_code_sha(),
+                **_post_close_runtime_payload(settings),
             }
             _audit(settings, store, "runtime_ready", ready_payload)
             _safe_notify(notifier, settings, store, "ready", ready_payload)
@@ -3197,21 +3813,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _status_payload(settings: Settings, store: StateStore) -> Dict[str, Any]:
-    classifier_cfg = _classifier_config_for_settings(settings)
-    if settings.strategy_family == "v9":
-        confirmation_policy = "v9_lane_specific_fresh_paired"
-        confirmations: Any = {"R": 1, "S": classifier_cfg.sweep_confirmations}
-        stable_leader: Any = "S_only"
-    else:
-        confirmation_policy = (
-            "distinct_evidence_states"
-            if classifier_cfg.distinct_evidence_confirmations
-            else "fresh_paired_observations"
-        )
-        confirmations = classifier_cfg.confirmations
-        stable_leader = classifier_cfg.require_stable_post_close_leader
+    snapshot = _post_close_snapshot_config_for_settings(settings)
     return {
-        "strategy": classifier_cfg.strategy_version,
+        "strategy": snapshot.strategy_version,
         "strategy_family": settings.strategy_family,
         "v9_live_enabled": settings.v9_live_enabled,
         "dry_run": settings.dry_run,
@@ -3221,20 +3825,23 @@ def _status_payload(settings: Settings, store: StateStore) -> Dict[str, Any]:
         "live_quantity_floor_step": settings.live_quantity_floor_step,
         "dry_run_simulated_balance": settings.dry_run_simulated_balance,
         "resolve_overrides_enabled": bool(parse_resolve_overrides(settings.resolve_overrides)),
-        "entry_window_ms": [
-            int(classifier_cfg.post_close_start_s * 1000),
-            int(classifier_cfg.post_close_end_s * 1000),
+        "post_close_snapshot_delay_ms": int(snapshot.snapshot_delay_s * 1000),
+        "leader_bid_threshold": snapshot.leader_bid_threshold,
+        "leader_bid_comparison": "strictly_greater_than",
+        "paired_receive_max_age_ms": int(snapshot.paired_max_age_s * 1000),
+        "max_decision_lateness_ms": int(snapshot.max_decision_lateness_s * 1000),
+        "entry_limit_price": snapshot.limit_price,
+        "decision_window_ms": [
+            int(snapshot.snapshot_delay_s * 1000),
+            int((snapshot.snapshot_delay_s + snapshot.max_decision_lateness_s) * 1000),
         ],
-        "confirmations": confirmations,
-        "confirmation_spacing_ms": int(
-            classifier_cfg.confirmation_spacing_s * 1000
-        ),
-        "confirmation_policy": confirmation_policy,
-        "lane_confirmations": {"R": 1, "S": classifier_cfg.sweep_confirmations}
-        if settings.strategy_family == "v9"
-        else None,
-        "require_loser_refill_failure": classifier_cfg.require_loser_refill_failure,
-        "require_stable_post_close_leader": stable_leader,
+        "confirmation_policy": "none_post_close_snapshot_frozen",
+        "confirmations": 0,
+        "confirmation_spacing_ms": 0,
+        "post_close_classifier_for_live_entry": False,
+        "require_loser_refill_failure": False,
+        "require_stable_post_close_leader": False,
+        "order_type": settings.order_type,
         "max_daily_loss": settings.max_daily_loss,
         "max_open_positions": settings.max_open_positions,
         "max_consecutive_losses": settings.max_consecutive_losses,
@@ -3245,6 +3852,24 @@ def _status_payload(settings: Settings, store: StateStore) -> Dict[str, Any]:
         "unresolved_orders": len(store.unresolved_orders()),
         "execution_unknown": store.has_execution_unknown(),
         "telegram": redacted_chat(settings.telegram_chat_id),
+    }
+
+
+def _post_close_runtime_payload(settings: Settings) -> Dict[str, Any]:
+    """Return the non-secret close+500ms contract for BOOT/READY evidence."""
+
+    config = _post_close_snapshot_config_for_settings(settings)
+    return {
+        "strategy_version": config.strategy_version,
+        "post_close_snapshot_delay_s": config.snapshot_delay_s,
+        "leader_bid_threshold": config.leader_bid_threshold,
+        "leader_bid_comparison": "strictly_greater_than",
+        "paired_receive_max_age_s": config.paired_max_age_s,
+        "max_decision_lateness_s": config.max_decision_lateness_s,
+        "max_decision_lateness_ms": int(config.max_decision_lateness_s * 1000),
+        "entry_limit_price": config.limit_price,
+        "order_type": settings.order_type,
+        "post_close_classifier_for_live_entry": False,
     }
 
 
@@ -3335,6 +3960,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "assets": list(settings.assets),
                 "pid": os.getpid(),
                 "code_sha": _resolve_code_sha(),
+                **_post_close_runtime_payload(settings),
             }
             _audit(settings, store, "boot", boot_payload)
             _safe_notify(notifier, settings, store, "boot", boot_payload)

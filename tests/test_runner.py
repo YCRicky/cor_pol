@@ -78,8 +78,8 @@ class CaptureNotifier:
 class PairedStream:
     no_bid_size = 18
     no_near_depth = 18
-    yes_ask_size = 20
-    no_ask_size = 20
+    yes_ask_size = 60
+    no_ask_size = 60
 
     def __init__(self, *, on_book, **_kwargs):
         self._on_book = on_book
@@ -96,12 +96,17 @@ class PairedStream:
                 )
             )
 
+        # The live contract freezes from the latest local paired snapshot at
+        # close+0.5s; later observations are intentionally ignored for side
+        # selection. Keep eligible close-window snapshots for lifecycle tests.
+        add(1199.40, 0.47, 0.50, 0.85, 0.99, yes_near=18, no_near=18)
         add(1199.70, 0.47, 0.50, 0.51, 0.54, yes_near=18, no_near=18)
         add(1199.82, 0.48, 0.51, 0.50, 0.53, yes_near=18, no_near=18)
         add(1199.95, 0.49, 0.64, 0.50, 0.53, yes_near=18, no_near=18)
         add(1200.10, 0.35, 0.37, 0.58, 0.64, yes_size=2, no_size=self.no_bid_size, yes_near=2, no_near=self.no_near_depth)
         add(1200.22, 0.30, 0.37, 0.60, 0.64, yes_size=2, no_size=self.no_bid_size, yes_near=2, no_near=self.no_near_depth)
         add(1200.35, 0.28, 0.37, 0.61, 0.64, yes_size=2, no_size=self.no_bid_size, yes_near=2, no_near=self.no_near_depth)
+        add(1200.40, 0.28, 0.37, 0.85, 0.64, yes_size=2, no_size=self.no_bid_size, yes_near=2, no_near=self.no_near_depth)
         self.ready = True
 
     def close(self):
@@ -133,16 +138,18 @@ class StableWinnerAsk99PairedStream(PairedStream):
             self._on_book(
                 PairedBook(
                     observed_at=ts,
-                    yes=SideBook(yes_bid, yes_size, yes_size, yes_ask, 20, yes_near),
-                    no=SideBook(no_bid, no_size, no_size, no_ask, 20, no_near),
+                    yes=SideBook(yes_bid, yes_size, yes_size, yes_ask, 60, yes_near),
+                    no=SideBook(no_bid, no_size, no_size, no_ask, 60, no_near),
                 )
             )
 
+        add(1199.40, 0.20, 0.99, 0.85, 0.99, yes_size=2, no_size=60, yes_near=2, no_near=60)
         add(1199.70, 0.47, 0.50, 0.51, 0.54, yes_size=20, no_size=20, yes_near=20, no_near=20)
         add(1199.82, 0.48, 0.51, 0.50, 0.53, yes_size=20, no_size=20, yes_near=20, no_near=20)
         add(1199.95, 0.49, 0.52, 0.50, 0.53, yes_size=20, no_size=20, yes_near=20, no_near=20)
         for ts in (1200.060, 1200.064):
             add(ts, 0.20, 0.99, 0.70, 0.99, yes_size=2, no_size=20, yes_near=2, no_near=20)
+        add(1200.40, 0.20, 0.99, 0.85, 0.99, yes_size=2, no_size=60, yes_near=2, no_near=60)
         self.ready = True
 
 
@@ -222,7 +229,7 @@ def test_shadow_round_uses_websocket_classifier_and_never_sends_an_order(tmp_pat
             executor=OrderExecutor(settings, store),
             live_gateway=None,
             round_start=900,
-            clock=lambda: 1200.22,
+            clock=lambda: 1200.50,
             sleep=lambda _: None,
             stream_factory=DeepSupportPairedStream,
         )
@@ -231,7 +238,7 @@ def test_shadow_round_uses_websocket_classifier_and_never_sends_an_order(tmp_pat
         open_positions = store.open_positions()
         assert len(open_positions) == 1
         assert open_positions[0].state == "filled"
-        assert open_positions[0].filled_qty == 20
+        assert open_positions[0].filled_qty == 50
     finally:
         store.close()
 
@@ -266,7 +273,7 @@ def test_run_round_does_not_arm_market_data_watchdog_for_quiet_book(tmp_path):
             executor=OrderExecutor(settings, store),
             live_gateway=None,
             round_start=900,
-            clock=lambda: 1200.22,
+            clock=lambda: 1200.50,
             sleep=lambda _: None,
             stream_factory=stream_factory,
         )
@@ -314,7 +321,7 @@ def test_initial_stream_generation_transition_does_not_discard_qualifying_books(
             if not self.published:
                 streams[0].publish_initial_generation()
                 self.published = True
-                self.now = 1200.22
+                self.now = 1200.50
                 return
             self.now += seconds
 
@@ -381,7 +388,7 @@ def test_reconnect_generation_transition_does_not_discard_fresh_books(tmp_path):
             if not self.published:
                 streams[0].publish_reconnected_generation()
                 self.published = True
-                self.now = 1200.22
+                self.now = 1200.50
                 return
             self.now += seconds
 
@@ -410,7 +417,7 @@ def test_reconnect_generation_transition_does_not_discard_fresh_books(tmp_path):
         store.close()
 
 
-def test_runtime_status_reports_active_v8_guards(tmp_path):
+def test_runtime_status_reports_active_post_close_snapshot_contract(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     try:
         settings = Settings(
@@ -421,18 +428,23 @@ def test_runtime_status_reports_active_v8_guards(tmp_path):
 
         status = runner_module._status_payload(settings, store)
 
-        assert status["strategy"] == "aftertake_v8_1_stable_book_refill_guard_250ms"
-        assert status["entry_window_ms"] == [50, 250]
-        assert status["confirmations"] == 2
+        assert status["strategy"] == "aftertake_postclose_snapshot_v1_plus0_5_leader_bid_gt_080"
+        assert status["post_close_snapshot_delay_ms"] == 500
+        assert status["max_decision_lateness_ms"] == 250
+        assert status["decision_window_ms"] == [500, 750]
+        assert status["leader_bid_threshold"] == 0.80
+        assert status["leader_bid_comparison"] == "strictly_greater_than"
+        assert status["paired_receive_max_age_ms"] == 250
+        assert status["confirmations"] == 0
         assert status["confirmation_spacing_ms"] == 0
-        assert status["confirmation_policy"] == "fresh_paired_observations"
-        assert status["require_loser_refill_failure"] is True
-        assert status["require_stable_post_close_leader"] is True
+        assert status["confirmation_policy"] == "none_post_close_snapshot_frozen"
+        assert status["post_close_classifier_for_live_entry"] is False
+        assert status["order_type"] == "GTC"
     finally:
         store.close()
 
 
-def test_residual_ten_ask_is_supported_when_near_touch_depth_covers_final_size(tmp_path):
+def test_post_close_fixed_qty_blocks_insufficient_displayed_ask_depth(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     try:
         settings = Settings(dry_run=True, out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3")
@@ -443,14 +455,13 @@ def test_residual_ten_ask_is_supported_when_near_touch_depth_covers_final_size(t
             executor=OrderExecutor(settings, store),
             live_gateway=None,
             round_start=900,
-            clock=lambda: 1200.22,
+            clock=lambda: 1200.50,
             sleep=lambda _: None,
             stream_factory=ResidualTenSupportPairedStream,
         )
         assert any(item.action == "enter" and item.side == "NO" for item in decisions)
-        open_positions = store.open_positions()
-        assert len(open_positions) == 1
-        assert open_positions[0].filled_qty == 10
+        assert any("requested_qty_exceeds_displayed_ask_depth" in item.reason for item in decisions)
+        assert not store.open_positions()
     finally:
         store.close()
 
@@ -461,7 +472,7 @@ def test_live_round_emits_only_execution_lifecycle_messages(tmp_path):
         settings = Settings(dry_run=False, order_type="GTC", out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3")
         notifier = CaptureNotifier()
         gateway = InstantGateway()
-        timestamps = iter((1190.0, 1190.1, 1200.22, 1200.24))
+        timestamps = iter((1190.0, 1190.1, 1200.40, 1200.50))
         decisions = run_round(
             settings=settings,
             store=store,
@@ -469,21 +480,23 @@ def test_live_round_emits_only_execution_lifecycle_messages(tmp_path):
             executor=OrderExecutor(settings, store, gateway=gateway, wall_clock=lambda: 1200.36),
             live_gateway=gateway,
             round_start=900,
-            clock=lambda: next(timestamps, 1200.24),
+            clock=lambda: next(timestamps, 1200.50),
             sleep=lambda _: None,
             notifier=notifier,
             stream_factory=DeepSupportPairedStream,
         )
         assert any(item.action == "enter" for item in decisions)
         assert store.market_state("btc-updown-5m-900") == "open"
-        assert gateway.submitted_qty == 20
-        assert [message.splitlines()[0] for message in notifier.messages] == ["[Aftertake] ENTRY_CONFIRMED"]
-        assert "Market: slug=btc-updown-5m-900 side=NO" in notifier.messages[0]
-        assert "Qty: requested=20.0000 filled=20.0000 unfilled=0.0000 fill_rate=100.00%" in notifier.messages[0]
-        assert "decision_to_submit_ms=" in notifier.messages[0]
-        assert "reconcile_duration_ms=" in notifier.messages[0]
-        assert "Price: take=0.6400 avg=0.6400 available=20.0000" in notifier.messages[0]
-        assert store.open_positions()[0].raw["timing"]["book_observed_ts"] == 1200.22
+        assert gateway.submitted_qty == 50
+        headlines = [message.splitlines()[0] for message in notifier.messages]
+        assert "[Aftertake] POST_CLOSE_SNAPSHOT_FROZEN" in headlines
+        assert "[Aftertake] ENTRY_CONFIRMED" in headlines
+        assert "Market: slug=btc-updown-5m-900 side=NO" in notifier.messages[-1]
+        assert "Qty: requested=50.0000 filled=50.0000 unfilled=0.0000 fill_rate=100.00%" in notifier.messages[-1]
+        assert "decision_to_submit_ms=" in notifier.messages[-1]
+        assert "reconcile_duration_ms=" in notifier.messages[-1]
+        assert "Price: take=0.9900 avg=0.6400 available=60.0000" in notifier.messages[-1]
+        assert store.open_positions()[0].raw["timing"]["book_observed_ts"] == 1200.40
     finally:
         store.close()
 
@@ -536,7 +549,7 @@ def test_live_round_reaches_single_gtc_post_through_v2_gateway(tmp_path):
             return {
                 "id": order_id,
                 "status": "matched",
-                "size_matched": "20",
+                "size_matched": "50",
                 "average_price": "0.64",
             }
 
@@ -562,7 +575,7 @@ def test_live_round_reaches_single_gtc_post_through_v2_gateway(tmp_path):
             out_dir=tmp_path / "out",
             state_db=tmp_path / "state.sqlite3",
         )
-        timestamps = iter((1190.0, 1190.1, 1200.22, 1200.24))
+        timestamps = iter((1190.0, 1190.1, 1200.40, 1200.50))
 
         decisions = run_round(
             settings=settings,
@@ -571,7 +584,7 @@ def test_live_round_reaches_single_gtc_post_through_v2_gateway(tmp_path):
             executor=OrderExecutor(settings, store, gateway=gateway),
             live_gateway=gateway,
             round_start=900,
-            clock=lambda: next(timestamps, 1200.24),
+            clock=lambda: next(timestamps, 1200.50),
             sleep=lambda _seconds: None,
             notifier=CaptureNotifier(),
             stream_factory=StableWinnerAsk99PairedStream,
@@ -619,13 +632,13 @@ def test_post_close_hold_polling_uses_five_millisecond_cadence(tmp_path):
         )
 
         assert decisions
+        assert decisions[0].reason == "post_close_snapshot_no_paired_observation"
         assert clock.sleeps
-        assert set(clock.sleeps) == {0.005}
     finally:
         store.close()
 
 
-def test_qualifying_decision_audit_is_deferred_until_after_submit(tmp_path, monkeypatch):
+def test_post_close_snapshot_decision_audit_precedes_submit(tmp_path, monkeypatch):
     store = StateStore(tmp_path / "state.sqlite3")
     try:
         settings = Settings(dry_run=False, order_type="GTC", out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3")
@@ -636,7 +649,7 @@ def test_qualifying_decision_audit_is_deferred_until_after_submit(tmp_path, monk
         original_execute = executor.execute_reserved
 
         def track_audit(settings, store, kind, payload, slug=""):
-            if kind == "aftertake_decision":
+            if kind == "post_close_snapshot_frozen":
                 events.append("decision_audit")
             return original_audit(settings, store, kind, payload, slug)
 
@@ -646,7 +659,7 @@ def test_qualifying_decision_audit_is_deferred_until_after_submit(tmp_path, monk
 
         monkeypatch.setattr(runner_module, "_audit", track_audit)
         monkeypatch.setattr(executor, "execute_reserved", track_execute)
-        timestamps = iter((1190.0, 1190.1, 1200.22, 1200.24))
+        timestamps = iter((1190.0, 1190.1, 1200.40, 1200.50))
 
         run_round(
             settings=settings,
@@ -655,23 +668,23 @@ def test_qualifying_decision_audit_is_deferred_until_after_submit(tmp_path, monk
             executor=executor,
             live_gateway=gateway,
             round_start=900,
-            clock=lambda: next(timestamps, 1200.24),
+            clock=lambda: next(timestamps, 1200.50),
             sleep=lambda _: None,
             stream_factory=DeepSupportPairedStream,
         )
 
-        assert events == ["submit", "decision_audit"]
+        assert events == ["decision_audit", "submit"]
     finally:
         store.close()
 
 
-def test_live_round_blocks_dynamic_quantity_that_the_observed_bid_support_cannot_cover(tmp_path):
+def test_live_round_blocks_fixed_quantity_that_observed_ask_depth_cannot_cover(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     try:
-        settings = Settings(dry_run=False, order_type="GTC", out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3")
+        settings = Settings(dry_run=False, qty=70, order_type="GTC", out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3")
         notifier = CaptureNotifier()
         gateway = InstantGateway()
-        timestamps = iter((1190.0, 1190.1, 1200.22))
+        timestamps = iter((1190.0, 1190.1, 1200.50))
         decisions = run_round(
             settings=settings,
             store=store,
@@ -679,7 +692,7 @@ def test_live_round_blocks_dynamic_quantity_that_the_observed_bid_support_cannot
             executor=OrderExecutor(settings, store, gateway=gateway),
             live_gateway=gateway,
             round_start=900,
-            clock=lambda: next(timestamps, 1200.25),
+            clock=lambda: next(timestamps, 1200.50),
             sleep=lambda _: None,
             notifier=notifier,
             stream_factory=PairedStream,
@@ -687,9 +700,9 @@ def test_live_round_blocks_dynamic_quantity_that_the_observed_bid_support_cannot
         assert any(item.action == "enter" for item in decisions)
         assert gateway.submitted_qty == 0
         assert store.market_state("btc-updown-5m-900") == "observing"
-        assert len(notifier.messages) == 1
-        assert notifier.messages[0].startswith("[Aftertake] ALERT")
-        assert "entry blocked by risk/preflight" in notifier.messages[0]
+        alerts = [message for message in notifier.messages if message.startswith("[Aftertake] ALERT")]
+        assert len(alerts) == 1
+        assert "entry blocked by risk/preflight" in alerts[0]
     finally:
         store.close()
 
@@ -813,7 +826,7 @@ def test_shared_account_snapshot_claims_cost_atomically_across_all_assets(tmp_pa
             assert required_cash == 0.0
             return LivePreflight(
                 geo=geo,
-                collateral=BalanceAllowance(balance=100.0, allowance=80.0, raw={}),
+                collateral=BalanceAllowance(balance=200.0, allowance=200.0, raw={}),
                 closed_only=False,
             )
 
@@ -863,7 +876,7 @@ def test_shared_account_snapshot_claims_cost_atomically_across_all_assets(tmp_pa
         def __call__(self):
             calls = getattr(self._local, "calls", 0) + 1
             self._local.calls = calls
-            return 1190.0 if calls <= 2 else 1200.22
+            return 1190.0 if calls <= 2 else 1200.50
 
     store = StateStore(tmp_path / "state.sqlite3")
     try:
@@ -896,7 +909,7 @@ def test_shared_account_snapshot_claims_cost_atomically_across_all_assets(tmp_pa
             sleep=lambda _seconds: None,
         )
 
-        account_budget = min(100.0 * 0.50, 80.0)
+        account_budget = min(200.0 * 0.50, 200.0)
         assert sorted(results) == sorted(assets)
         assert gateway.preflight_calls == 1
         assert gateway.submitted_cost > 0.0
@@ -998,7 +1011,8 @@ def test_live_asset_transport_failure_isolated_and_schedules_runtime_rebuild(tmp
         assert asset_results["ETH"][-1].reason == "market_metadata_transport_error"
         assert all(asset_results[asset] for asset in ("BTC", "XRP"))
         alerts = [message for message in notifier.messages if message.startswith("[Aftertake] ALERT")]
-        assert len(alerts) == 1
+        transport_alerts = [message for message in alerts if "asset transport error" in message]
+        assert len(transport_alerts) == 1
         assert any(message.startswith("[Aftertake] RUNTIME_READY") for message in notifier.messages)
         audit = store._conn.execute(
             """SELECT slug, payload_json FROM audit_events
@@ -1715,7 +1729,7 @@ def test_service_main_reports_boot_before_any_live_pm_connection(monkeypatch, tm
     def assert_boot_then_stop(**_kwargs):
         assert len(notifier.messages) == 1
         assert notifier.messages[0].startswith(
-            "[Aftertake] BOOT\nmode=LIVE qty=5.0000 assets=BTC,ETH,XRP,HYPE,DOGE,SOL\n"
+                "[Aftertake] BOOT\nmode=LIVE qty=50.0000 assets=BTC,ETH,XRP,HYPE,DOGE,SOL\n"
             f"pid=4242 code_sha={code_sha}\n"
             "multi-asset per-asset risk gates + SQLite recovery + CLOB V2 preflight\n"
         )
