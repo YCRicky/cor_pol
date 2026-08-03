@@ -1986,10 +1986,11 @@ def _run_post_close_snapshot_round(
     metadata = _build_dry_metadata(market)
     notifier = notifier or Notifier(token=settings.telegram_token, chat_id=settings.telegram_chat_id)
 
-    observations: List[Any] = []
+    latest_observation: Optional[Any] = None
     observations_lock = threading.Lock()
 
     def record_book(book: Any) -> None:
+        nonlocal latest_observation
         try:
             observed_at = float(book.observed_at)
         except (AttributeError, TypeError, ValueError):
@@ -1997,13 +1998,17 @@ def _run_post_close_snapshot_round(
         if not (observed_at == observed_at and abs(observed_at) != float("inf")):
             return
         with observations_lock:
-            if observations and observed_at <= float(observations[-1].observed_at):
+            if latest_observation is not None and observed_at <= float(latest_observation.observed_at):
                 return
-            observations.append(book)
+            # The strategy consumes only the newest causal snapshot at T+500ms.
+            # Retaining the full high-frequency stream wastes memory and can
+            # trigger the EC2 OOM killer without changing the decision.
+            latest_observation = book
 
     def reset_books() -> None:
+        nonlocal latest_observation
         with observations_lock:
-            observations.clear()
+            latest_observation = None
 
     stream = stream_factory(
         yes_token_id=yes_token,
@@ -2016,15 +2021,12 @@ def _run_post_close_snapshot_round(
     )
     decisions: List[PostCloseDecision] = []
     preflight_done = settings.dry_run
-    live_preflight: Optional[LivePreflight] = None
     preflight_at = float(round_end) - LIVE_PREFLIGHT_LEAD_S
     snapshot_target_ts = float(round_end) + post_close_cfg.snapshot_delay_s
     stream_health_confirmed = False
     stream_component = "market_stream:%s" % active_asset
     frozen_decision: Optional[PostCloseDecision] = None
     snapshot_decision_ts: Optional[float] = None
-    round_claim_id: Optional[int] = None
-    claim_committed = False
 
     def audit_post_close_snapshot(decision: PostCloseDecision, event_ts: float) -> None:
         payload = {
@@ -2173,19 +2175,14 @@ def _run_post_close_snapshot_round(
                 phase = "account_preflight" if round_preflight is not None else "market_metadata"
                 try:
                     if round_preflight is not None:
-                        live_preflight = round_preflight.snapshot()
+                        round_preflight.snapshot()
                         phase = "market_metadata"
                     metadata = live_gateway.market_metadata(market.condition_id)
                     _metadata_token_matches(market, metadata, "YES")
                     _metadata_token_matches(market, metadata, "NO")
-                    required_cash = _required_cash(settings, metadata)
-                    if round_preflight is not None:
-                        _check_preflight_collateral(live_preflight, required_cash)
-                    else:
+                    if round_preflight is None:
                         geo = public.geoblock_status(settings.geo_endpoint)
-                        live_preflight = live_gateway.preflight(geo, required_cash)
-                    if settings.qty < metadata.min_order_size:
-                        raise RiskRejected("requested_qty_below_market_minimum")
+                        live_gateway.preflight(geo, 0.0)
                 except Exception as exc:
                     _audit_asset_transport_error(
                         settings,
@@ -2225,7 +2222,9 @@ def _run_post_close_snapshot_round(
                     )
                     break
                 with observations_lock:
-                    decision_observations = tuple(observations)
+                    decision_observations = (
+                        (latest_observation,) if latest_observation is not None else ()
+                    )
                 decision_ts = now
                 decision = select_post_close_snapshot_signal(
                     decision_observations,
@@ -2259,47 +2258,7 @@ def _run_post_close_snapshot_round(
             try:
                 entry_qty = float(settings.qty)
                 entry_price = float(post_close_cfg.limit_price)
-                displayed_ask_size = float(frozen_decision.entry_ask_size)
-                check_entry_risk(
-                    settings=settings,
-                    store=store,
-                    slug=slug,
-                    price=entry_price,
-                    qty=entry_qty,
-                    displayed_ask_size=displayed_ask_size,
-                    now_ts=now,
-                )
                 token_id = _metadata_token_matches(market, metadata, frozen_decision.side)
-                if settings.is_live and entry_qty < metadata.min_order_size:
-                    raise RiskRejected("requested_qty_below_market_minimum")
-                estimated_cost = (
-                    entry_price * entry_qty
-                    + fee_total(entry_price, entry_qty, metadata.fee_rate, metadata.fee_exponent)
-                    + builder_fee_total(entry_price, entry_qty, metadata.builder_taker_fee_bps)
-                )
-                if settings.dry_run:
-                    simulated_budget = (
-                        float(settings.dry_run_simulated_balance)
-                        * float(settings.live_max_account_risk_fraction)
-                    )
-                    if estimated_cost > simulated_budget + 1e-9:
-                        raise RiskRejected("dry_run_fixed_qty_exceeds_risk_budget")
-                elif round_preflight is not None:
-                    _, round_claim_id = round_preflight.claim_fixed_entry(
-                        price=entry_price,
-                        qty=entry_qty,
-                        metadata=metadata,
-                    )
-                else:
-                    if live_preflight is None:
-                        raise LivePreflightError("live_preflight_snapshot_missing")
-                    account_budget = min(
-                        float(live_preflight.collateral.balance)
-                        * float(settings.live_max_account_risk_fraction),
-                        float(live_preflight.collateral.allowance),
-                    )
-                    if estimated_cost > account_budget + 1e-9:
-                        raise RiskRejected("account_risk_budget_exceeded")
                 record = store.reserve_entry(
                     slug=slug,
                     condition_id=market.condition_id,
@@ -2315,7 +2274,6 @@ def _run_post_close_snapshot_round(
                 if record is None:
                     hold("market_already_reserved", event_ts=now, side=frozen_decision.side)
                     break
-                claim_committed = True
                 timing_context = {
                     "asset": active_asset,
                     "round_start": int(round_start),
@@ -2401,14 +2359,6 @@ def _run_post_close_snapshot_round(
                     available_size=frozen_decision.entry_ask_size,
                     simulated_take=result.dry_run,
                 )
-                if (
-                    round_claim_id is not None
-                    and result.terminal
-                    and result.filled_qty <= 0
-                    and round_preflight is not None
-                ):
-                    round_preflight.release_claim(round_claim_id)
-                    round_claim_id = None
                 if settings.is_live and _report_executor_timeout(
                     settings=settings,
                     store=store,
@@ -2459,9 +2409,6 @@ def _run_post_close_snapshot_round(
                 _safe_notify(notifier, settings, store, "alert", {"reason": str(exc)}, slug)
                 decisions.append(PostCloseDecision("hold", "entry_runtime_error", side=frozen_decision.side))
                 break
-            finally:
-                if round_claim_id is not None and not claim_committed and round_preflight is not None:
-                    round_preflight.release_claim(round_claim_id)
     finally:
         stream.close()
 
