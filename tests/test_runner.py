@@ -1,4 +1,5 @@
 import json
+import signal
 import threading
 import time
 from pathlib import Path
@@ -1056,9 +1057,6 @@ def test_unhandled_asset_transport_failure_isolated_and_rebuilds_runtime(tmp_pat
             def beat(self, _stage):
                 return None
 
-            def request_restart(self, *_args, **_kwargs):
-                restart_requested.append(True)
-
             def restart_after_diagnostics(self):
                 restart_requested.append(True)
 
@@ -1224,6 +1222,7 @@ def test_asset_transport_error_sends_recovery_success_on_next_clean_round(tmp_pa
 
 def test_asset_supervisor_returns_timeout_without_waiting_for_hung_worker(tmp_path, monkeypatch):
     release = threading.Event()
+    restarts = []
     store = StateStore(tmp_path / "state.sqlite3")
     try:
         settings = Settings(
@@ -1248,16 +1247,53 @@ def test_asset_supervisor_returns_timeout_without_waiting_for_hung_worker(tmp_pa
             live_gateway=None,
             round_start=900,
             timeout_s=0.02,
+            restart_fn=lambda: restarts.append("restart"),
         )
         elapsed = time.monotonic() - started
         assert elapsed < 0.5
         assert results["BTC"][-1].reason == "asset_round_timeout"
         assert results["ETH"][-1].reason == "eth_complete"
+        assert restarts == []
         timeout_audit = store._conn.execute(
             "SELECT payload_json FROM audit_events WHERE kind = 'asset_transport_error' AND slug = 'btc-updown-5m-900'"
         ).fetchone()
         assert timeout_audit is not None
         assert json.loads(timeout_audit["payload_json"])["phase"] == "asset_round_timeout"
+    finally:
+        release.set()
+        store.close()
+
+
+def test_live_asset_supervisor_timeout_is_the_only_worker_restart_boundary(tmp_path, monkeypatch):
+    release = threading.Event()
+    restarts = []
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        settings = Settings(
+            dry_run=False,
+            assets=("BTC",),
+            out_dir=tmp_path / "out",
+            state_db=tmp_path / "state.sqlite3",
+        )
+
+        def hung_round(**_kwargs):
+            release.wait(timeout=2.0)
+            return [runner_module.PostCloseDecision("hold", "late_complete")]
+
+        monkeypatch.setattr(runner_module, "run_round", hung_round)
+        results = _run_asset_rounds(
+            settings=settings,
+            store=store,
+            public=FakePublic(),
+            executor=OrderExecutor(settings, store),
+            live_gateway=None,
+            round_start=900,
+            timeout_s=0.02,
+            restart_fn=lambda: restarts.append("restart"),
+        )
+
+        assert results["BTC"][-1].reason == "asset_round_timeout"
+        assert restarts == ["restart"]
     finally:
         release.set()
         store.close()
@@ -1301,20 +1337,28 @@ def test_asset_supervisor_budget_covers_remaining_active_round(tmp_path, monkeyp
         store.close()
 
 
-def test_runtime_watchdog_requests_process_restart_after_active_stall():
+def test_runtime_watchdog_stall_alerts_and_continues_without_exit():
     exits = []
-    watchdog = RuntimeWatchdog(stale_after_s=0.01, interval_s=0.001, exit_fn=exits.append)
+    alerts = []
+    watchdog = RuntimeWatchdog(
+        stale_after_s=0.01,
+        interval_s=0.001,
+        exit_fn=exits.append,
+        fatal_callback=lambda reason, payload: alerts.append((reason, payload)),
+    )
     watchdog.start()
     try:
         deadline = time.monotonic() + 0.5
         while not exits and time.monotonic() < deadline:
             time.sleep(0.005)
-        assert exits == [1]
+        assert alerts
+        assert exits == []
+        assert watchdog._thread is not None and watchdog._thread.is_alive()
     finally:
         watchdog.stop()
 
 
-def test_runtime_watchdog_persists_fatal_diagnostics_before_restart():
+def test_runtime_watchdog_stall_alerts_without_process_restart():
     events = []
     watchdog = RuntimeWatchdog(
         stale_after_s=0.01,
@@ -1327,34 +1371,9 @@ def test_runtime_watchdog_persists_fatal_diagnostics_before_restart():
         deadline = time.monotonic() + 0.5
         while not events and time.monotonic() < deadline:
             time.sleep(0.005)
-        assert events == ["alert", "restart"]
+        assert events == ["alert"]
     finally:
         watchdog.stop()
-
-
-def test_runtime_watchdog_manual_restart_persists_fatal_once_before_exit():
-    events = []
-    watchdog = RuntimeWatchdog(
-        stale_after_s=1.0,
-        interval_s=1.0,
-        exit_fn=lambda _code: events.append("restart"),
-        fatal_callback=lambda reason, payload: events.append(("alert", reason, payload)),
-    )
-
-    watchdog.request_restart(
-        "asset supervisor timeout",
-        {"asset": "ETH", "action": "process_restart_requested"},
-    )
-    watchdog.request_restart(
-        "asset supervisor timeout",
-        {"asset": "ETH", "action": "process_restart_requested"},
-    )
-
-    assert [event if isinstance(event, str) else event[0] for event in events] == [
-        "alert",
-        "restart",
-    ]
-    assert events[0][1] == "asset supervisor timeout"
 
 
 def test_runtime_watchdog_does_not_restart_while_waiting_for_boundary():
@@ -1381,17 +1400,24 @@ def test_runtime_watchdog_does_not_restart_while_active_round_is_waiting():
         watchdog.stop()
 
 
-def test_runtime_watchdog_active_round_exemption_has_a_finite_deadline(monkeypatch):
+def test_runtime_watchdog_active_round_stall_alerts_without_exit(monkeypatch):
     exits = []
+    alerts = []
     monkeypatch.setattr(runner_module, "RUNTIME_ACTIVE_STAGE_TIMEOUT_S", 0.02)
-    watchdog = RuntimeWatchdog(stale_after_s=0.01, interval_s=0.001, exit_fn=exits.append)
+    watchdog = RuntimeWatchdog(
+        stale_after_s=0.01,
+        interval_s=0.001,
+        exit_fn=exits.append,
+        fatal_callback=lambda reason, payload: alerts.append((reason, payload)),
+    )
     watchdog.beat("active_round")
     watchdog.start()
     try:
         deadline = time.monotonic() + 0.5
         while not exits and time.monotonic() < deadline:
             time.sleep(0.005)
-        assert exits == [1]
+        assert alerts
+        assert exits == []
     finally:
         watchdog.stop()
 
@@ -1434,50 +1460,36 @@ def test_fatal_restart_runs_after_diagnostics_persist(tmp_path):
     assert events == ["alert_outbox_persisted", "restart"]
 
 
-def test_heartbeat_fatal_persists_alert_before_process_restart(tmp_path):
+def test_heartbeat_fatal_alerts_without_process_restart(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     notifier = CaptureNotifier()
-    events = []
-
-    def restart():
-        events.append("restart")
-        events.append("alert" if notifier.messages else "missing_alert")
 
     try:
-        runner_module._restart_after_heartbeat_fatal(
+        runner_module._report_heartbeat_fatal(
             settings=Settings(state_db=tmp_path / "state.sqlite3"),
             store=store,
             notifier=notifier,
             reason="heartbeat status queue is full",
             payload={"consecutive_failures": 3},
-            restart_fn=restart,
         )
-        assert events == ["restart", "alert"]
         assert notifier.messages[0].startswith("[Aftertake] ALERT")
     finally:
         store.close()
 
 
-def test_executor_timeout_persists_alert_before_process_restart(tmp_path):
+def test_executor_timeout_alerts_without_process_restart(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     notifier = CaptureNotifier()
     executor = OrderExecutor(Settings(state_db=tmp_path / "state.sqlite3"), store)
-    executor._mark_process_restart_required("get_order probe exceeded reconciliation deadline")
-    events = []
-
-    def restart():
-        events.append("restart")
-        events.append("alert" if notifier.messages else "missing_alert")
-
+    executor._mark_read_probe_stalled("get_order probe exceeded reconciliation deadline")
     try:
-        assert runner_module._restart_after_executor_timeout(
+        assert runner_module._report_executor_timeout(
             settings=Settings(state_db=tmp_path / "state.sqlite3"),
             store=store,
             notifier=notifier,
             executor=executor,
-            restart_fn=restart,
         ) is True
-        assert events == ["restart", "alert"]
+        assert notifier.messages[0].startswith("[Aftertake] ALERT")
     finally:
         store.close()
 
@@ -1783,6 +1795,67 @@ def test_service_main_reports_boot_before_any_live_pm_connection(monkeypatch, tm
     assert runner_module.main(["--forever"]) == 0
 
 
+def test_sigterm_raises_system_exit_and_closes_runtime_resources(monkeypatch, tmp_path):
+    settings = Settings(
+        dry_run=True,
+        out_dir=tmp_path / "out",
+        state_db=tmp_path / "state.sqlite3",
+    )
+    store = StateStore(settings.state_db)
+    closed = []
+    original_store_close = store.close
+
+    def close_store():
+        closed.append("store")
+        original_store_close()
+
+    store.close = close_store
+
+    class FakeExecutor:
+        def __init__(self, **_kwargs):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+            closed.append("executor")
+
+    class NoLock:
+        def __init__(self, _path):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    registered = []
+
+    def capture_signal(signum, handler):
+        if signum == signal.SIGTERM:
+            registered.append(handler)
+
+    monkeypatch.setattr(runner_module.Settings, "from_env", staticmethod(lambda: settings))
+    monkeypatch.setattr(runner_module, "StateStore", lambda _path: store)
+    monkeypatch.setattr(runner_module, "OrderExecutor", FakeExecutor)
+    monkeypatch.setattr(runner_module, "RuntimeLock", NoLock)
+    monkeypatch.setattr(runner_module, "PolymarketPublicClient", lambda **_kwargs: object())
+    monkeypatch.setattr(runner_module, "Notifier", lambda **_kwargs: CaptureNotifier())
+    monkeypatch.setattr(runner_module.signal, "signal", capture_signal)
+
+    def stop_round(**_kwargs):
+        assert registered
+        registered[0](signal.SIGTERM, None)
+
+    monkeypatch.setattr(runner_module, "_run_round_loop", stop_round)
+
+    with pytest.raises(SystemExit) as exc_info:
+        runner_module.main(["--forever"])
+
+    assert exc_info.value.code == 0
+    assert closed == ["executor", "store"]
+
+
 def _boot_source_file(tmp_path: Path) -> Path:
     source_file = tmp_path / "src" / "aftertake" / "runner.py"
     source_file.parent.mkdir(parents=True)
@@ -1994,14 +2067,14 @@ def test_reconcile_submitted_orders_stops_after_uncancellable_timeout(tmp_path):
             records.append(record)
 
         class TimeoutExecutor:
-            process_restart_required = False
+            read_probe_stalled = False
 
             def __init__(self):
                 self.calls = 0
 
             def reconcile_existing_once(self, record):
                 self.calls += 1
-                self.process_restart_required = True
+                self.read_probe_stalled = True
                 return OrderExecutor(
                     Settings(dry_run=False),
                     StateStore.__new__(StateStore),
@@ -2171,10 +2244,9 @@ def test_slow_post_round_maintenance_does_not_block_next_round_scheduler(
         store.close()
 
 
-def test_uncancellable_maintenance_requests_process_restart(tmp_path, monkeypatch):
+def test_uncancellable_maintenance_alerts_without_process_restart(tmp_path, monkeypatch):
     store = StateStore(tmp_path / "state.sqlite3")
     release = threading.Event()
-    restarted = threading.Event()
 
     def hung_settlement(**_kwargs):
         release.wait(timeout=1.0)
@@ -2186,12 +2258,11 @@ def test_uncancellable_maintenance_requests_process_restart(tmp_path, monkeypatc
         store=store,
         public=FakePublic(),
         notifier=CaptureNotifier(),
-        restart_fn=restarted.set,
         timeout_s=0.03,
     )
     try:
         assert worker.trigger(OrderExecutor(Settings(), store)) is True
-        assert restarted.wait(0.5), "hung maintenance remained silently detached"
+        time.sleep(0.1)
         deadline = time.monotonic() + 0.5
         while (
             store.component_status("maintenance_worker") != "unhealthy"
