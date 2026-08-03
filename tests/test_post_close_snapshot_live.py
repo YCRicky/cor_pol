@@ -53,7 +53,8 @@ def test_post_close_snapshot_uses_close_plus_half_second_and_latest_local_snapsh
     [
         ([_book(100.40, 0.80, 0.70)], "post_close_leader_bid_not_strictly_above_threshold"),
         ([_book(100.40, 0.80, 0.80)], "post_close_snapshot_bid_tie"),
-        ([_book(100.40, None, 0.80)], "post_close_snapshot_missing_or_invalid_bid"),
+        ([_book(100.40, None, 0.80)], "post_close_leader_bid_not_strictly_above_threshold"),
+        ([_book(100.40, None, None)], "post_close_snapshot_missing_or_invalid_bid"),
         ([_book(100.20, 0.90, 0.70)], "post_close_snapshot_stale"),
         ([_book(100.60, 0.90, 0.70)], "post_close_snapshot_no_paired_observation"),
     ],
@@ -94,6 +95,23 @@ def test_post_close_snapshot_strict_threshold_and_not_due_boundary():
     )
     assert too_late.action == "hold"
     assert too_late.reason == "post_close_snapshot_decision_too_late"
+
+
+@pytest.mark.parametrize(
+    ("yes_bid", "no_bid", "expected_side"),
+    [(0.99, None, "YES"), (None, 0.99, "NO")],
+)
+def test_post_close_snapshot_enters_when_only_one_side_has_a_valid_bid(
+    yes_bid, no_bid, expected_side
+):
+    decision = select_post_close_snapshot_signal(
+        [_book(100.49, yes_bid, no_bid)],
+        round_end_ts=100.0,
+    )
+    assert decision.action == "enter"
+    assert decision.side == expected_side
+    assert decision.winner_bid == pytest.approx(0.99)
+    assert decision.loser_bid is None
 
 
 def test_post_close_snapshot_freeze_is_not_changed_by_later_leader_flip():

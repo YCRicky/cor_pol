@@ -155,21 +155,24 @@ def select_post_close_snapshot_signal(
 
     yes_bid = book.yes.best_bid
     no_bid = book.no.best_bid
-    if not (_valid_bid(yes_bid) and _valid_bid(no_bid)):
+    yes_valid = _valid_bid(yes_bid)
+    no_valid = _valid_bid(no_bid)
+    if not yes_valid and not no_valid:
         return PostCloseDecision("hold", "post_close_snapshot_missing_or_invalid_bid", audit=audit)
-    if float(yes_bid) == float(no_bid):
+    if yes_valid and no_valid and float(yes_bid) == float(no_bid):
         return PostCloseDecision("hold", "post_close_snapshot_bid_tie", audit=audit)
 
-    side = "YES" if float(yes_bid) > float(no_bid) else "NO"
+    side = "YES" if yes_valid and (not no_valid or float(yes_bid) > float(no_bid)) else "NO"
     winner = book.yes if side == "YES" else book.no
     loser = book.no if side == "YES" else book.yes
     winner_bid = float(winner.best_bid)
+    loser_bid = float(loser.best_bid) if _valid_bid(loser.best_bid) else None
     audit.update(
         {
             "selected_side": side,
             "selected_token": side,
             "winner_best_bid": winner_bid,
-            "loser_best_bid": float(loser.best_bid),
+            "loser_best_bid": loser_bid,
             "winner_best_ask": winner.best_ask,
             "winner_ask_size": float(winner.ask_size),
         }
@@ -180,7 +183,7 @@ def select_post_close_snapshot_signal(
             "post_close_leader_bid_not_strictly_above_threshold",
             side=side,
             winner_bid=winner_bid,
-            loser_bid=float(loser.best_bid),
+            loser_bid=loser_bid,
             audit=audit,
         )
 
@@ -191,6 +194,6 @@ def select_post_close_snapshot_signal(
         entry_ask=cfg.limit_price,
         entry_ask_size=float(winner.ask_size),
         winner_bid=winner_bid,
-        loser_bid=float(loser.best_bid),
+        loser_bid=loser_bid,
         audit=audit,
     )
