@@ -1811,7 +1811,7 @@ def test_confirmed_open_fill_is_settled_from_pm_outcome(tmp_path):
         store.close()
 
 
-def test_startup_reconciliation_keeps_missing_order_id_ambiguous_and_alerts_every_boot(tmp_path):
+def test_startup_reconciliation_keeps_invalid_order_ambiguous_and_alerts_once(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     try:
         record = store.reserve_entry(
@@ -1824,6 +1824,8 @@ def test_startup_reconciliation_keeps_missing_order_id_ambiguous_and_alerts_ever
             0.64,
         )
         assert record is not None
+        store.mark_submitted(record.intent_id, "old-order", {"order_type": "GTC"})
+        record = store.unresolved_orders()[0]
         notifier = CaptureNotifier()
         settings = Settings(
             dry_run=False,
@@ -1831,7 +1833,11 @@ def test_startup_reconciliation_keeps_missing_order_id_ambiguous_and_alerts_ever
             out_dir=tmp_path / "out",
             state_db=tmp_path / "state.sqlite3",
         )
-        executor = OrderExecutor(settings, store, gateway=object())
+        class InvalidOrderGateway:
+            def get_order(self, _order_id):
+                raise RuntimeError("CLOB returned an invalid order lookup")
+
+        executor = OrderExecutor(settings, store, gateway=InvalidOrderGateway())
 
         for boot_number in (1, 2):
             _reconcile_startup(settings, store, executor, notifier)
@@ -1842,9 +1848,10 @@ def test_startup_reconciliation_keeps_missing_order_id_ambiguous_and_alerts_ever
             assert unresolved[0].state == "execution_unknown"
             assert store.has_execution_unknown() is True
 
-        assert len(notifier.messages) == 2
+        assert len(notifier.messages) == 1
         assert all(message.startswith("[Aftertake] ALERT") for message in notifier.messages)
         assert all("order_id" in message.lower() for message in notifier.messages)
+        assert store.component_status("startup_reconciliation:%s" % record.intent_id) == "unhealthy"
     finally:
         store.close()
 

@@ -132,13 +132,17 @@ class HeartbeatLoop:
         # but valid response into a restart storm. Small test intervals remain
         # responsive.
         self.call_timeout_s = max(0.2, min(5.5, self.interval_s * 2.5))
-        self.hard_failure_s = 7.0
+        # The pinned SDK may use a five-second HTTP timeout.  Keep enough
+        # room for the default 4-second cadence, that timeout, and a late
+        # completion before declaring the account heartbeat unrecoverable.
+        self.hard_failure_s = 20.0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._request_thread: Optional[threading.Thread] = None
         self._request_done: Optional[threading.Event] = None
         self._request_result: Dict[str, Any] = {}
         self._request_failure: List[BaseException] = []
+        self._request_started_mono = 0.0
         self._request_lock = threading.Lock()
         self.last_error = ""
         self._heartbeat_id = ""
@@ -166,8 +170,64 @@ class HeartbeatLoop:
             name="aftertake-heartbeat-status",
         )
         self._status_thread.start()
+        self._bootstrap()
         self._thread = threading.Thread(target=self._run, daemon=True, name="aftertake-heartbeat")
         self._thread.start()
+
+    def _bootstrap(self) -> None:
+        """Establish a fresh server heartbeat before the runtime is READY.
+
+        The CLOB protocol uses an empty id to start a session.  An expired
+        session may answer that first request with a replacement id; that is
+        expected startup negotiation, not an operator-facing outage.  A
+        timeout still owns its request until it completes, so bootstrap never
+        overlaps SDK calls while it waits for a valid id.
+        """
+
+        deadline = time.monotonic() + self.hard_failure_s
+        while not self._stop.is_set():
+            try:
+                response = self._post_heartbeat_bounded()
+                heartbeat_id = _heartbeat_id_from_value(response)
+                if not heartbeat_id:
+                    raise RuntimeError("CLOB heartbeat bootstrap returned no heartbeat id")
+                self._heartbeat_id = heartbeat_id
+                self.last_error = ""
+                self.last_success_at = time.time()
+                self.consecutive_failures = 0
+                status_ack = self._notify_status(
+                    "heartbeat_recovered",
+                    {"reason": "CLOB heartbeat restored", "heartbeat_id": self._heartbeat_id},
+                )
+                if status_ack is not None:
+                    status_ack.wait(0.1)
+                return
+            except Exception as exc:
+                self.consecutive_failures += 1
+                replacement_id = _heartbeat_id_from_value(exc)
+                if replacement_id:
+                    self._heartbeat_id = replacement_id
+                error_value = getattr(exc, "error_msg", None)
+                self.last_error = _safe_error_message(error_value if error_value is not None else exc)
+                now_mono = time.monotonic()
+                if now_mono >= deadline:
+                    self._request_fatal(
+                        "CLOB heartbeat bootstrap exceeded hard failure deadline",
+                        {
+                            "error_message": self.last_error,
+                            "consecutive_failures": self.consecutive_failures,
+                            "failure_age_s": max(0.0, self.hard_failure_s),
+                        },
+                    )
+                    raise TimeoutError(
+                        "CLOB heartbeat bootstrap exceeded hard failure deadline"
+                    ) from exc
+                # A replacement id means the request completed with the
+                # expected 400 response; retry immediately with that id.
+                if replacement_id:
+                    continue
+                self._stop.wait(min(0.25, max(0.01, deadline - now_mono)))
+        raise RuntimeError("heartbeat stopped during bootstrap")
 
     def _post_heartbeat_bounded(self) -> Dict[str, Any]:
         """Bound one SDK call and retain a completion that arrives late."""
@@ -181,6 +241,7 @@ class HeartbeatLoop:
             self._request_done = done
             self._request_result = {}
             self._request_failure = []
+            self._request_started_mono = time.monotonic()
 
             def call() -> None:
                 try:
@@ -227,9 +288,21 @@ class HeartbeatLoop:
         self._request_done = None
         self._request_result = {}
         self._request_failure = []
+        self._request_started_mono = 0.0
         if failure:
             raise failure[0]
         return result
+
+    def _in_flight_age(self, now_mono: float) -> float:
+        with self._request_lock:
+            if (
+                self._request_thread is None
+                or self._request_done is None
+                or self._request_done.is_set()
+                or self._request_started_mono <= 0
+            ):
+                return 0.0
+            return max(0.0, float(now_mono) - self._request_started_mono)
 
     def _notify_status(self, kind: str, payload: Dict[str, Any]) -> Optional[threading.Event]:
         if self.status_callback is None:
@@ -301,13 +374,12 @@ class HeartbeatLoop:
 
     def _run(self) -> None:
         had_error = False
-        first_success = True
         started_mono = time.monotonic()
-        last_success_mono = 0.0
-        next_due = started_mono
-        # The live runtime starts this single account-wide loop well before the
-        # close. Send immediately so an existing GTC is protected on boot and a
-        # valid heartbeat id is warm before any new order can be acknowledged.
+        last_success_mono = started_mono
+        next_due = started_mono + self.interval_s
+        # Bootstrap already sent the first heartbeat before this thread was
+        # created. The background account-wide loop starts at the next normal
+        # interval, after a valid id is warm for any order acknowledgement.
         while not self._stop.is_set():
             wait_s = max(0.0, next_due - time.monotonic())
             if self._stop.wait(wait_s):
@@ -321,13 +393,12 @@ class HeartbeatLoop:
                 self.last_success_at = time.time()
                 last_success_mono = time.monotonic()
                 self.consecutive_failures = 0
-                if had_error or first_success:
+                if had_error:
                     self._notify_status(
                         "heartbeat_recovered",
                         {"reason": "CLOB heartbeat restored", "heartbeat_id": self._heartbeat_id},
                     )
                 had_error = False
-                first_success = False
                 next_due += self.interval_s
             except Exception as exc:  # execution reconciliation will fail closed
                 # Polymarket returns the replacement heartbeat_id alongside a
@@ -341,24 +412,25 @@ class HeartbeatLoop:
                     self._heartbeat_id = replacement_id
                 error_value = getattr(exc, "error_msg", None)
                 self.last_error = _safe_error_message(error_value if error_value is not None else exc)
+                status_ack = None
+                if not had_error:
+                    status_ack = self._notify_status(
+                        "heartbeat_error",
+                        {
+                            "reason": "CLOB heartbeat failed",
+                            "error_message": self.last_error,
+                            "heartbeat_id": self._heartbeat_id,
+                            "consecutive_failures": self.consecutive_failures,
+                        },
+                    )
                 had_error = True
-                status_ack = self._notify_status(
-                    "heartbeat_error",
-                    {
-                        "reason": "CLOB heartbeat failed",
-                        "error_message": self.last_error,
-                        "heartbeat_id": self._heartbeat_id,
-                        "consecutive_failures": self.consecutive_failures,
-                    },
-                )
                 now_mono = time.monotonic()
-                failure_age = now_mono - (last_success_mono or started_mono)
-                request_stuck = isinstance(exc, TimeoutError) and (
-                    "timed out" in self.last_error.lower()
-                    or "still in flight" in self.last_error.lower()
+                failure_age = now_mono - last_success_mono
+                request_in_flight = self._in_flight_age(now_mono) > 0
+                hard_failure = failure_age >= self.hard_failure_s and (
+                    request_in_flight or self.consecutive_failures >= 2
                 )
-                repeated_failure = not replacement_id and self.consecutive_failures >= 2
-                if request_stuck or repeated_failure or failure_age >= self.hard_failure_s:
+                if hard_failure:
                     self._request_fatal(
                         "CLOB heartbeat is not recoverable in-process",
                         {
@@ -369,6 +441,10 @@ class HeartbeatLoop:
                         acknowledged=status_ack,
                     )
                 if replacement_id:
+                    next_due = now_mono + min(0.25, self.interval_s)
+                elif request_in_flight:
+                    # Keep polling the completion state, never start a second
+                    # SDK request while the original call can still return.
                     next_due = now_mono + min(0.25, self.interval_s)
                 else:
                     next_due += self.interval_s

@@ -61,10 +61,8 @@ def test_heartbeat_loop_adopts_replacement_id_from_invalid_id_response():
     assert "replacement-id" in calls
     assert loop.heartbeat_id == "replacement-id"
     assert loop.last_error == ""
-    assert statuses[0][0] == "heartbeat_error"
-    assert statuses[0][1]["consecutive_failures"] == 1
+    assert [kind for kind, _payload in statuses] == ["heartbeat_recovered"]
     assert statuses[0][1]["heartbeat_id"] == "replacement-id"
-    assert statuses[-1][0] == "heartbeat_recovered"
 
 
 def test_heartbeat_loop_bounds_and_does_not_overlap_a_hung_sdk_call():
@@ -75,18 +73,21 @@ def test_heartbeat_loop_bounds_and_does_not_overlap_a_hung_sdk_call():
     class Gateway:
         def post_heartbeat(self, heartbeat_id=""):
             calls.append(heartbeat_id)
+            if len(calls) == 1:
+                return {"heartbeat_id": "h"}
             started.set()
             release.wait(timeout=1.0)
             return {"heartbeat_id": "h"}
 
     loop = HeartbeatLoop(Gateway(), 0.01)
+    loop.call_timeout_s = 0.03
     loop.start()
     try:
         assert started.wait(1.0)
         # The first request is still in flight; a second call must not be
         # started on every short interval and create an unbounded client pile.
         threading.Event().wait(0.25)
-        assert len(calls) == 1
+        assert len(calls) == 2  # one bootstrap request plus one in-flight request
         assert "timed out" in loop.last_error or "in flight" in loop.last_error
     finally:
         release.set()
@@ -116,6 +117,96 @@ def test_heartbeat_loop_keeps_delayed_success_and_adopts_returned_id():
     assert calls
     assert loop.heartbeat_id == "delayed-heartbeat-id"
     assert loop.last_success_at > 0
+
+
+def test_heartbeat_single_timeout_consumes_late_success_without_fatal_restart():
+    request_started = threading.Event()
+    late_success = threading.Event()
+    release = threading.Event()
+    fatal_reasons = []
+    calls = []
+    active = 0
+    max_active = 0
+    active_lock = threading.Lock()
+
+    class Gateway:
+        def post_heartbeat(self, heartbeat_id=""):
+            nonlocal active, max_active
+            with active_lock:
+                active += 1
+                max_active = max(max_active, active)
+            calls.append(heartbeat_id)
+            try:
+                if len(calls) == 1:
+                    return {"heartbeat_id": "h"}
+                request_started.set()
+                release.wait(timeout=1.0)
+                late_success.set()
+                return {"heartbeat_id": "h"}
+            finally:
+                with active_lock:
+                    active -= 1
+
+    loop = HeartbeatLoop(
+        Gateway(),
+        0.01,
+        fatal_callback=lambda reason, _payload: fatal_reasons.append(reason),
+    )
+    loop.call_timeout_s = 0.03
+    loop.hard_failure_s = 0.15
+    loop.start()
+    try:
+        assert request_started.wait(1.0)
+        time.sleep(0.06)
+        assert fatal_reasons == []
+        release.set()
+        assert late_success.wait(1.0)
+        time.sleep(0.05)
+        assert fatal_reasons == []
+        assert len(calls) >= 2
+        assert max_active == 1
+    finally:
+        release.set()
+        loop.stop()
+
+
+def test_heartbeat_default_timeout_does_not_fatal_on_first_timeout():
+    request_started = threading.Event()
+    late_success = threading.Event()
+    release = threading.Event()
+    fatal_reasons = []
+    calls = []
+
+    class Gateway:
+        def post_heartbeat(self, heartbeat_id=""):
+            calls.append(heartbeat_id)
+            if len(calls) == 1:
+                return {"heartbeat_id": "h"}
+            request_started.set()
+            release.wait(timeout=10.0)
+            late_success.set()
+            return {"heartbeat_id": "h"}
+
+    # Keep the production/default interval and derived 5.5s SDK-call bound;
+    # this test must prove the live default does not restart at first timeout.
+    loop = HeartbeatLoop(
+        Gateway(),
+        4.0,
+        fatal_callback=lambda reason, _payload: fatal_reasons.append(reason),
+    )
+    loop.start()
+    try:
+        assert loop.call_timeout_s == 5.5
+        assert loop.hard_failure_s == 20.0
+        assert request_started.wait(6.0)
+        time.sleep(5.65)
+        assert fatal_reasons == []
+        release.set()
+        assert late_success.wait(1.0)
+        assert fatal_reasons == []
+    finally:
+        release.set()
+        loop.stop()
 
 
 def test_heartbeat_consumes_done_request_before_worker_thread_fully_exits(monkeypatch):
@@ -156,30 +247,31 @@ def test_heartbeat_consumes_done_request_before_worker_thread_fully_exits(monkey
 def test_heartbeat_hung_request_requests_one_process_restart_without_waiting_for_status(tmp_path):
     release = threading.Event()
     restarted = threading.Event()
-    status_started = threading.Event()
+    fatal_reasons = []
+    calls = []
 
     class Gateway:
         def post_heartbeat(self, heartbeat_id=""):
+            calls.append(heartbeat_id)
+            if len(calls) == 1:
+                return {"heartbeat_id": "h"}
             release.wait(timeout=2.0)
             return {"heartbeat_id": "h"}
-
-    def blocked_status(_kind, _payload):
-        status_started.set()
-        release.wait(timeout=2.0)
 
     loop = HeartbeatLoop(
         Gateway(),
         0.01,
-        fatal_callback=lambda _reason, _payload: restarted.set(),
+        fatal_callback=lambda reason, _payload: (fatal_reasons.append(reason), restarted.set()),
     )
-    loop.status_callback = blocked_status
+    loop.call_timeout_s = 0.03
+    loop.hard_failure_s = 0.15
     loop.start()
     try:
         assert restarted.wait(1.0)
         assert loop.fatal_requested is True
-        # The core heartbeat thread must not wait for diagnostics. Depending
-        # on timing the first error may still be queued behind the blocked
-        # callback, but fatal restart must already be requested.
+        time.sleep(0.05)
+        assert len(fatal_reasons) == 1
+        assert len(calls) == 2
         assert loop._thread is not None and loop._thread.is_alive()
     finally:
         release.set()

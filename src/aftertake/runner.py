@@ -2828,7 +2828,6 @@ def _reconcile_startup(
                     "intent_id": record.intent_id,
                 },
                 slug=record.slug,
-                notify_on_no_transition=True,
             )
             if bool(getattr(executor, "process_restart_required", False)):
                 # The bounded probe's daemon thread is still uncancellable;
@@ -2875,7 +2874,6 @@ def _reconcile_startup(
                     "order_id": record.order_id or "n/a",
                 },
                 slug=record.slug,
-                notify_on_no_transition=True,
             )
             if bool(getattr(executor, "process_restart_required", False)):
                 # The bounded probe's daemon thread is still uncancellable;
@@ -2910,7 +2908,6 @@ def _reconcile_startup(
                     "order_id": result.order_id or record.order_id,
                 },
                 slug=record.slug,
-                notify_on_no_transition=True,
             )
         else:
             _transition_component_and_notify(
