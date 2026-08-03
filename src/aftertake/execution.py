@@ -195,6 +195,7 @@ class HeartbeatLoop:
                 self.last_error = ""
                 self.last_success_at = time.time()
                 self.consecutive_failures = 0
+                self._fatal_requested.clear()
                 status_ack = self._notify_status(
                     "heartbeat_recovered",
                     {"reason": "CLOB heartbeat restored", "heartbeat_id": self._heartbeat_id},
@@ -365,7 +366,7 @@ class HeartbeatLoop:
         threading.Thread(
             target=invoke,
             daemon=True,
-            name="aftertake-heartbeat-restart",
+            name="aftertake-heartbeat-fatal-alert",
         ).start()
 
     @property
@@ -393,6 +394,7 @@ class HeartbeatLoop:
                 self.last_success_at = time.time()
                 last_success_mono = time.monotonic()
                 self.consecutive_failures = 0
+                self._fatal_requested.clear()
                 if had_error:
                     self._notify_status(
                         "heartbeat_recovered",
@@ -655,8 +657,9 @@ class OrderExecutor:
         self._event_callback = event_callback
         self._event_threads: List[tuple] = []
         self._event_threads_lock = threading.Lock()
-        self._process_restart_required = threading.Event()
-        self._process_restart_reason = ""
+        self._read_probe_stalled = threading.Event()
+        self._read_probe_lock = threading.Lock()
+        self._read_probe_stall_reason = ""
 
     def _new_heartbeat(self) -> HeartbeatLoop:
         heartbeat = self._heartbeat_factory(self.gateway, self.settings.heartbeat_interval_s)
@@ -673,19 +676,26 @@ class OrderExecutor:
             heartbeat.stop()
 
     @property
-    def process_restart_required(self) -> bool:
-        """Return whether an SDK call outlived its hard reconciliation deadline."""
+    def read_probe_stalled(self) -> bool:
+        """Return whether one read-only SDK probe remains uncancellable."""
 
-        return self._process_restart_required.is_set()
+        return self._read_probe_stalled.is_set()
 
     @property
-    def process_restart_reason(self) -> str:
-        return self._process_restart_reason
+    def read_probe_stall_reason(self) -> str:
+        with self._read_probe_lock:
+            return self._read_probe_stall_reason
 
-    def _mark_process_restart_required(self, reason: str) -> None:
-        if not self._process_restart_required.is_set():
-            self._process_restart_reason = str(reason)
-            self._process_restart_required.set()
+    def _mark_read_probe_stalled(self, reason: str) -> None:
+        with self._read_probe_lock:
+            if not self._read_probe_stalled.is_set():
+                self._read_probe_stall_reason = str(reason)
+                self._read_probe_stalled.set()
+
+    def _clear_read_probe_stalled(self) -> None:
+        with self._read_probe_lock:
+            self._read_probe_stall_reason = ""
+            self._read_probe_stalled.clear()
 
     def _emit(self, kind: str, payload: Dict[str, Any]) -> None:
         if self._event_callback is None:
@@ -1281,6 +1291,9 @@ class OrderExecutor:
     ) -> Any:
         """Run one SDK probe under a deadline even if its client ignores it."""
 
+        if self.read_probe_stalled:
+            raise TimeoutError(self.read_probe_stall_reason or "previous read probe is still in flight")
+
         done = threading.Event()
         result: List[Any] = []
         failure: List[BaseException] = []
@@ -1292,6 +1305,7 @@ class OrderExecutor:
                 failure.append(exc)
             finally:
                 done.set()
+                self._clear_read_probe_stalled()
 
         thread = threading.Thread(
             target=invoke,
@@ -1301,7 +1315,9 @@ class OrderExecutor:
         thread.start()
         if not done.wait(max(0.01, float(timeout_s))):
             reason = "%s probe exceeded reconciliation deadline" % label
-            self._mark_process_restart_required(reason)
+            self._mark_read_probe_stalled(reason)
+            if done.is_set():
+                self._clear_read_probe_stalled()
             raise TimeoutError(reason)
         if failure:
             raise failure[0]

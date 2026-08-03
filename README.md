@@ -84,6 +84,22 @@ The deployment script installs the checked-in systemd unit directly into
 WebSocket/Gamma/CLOB interruptions suppress the affected round and reconnect
 without marking the service failed.
 
+## Railway
+
+Create one Railway persistent service from this GitHub repository, attach one
+volume at `/data`, and add the values from `.env.example` as Railway service
+variables. Secrets such as the private key, CLOB credentials, and Telegram
+token belong only in Railway Variables; do not upload `.env`. On Railway set
+`AFTERTAKE_OUT_DIR=/data/out` (do not copy the local `out` value).
+
+The checked-in `Dockerfile` and `railway.json` run exactly one background worker
+with SQLite and runtime logs under `/data/out`. No public domain, `PORT`, or HTTP
+healthcheck is required. Select a Railway region where the Polymarket geo
+preflight is permitted, then set `AFTERTAKE_DRY_RUN=false` only for the live
+service. Normal heartbeat, market-stream, reconciliation, and per-asset
+transport failures alert and continue; Railway restarts only an actual crashed
+process, with at most three retries.
+
 See [RUNBOOK.md](docs/RUNBOOK.md), [SAFETY.md](docs/SAFETY.md), and
 [ARCHITECTURE.md](docs/ARCHITECTURE.md).
 

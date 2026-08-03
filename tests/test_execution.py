@@ -162,6 +162,29 @@ def test_heartbeat_late_recovery_waits_for_next_cadence_instead_of_catching_up()
         loop.stop()
 
 
+def test_heartbeat_fatal_latch_clears_after_success_for_a_new_outage():
+    callbacks = []
+    callback_seen = threading.Event()
+
+    def on_fatal(reason, _payload):
+        callbacks.append(reason)
+        callback_seen.set()
+
+    loop = HeartbeatLoop(object(), 0.1, fatal_callback=on_fatal)
+    loop._request_fatal("first outage", {})
+    assert callback_seen.wait(1.0)
+    assert loop.fatal_requested is True
+
+    loop._post_heartbeat_bounded = lambda: {"heartbeat_id": "recovered"}
+    loop._bootstrap()
+    assert loop.fatal_requested is False
+
+    callback_seen.clear()
+    loop._request_fatal("second outage", {})
+    assert callback_seen.wait(1.0)
+    assert callbacks == ["first outage", "second outage"]
+
+
 def test_heartbeat_single_timeout_consumes_late_success_without_fatal_restart():
     request_started = threading.Event()
     late_success = threading.Event()
@@ -837,7 +860,7 @@ def test_reconcile_trade_lookup_is_bounded_and_keeps_fill_unknown(tmp_path):
         store.close()
 
 
-def test_bounded_clob_timeout_marks_process_restart_required(tmp_path):
+def test_bounded_read_timeout_marks_probe_stalled_without_requesting_restart(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     release = threading.Event()
     executor = OrderExecutor(Settings(state_db=tmp_path / "state.sqlite3"), store)
@@ -845,8 +868,17 @@ def test_bounded_clob_timeout_marks_process_restart_required(tmp_path):
     try:
         with pytest.raises(TimeoutError, match="probe exceeded"):
             executor._call_bounded(lambda: release.wait(timeout=2.0), 0.02, "probe")
-        assert executor.process_restart_required is True
-        assert executor.process_restart_reason == "probe probe exceeded reconciliation deadline"
+        assert executor.read_probe_stalled is True
+        assert executor.read_probe_stall_reason == "probe probe exceeded reconciliation deadline"
+        with pytest.raises(TimeoutError, match="probe exceeded"):
+            executor._call_bounded(lambda: pytest.fail("overlapping probe started"), 0.02, "next")
+
+        release.set()
+        deadline = time.monotonic() + 1.0
+        while executor.read_probe_stalled and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert executor.read_probe_stalled is False
+        assert executor._call_bounded(lambda: "ok", 0.1, "recovered") == "ok"
     finally:
         release.set()
         store.close()
