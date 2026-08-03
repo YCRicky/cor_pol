@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .config import Settings
-from .execution import HeartbeatLoop, OrderExecutor, OrderResult
+from .execution import OrderExecutor, OrderResult
 from .ledger import append_jsonl, rebuild_ledger
 from .live_sizing import LiveSizingDecision, compute_live_entry_size
 from .market_stream import MarketBookStream
@@ -3079,40 +3079,19 @@ def _live_runtime(
                 },
             )
 
-    def heartbeat_fatal(reason: str, payload: Dict[str, Any]) -> None:
-        _report_heartbeat_fatal(
-            settings=settings,
-            store=store,
-            notifier=notifier,
-            reason=reason,
-            payload=payload,
-        )
-
-    heartbeat = HeartbeatLoop(
-        gateway,
-        settings.heartbeat_interval_s,
-        fatal_callback=heartbeat_fatal,
+    prepare = getattr(gateway, "prepare_order_submission", None)
+    if callable(prepare):
+        prepare()
+    geo = public.geoblock_status(settings.geo_endpoint)
+    gateway.preflight(geo, 0.0)
+    executor = OrderExecutor(
+        settings=settings,
+        store=store,
+        gateway=gateway,
+        event_callback=report_submission,
     )
-    heartbeat.status_callback = report_submission
-    try:
-        prepare = getattr(gateway, "prepare_order_submission", None)
-        if callable(prepare):
-            prepare()
-        heartbeat.start()
-        geo = public.geoblock_status(settings.geo_endpoint)
-        gateway.preflight(geo, 0.0)
-        executor = OrderExecutor(
-            settings=settings,
-            store=store,
-            gateway=gateway,
-            event_callback=report_submission,
-            account_heartbeat=heartbeat,
-        )
-        _reconcile_startup(settings, store, executor, notifier)
-        return gateway, executor
-    except Exception:
-        heartbeat.stop()
-        raise
+    _reconcile_startup(settings, store, executor, notifier)
+    return gateway, executor
 
 
 class _MaintenanceWorker:
