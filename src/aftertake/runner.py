@@ -2735,7 +2735,6 @@ def _reconcile_startup(
 ) -> None:
     unresolved = store.unresolved_orders()
     for record in unresolved:
-        component = "startup_reconciliation:%s" % record.intent_id
         if not record.order_id:
             # A crash can occur after the request leaves the process but before
             # its acknowledgement/order id is persisted.  No local evidence can
@@ -2755,24 +2754,6 @@ def _reconcile_startup(
                 "startup_execution_unknown",
                 {"reason": reason, "order_id": "n/a", "intent_id": record.intent_id},
                 record.slug,
-            )
-            _transition_component_and_notify(
-                store=store,
-                component=component,
-                status="unhealthy",
-                detail=reason,
-                notifier=notifier,
-                settings=settings,
-                kind="alert",
-                payload={
-                    "reason": "startup execution unknown; order_id recovery required",
-                    "component": component,
-                    "error_type": "MissingOrderId",
-                    "error_message": reason,
-                    "order_id": "n/a",
-                    "intent_id": record.intent_id,
-                },
-                slug=record.slug,
             )
             if bool(getattr(executor, "read_probe_stalled", False)):
                 # The bounded probe's daemon thread is still uncancellable;
@@ -2802,23 +2783,6 @@ def _reconcile_startup(
                 },
                 record.slug,
             )
-            _transition_component_and_notify(
-                store=store,
-                component=component,
-                status="unhealthy",
-                detail=_safe_transport_message(exc),
-                notifier=notifier,
-                settings=settings,
-                kind="alert",
-                payload={
-                    "reason": "startup reconciliation error",
-                    "component": component,
-                    "error_type": type(exc).__name__,
-                    "error_message": _safe_transport_message(exc),
-                    "order_id": record.order_id or "n/a",
-                },
-                slug=record.slug,
-            )
             if bool(getattr(executor, "read_probe_stalled", False)):
                 # The bounded probe's daemon thread is still uncancellable;
                 # stop this read-only sweep so it cannot accumulate threads.
@@ -2835,38 +2799,23 @@ def _reconcile_startup(
                 or result.error
                 or "authoritative CLOB reconciliation timed out"
             )
-            _transition_component_and_notify(
-                store=store,
-                component=component,
-                status="unhealthy",
-                detail=detail,
-                notifier=notifier,
-                settings=settings,
-                kind="alert",
-                payload={
-                    "reason": "startup reconciliation transport error",
-                    "component": component,
-                    "error_type": "TimeoutError",
-                    "error_message": detail,
+            _audit(
+                settings,
+                store,
+                "startup_reconciliation_deferred",
+                {
+                    "reason": detail,
                     "order_id": result.order_id or record.order_id,
                 },
-                slug=record.slug,
+                record.slug,
             )
         else:
-            _transition_component_and_notify(
-                store=store,
-                component=component,
-                status="healthy",
-                detail="authoritative CLOB reconciliation completed",
-                notifier=notifier,
-                settings=settings,
-                kind="recovery_success",
-                payload={
-                    "component": component,
-                    "reason": "authoritative CLOB reconciliation restored",
-                    "order_id": result.order_id or record.order_id,
-                },
-                slug=record.slug,
+            _audit(
+                settings,
+                store,
+                "startup_reconciliation_succeeded",
+                {"order_id": result.order_id or record.order_id},
+                record.slug,
             )
         if executor.read_probe_stalled:
             # Do not start another bounded SDK probe while the previous one is

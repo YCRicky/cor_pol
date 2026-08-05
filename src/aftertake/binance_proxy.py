@@ -1,4 +1,4 @@
-"""Memory-bounded Binance Spot 5-minute OHLC proxy."""
+"""Memory-bounded Binance USD-M Futures 5-minute OHLC proxy."""
 
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ class _Candle:
 
 
 class BinanceFiveMinuteProxy:
-    """Aggregate public Spot trades into exact UTC five-minute buckets."""
+    """Aggregate public USD-M Futures trades into exact UTC five-minute buckets."""
 
     def __init__(self, assets: Iterable[str], *, clock=time.time):
         self._clock = clock
@@ -55,7 +55,7 @@ class BinanceFiveMinuteProxy:
             if asset in DEFAULT_SYMBOLS
         }
         streams = "/".join(f"{symbol}@trade" for symbol in self._symbols)
-        self._url = f"wss://stream.binance.com:9443/stream?streams={streams}"
+        self._url = f"wss://fstream.binance.com/stream?streams={streams}"
         self._lock = threading.RLock()
         self._candles: Dict[Tuple[str, int], _Candle] = {}
         self._invalid: set[Tuple[str, int]] = set()

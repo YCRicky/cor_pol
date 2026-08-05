@@ -16,6 +16,7 @@ def test_proxy_builds_complete_five_minute_ohlc_and_direction():
         return 899.0
 
     proxy = BinanceFiveMinuteProxy(("XRP",), clock=clock)
+    assert proxy._url.startswith("wss://fstream.binance.com/stream?")
     proxy._on_open(None)
     proxy._on_message(None, _trade("XRPUSDT", 900_001, 1.0))
     proxy._on_message(None, _trade("XRPUSDT", 1_199_900, 1.002))

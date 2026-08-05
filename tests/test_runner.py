@@ -1912,7 +1912,7 @@ def test_confirmed_open_fill_is_settled_from_pm_outcome(tmp_path):
         store.close()
 
 
-def test_startup_reconciliation_keeps_invalid_order_ambiguous_and_alerts_once(tmp_path):
+def test_startup_reconciliation_keeps_invalid_order_ambiguous_without_tg_spam(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     try:
         record = store.reserve_entry(
@@ -1949,10 +1949,7 @@ def test_startup_reconciliation_keeps_invalid_order_ambiguous_and_alerts_once(tm
             assert unresolved[0].state == "execution_unknown"
             assert store.has_execution_unknown() is True
 
-        assert len(notifier.messages) == 1
-        assert all(message.startswith("[Aftertake] ALERT") for message in notifier.messages)
-        assert all("order_id" in message.lower() for message in notifier.messages)
-        assert store.component_status("startup_reconciliation:%s" % record.intent_id) == "unhealthy"
+        assert notifier.messages == []
     finally:
         store.close()
 
