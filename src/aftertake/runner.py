@@ -24,6 +24,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from .binance_proxy import BinanceFiveMinuteProxy
 from .config import Settings
 from .execution import OrderExecutor, OrderResult
 from .ledger import append_jsonl, rebuild_ledger
@@ -1966,6 +1967,7 @@ def _run_post_close_snapshot_round(
     sleep: Callable[[float], None] = time.sleep,
     notifier: Optional[Notifier] = None,
     stream_factory: Callable[..., MarketBookStream] = MarketBookStream,
+    binance_proxy: Optional[BinanceFiveMinuteProxy] = None,
 ) -> List[PostCloseDecision]:
     """Run the sole live entry path: snapshot at close+500ms, submit once."""
 
@@ -2077,44 +2079,18 @@ def _run_post_close_snapshot_round(
                 )
                 if reconnect_count > 0:
                     stream_health_confirmed = False
-                    stream_error = str(
-                        getattr(stream, "last_error", "") or "market stream disconnected"
-                    )
-                    _transition_component_and_notify(
-                        store=store,
-                        component=stream_component,
-                        status="unhealthy",
-                        detail=stream_error,
-                        notifier=notifier,
-                        settings=settings,
-                        kind="alert",
-                        payload={
-                            "reason": "market stream reconnecting",
-                            "component": stream_component,
-                            "generation": stream_generation,
-                            "reconnect_count": reconnect_count,
-                            "error_message": stream_error,
-                        },
-                        slug=slug,
-                        notify_on_no_transition=True,
-                    )
             if getattr(stream, "ready", False) and not stream_health_confirmed:
                 stream_health_confirmed = True
-                _transition_component_and_notify(
-                    store=store,
-                    component=stream_component,
-                    status="healthy",
-                    detail="fresh paired book restored",
-                    notifier=notifier,
-                    settings=settings,
-                    kind="recovery_success",
-                    payload={
+                _audit(
+                    settings,
+                    store,
+                    "market_stream_ready",
+                    {
                         "component": stream_component,
-                        "reason": "fresh paired book restored",
-                        "details": "generation=%s reconnect_count=%s"
-                        % (current_generation, int(getattr(stream, "reconnect_count", 0))),
+                        "generation": current_generation,
+                        "reconnect_count": int(getattr(stream, "reconnect_count", 0)),
                     },
-                    slug=slug,
+                    slug,
                 )
 
             if now < preflight_at:
@@ -2236,6 +2212,50 @@ def _run_post_close_snapshot_round(
                 frozen_decision = decision
                 # No subsequent websocket event can change the frozen side.
                 # Fall through in this same control flow to the one submission.
+
+                if binance_proxy is not None:
+                    proxy = binance_proxy.signal(active_asset, round_start)
+                    proxy_payload = {
+                        "asset": active_asset,
+                        "pm_side": frozen_decision.side,
+                        "minimum_abs_change_fraction": 0.0001,
+                    }
+                    if proxy is None:
+                        hold(
+                            "binance_proxy_unavailable_or_incomplete",
+                            event_ts=now,
+                            side=frozen_decision.side,
+                            audit=proxy_payload,
+                        )
+                        break
+                    proxy_payload.update(
+                        {
+                            "binance_side": proxy.side,
+                            "open": proxy.open_price,
+                            "high": proxy.high_price,
+                            "low": proxy.low_price,
+                            "close": proxy.close_price,
+                            "change_fraction": proxy.change_fraction,
+                            "change_percent": proxy.change_fraction * 100.0,
+                        }
+                    )
+                    _audit(settings, store, "binance_proxy_decision", proxy_payload, slug)
+                    if abs(proxy.change_fraction) < 0.0001:
+                        hold(
+                            "binance_proxy_move_below_0_01_percent",
+                            event_ts=now,
+                            side=frozen_decision.side,
+                            audit=proxy_payload,
+                        )
+                        break
+                    if proxy.side != frozen_decision.side:
+                        hold(
+                            "binance_proxy_direction_mismatch",
+                            event_ts=now,
+                            side=frozen_decision.side,
+                            audit=proxy_payload,
+                        )
+                        break
 
             if now > snapshot_target_ts + post_close_cfg.max_decision_lateness_s:
                 hold(
@@ -2425,6 +2445,7 @@ def run_round(
     sleep: Callable[[float], None] = time.sleep,
     notifier: Optional[Notifier] = None,
     stream_factory: Callable[..., MarketBookStream] = MarketBookStream,
+    binance_proxy: Optional[BinanceFiveMinuteProxy] = None,
 ) -> List[PostCloseDecision]:
     """Public live entry point; historical classifiers are not called."""
 
@@ -2441,6 +2462,7 @@ def run_round(
         sleep=sleep,
         notifier=notifier,
         stream_factory=stream_factory,
+        binance_proxy=binance_proxy,
     )
 
 
@@ -2454,6 +2476,7 @@ def _run_asset_rounds(
     round_start: int,
     notifier: Optional[Notifier] = None,
     stream_factory: Callable[..., MarketBookStream] = MarketBookStream,
+    binance_proxy: Optional[BinanceFiveMinuteProxy] = None,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
     timeout_s: float = ASSET_ROUND_TIMEOUT_S,
@@ -2488,6 +2511,7 @@ def _run_asset_rounds(
             round_preflight=round_preflight,
             notifier=notifier,
             stream_factory=stream_factory,
+            binance_proxy=binance_proxy,
             clock=clock,
             sleep=sleep,
         ): asset
@@ -3258,6 +3282,7 @@ def _run_round_loop(
     wait_for_next_boundary: Callable[[], int] = _wait_for_next_boundary,
     sleep: Callable[[float], None] = time.sleep,
     runtime_watchdog: Optional[RuntimeWatchdog] = None,
+    binance_proxy: Optional[BinanceFiveMinuteProxy] = None,
 ) -> None:
     """Keep the daemon alive while PM transport/account checks recover.
 
@@ -3396,6 +3421,7 @@ def _run_round_loop(
                 round_start=start,
                 notifier=notifier,
                 error_state=active_error_components,
+                binance_proxy=binance_proxy,
                 restart_fn=(
                     runtime_watchdog.restart_after_diagnostics
                     if runtime_watchdog is not None
@@ -3795,6 +3821,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     startup_watchdog.set_fatal_callback(persist_runtime_watchdog_alert)
     executor: Optional[OrderExecutor] = None
+    binance_proxy: Optional[BinanceFiveMinuteProxy] = None
     try:
         if args.status:
             print(json.dumps(_status_payload(settings, store), indent=2, sort_keys=True))
@@ -3842,6 +3869,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             }
             _audit(settings, store, "boot", boot_payload)
             _safe_notify(notifier, settings, store, "boot", boot_payload)
+            if settings.is_live:
+                binance_proxy = BinanceFiveMinuteProxy(settings.assets)
+                binance_proxy.start()
             runtime_watchdog = startup_watchdog
             try:
                 _run_round_loop(
@@ -3852,11 +3882,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                     forever=args.forever,
                     rounds=args.rounds,
                     runtime_watchdog=runtime_watchdog,
+                    binance_proxy=binance_proxy,
                 )
             finally:
                 runtime_watchdog.stop()
     finally:
         try:
+            if binance_proxy is not None:
+                binance_proxy.close()
             if executor is not None:
                 executor.close()
             store.close()
