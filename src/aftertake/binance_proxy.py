@@ -10,7 +10,6 @@ from typing import Dict, Iterable, Optional, Tuple
 
 import websocket
 
-
 WINDOW_MS = 300_000
 DEFAULT_SYMBOLS = {
     "BTC": "btcusdt",

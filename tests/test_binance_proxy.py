@@ -12,7 +12,9 @@ def _trade(symbol, timestamp_ms, price):
 
 
 def test_proxy_builds_complete_five_minute_ohlc_and_direction():
-    clock = lambda: 899.0
+    def clock():
+        return 899.0
+
     proxy = BinanceFiveMinuteProxy(("XRP",), clock=clock)
     proxy._on_open(None)
     proxy._on_message(None, _trade("XRPUSDT", 900_001, 1.0))
