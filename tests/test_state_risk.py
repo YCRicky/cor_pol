@@ -28,6 +28,22 @@ def _settle_loss(store, slug):
     store.record_settlement(slug, -5.0, {"win": False})
 
 
+def test_runtime_initialization_retires_unresolved_without_deleting_history(tmp_path):
+    store = StateStore(tmp_path / "state.sqlite3")
+    try:
+        record = _reserve(store)
+        assert record is not None
+        store.mark_submitted(record.intent_id, "old-order", {})
+
+        result = store.initialize_runtime_state()
+
+        assert result["retired_unresolved_orders"] == 1
+        assert store.unresolved_orders() == []
+        assert store.market_state("btc-updown-5m-0") == "retired"
+    finally:
+        store.close()
+
+
 def test_sqlite_reservation_is_one_entry_per_market(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     try:

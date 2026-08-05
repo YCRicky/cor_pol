@@ -666,6 +666,35 @@ class StateStore:
             ).fetchall()
         return [self._record_from_row(row) for row in rows]
 
+    def initialize_runtime_state(self) -> Dict[str, int]:
+        """Retire prior-runtime unresolved intents without any venue request."""
+
+        now = _utc_now()
+        with self._lock, self._transaction():
+            unresolved = self._conn.execute(
+                """SELECT COUNT(*) AS count FROM orders
+                   WHERE state IN ('entry_reserved', 'submitted', 'execution_unknown')"""
+            ).fetchone()
+            pending_notifications = self._conn.execute(
+                "SELECT COUNT(*) AS count FROM notification_outbox WHERE status = 'pending'"
+            ).fetchone()
+            self._conn.execute(
+                """UPDATE orders SET state = 'retired', error = 'runtime_initialized', updated_at = ?
+                   WHERE state IN ('entry_reserved', 'submitted', 'execution_unknown')""",
+                (now,),
+            )
+            self._conn.execute(
+                """UPDATE markets SET state = 'retired', reason = 'runtime_initialized', updated_at = ?
+                   WHERE state IN ('entry_reserved', 'submitted', 'execution_unknown')""",
+                (now,),
+            )
+            self._conn.execute("DELETE FROM component_health")
+            self._conn.execute("DELETE FROM notification_outbox WHERE status = 'pending'")
+        return {
+            "retired_unresolved_orders": int(unresolved["count"] or 0),
+            "discarded_pending_notifications": int(pending_notifications["count"] or 0),
+        }
+
     def has_execution_unknown(self) -> bool:
         with self._lock:
             row = self._conn.execute(

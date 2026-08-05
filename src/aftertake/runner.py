@@ -3006,7 +3006,6 @@ def _live_runtime(
         gateway=gateway,
         event_callback=report_submission,
     )
-    _reconcile_startup(settings, store, executor, notifier)
     return gateway, executor
 
 
@@ -3784,6 +3783,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 gateway, executor = _live_runtime(settings, store, public, notifier)
             else:
                 gateway, executor = None, OrderExecutor(settings=settings, store=store)
+                initialization = store.initialize_runtime_state()
+                _audit(settings, store, "runtime_state_initialized", initialization)
             if args.sync_allowance:
                 if gateway is None:
                     raise RuntimeError("--sync-allowance requires AFTERTAKE_DRY_RUN=false")
