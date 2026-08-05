@@ -55,7 +55,8 @@ def test_ec2_deploy_enforces_multi_asset_live_universe_without_touching_secrets(
     assert "ensure_env_default AFTERTAKE_POST_CLOSE_SNAPSHOT_MAX_LATENESS_S 0.250" in deploy
     assert "ensure_env_default AFTERTAKE_POST_CLOSE_LIMIT_PRICE 0.99" in deploy
     assert "require_post_close_contract" in deploy
-    assert "AFTERTAKE_QTY must be 50" in deploy
+    assert "AFTERTAKE_QTY must be a positive number" in deploy
+    assert "AFTERTAKE_QTY must be 50" not in deploy
     assert "AFTERTAKE_POST_CLOSE_SNAPSHOT_DELAY_S must be 0.5" in deploy
     assert "AFTERTAKE_POST_CLOSE_LEADER_BID_THRESHOLD must be 0.80" in deploy
     assert "AFTERTAKE_POST_CLOSE_SNAPSHOT_MAX_LATENESS_S must be 0.250" in deploy

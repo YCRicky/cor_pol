@@ -95,10 +95,13 @@ require_post_close_contract() {
   paired_age="$(read_env AFTERTAKE_POST_CLOSE_PAIRED_MAX_AGE_S)"
   lateness="$(read_env AFTERTAKE_POST_CLOSE_SNAPSHOT_MAX_LATENESS_S)"
   limit="$(read_env AFTERTAKE_POST_CLOSE_LIMIT_PRICE)"
-  case "${qty}" in
-    50|50.0|50.00) ;;
-    *) echo "AFTERTAKE_QTY must be 50 for the close+500ms live contract; found '${qty}'. Refusing deployment." >&2; exit 2 ;;
-  esac
+  awk -v value="${qty}" 'BEGIN {
+    valid = (value ~ /^[0-9]+([.][0-9]+)?$/ && (value + 0) > 0)
+    exit(valid ? 0 : 1)
+  }' || {
+    echo "AFTERTAKE_QTY must be a positive number; found '${qty}'. Refusing deployment." >&2
+    exit 2
+  }
   test "${order_type}" = "GTC" || {
     echo "AFTERTAKE_ORDER_TYPE must be GTC for the close+500ms live contract; found '${order_type}'. Refusing deployment" >&2
     exit 2
