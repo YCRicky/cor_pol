@@ -9,8 +9,8 @@
 5. Start `aftertake --forever` and confirm `BOOT` arrives.
 
 The shadow runner receives real Gamma/CLOB and Binance Futures data and writes the
-same SQLite/JSONL audit trail. It waits for a fresh candle boundary, requires a
-Gamma-declared 30-second TWAP market, then records the one `E-10.25s` decision
+same SQLite/JSONL audit trail. It joins an active round when preflight lead remains, requires a
+Gamma-declared 30-second TWAP market, then records the one `E-10s` to `E-9s` decision
 or its fail-closed reason. No wallet key, signature, or CLOB order is used.
 
 ## EC2
@@ -39,9 +39,8 @@ waiting for the next five-minute boundary is explicitly exempt from that
 watchdog.
 
 The PM market WebSocket has a 5-second keepalive and a 12-second transport
-watchdog. Binance Futures `aggTrade` is collected independently. A PM or Futures
-disconnect/reconnect during the candle invalidates the tail round; the service
-does not reconstruct an incomplete tape. For live orders,
+watchdog. Binance Futures `aggTrade` is collected independently for audit only;
+missing Futures data never invalidates a PM-qualified entry. For live orders,
 the CLOB heartbeat is sent every 4 seconds. If Polymarket returns a
 400 invalid/expired heartbeat id, the replacement id in that response is
 adopted and retried immediately instead of repeating the stale id. Each

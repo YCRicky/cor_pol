@@ -433,19 +433,18 @@ def test_runtime_status_reports_active_twap_tail_contract(tmp_path):
 
         status = runner_module._status_payload(settings, store)
 
-        assert status["strategy"] == "aftertake_twap_price_path_tail_v2"
-        assert status["tail_decision_lead_ms"] == 10_250
-        assert status["max_decision_lateness_ms"] == 250
-        assert status["decision_window_ms"] == [-10_250, -10_000]
+        assert status["strategy"] == "aftertake_twap_pm_tail_v3"
+        assert status["tail_decision_lead_ms"] == 10_000
+        assert status["max_decision_lateness_ms"] == 1_000
+        assert status["decision_window_ms"] == [-10_000, -9_000]
         assert status["leader_bid_threshold"] == 0.90
         assert status["leader_bid_comparison"] == "strictly_greater_than"
         assert status["paired_receive_max_age_ms"] == 2_000
-        assert status["binance_trade_max_age_ms"] == 2_000
         assert status["confirmations"] == 0
         assert status["confirmation_spacing_ms"] == 0
         assert status["confirmation_policy"] == "one_causal_twap_tail_decision"
         assert status["post_close_classifier_for_live_entry"] is False
-        assert status["binance_role"] == "usd_m_futures_path_filter_not_settlement_oracle"
+        assert status["binance_role"] == "usd_m_futures_observational_only_not_entry_gate"
         assert status["order_type"] == "GTC"
     finally:
         store.close()
@@ -1584,7 +1583,7 @@ def test_configured_assets_do_not_block_each_other_by_position_or_cooldown(tmp_p
         store.close()
 
 
-def test_round_scheduler_skips_partial_round_without_full_binance_coverage():
+def test_round_scheduler_joins_active_round_when_preflight_lead_remains():
     slept = []
     processed = {900}
     current = [1201.0]
@@ -1600,8 +1599,8 @@ def test_round_scheduler_skips_partial_round_without_full_binance_coverage():
         clock=lambda: current[0],
     )
 
-    assert selected == 1500
-    assert slept == [299.0]
+    assert selected == 1200
+    assert slept == []
 
 
 def test_round_scheduler_waits_when_active_round_is_too_close_to_close():
@@ -1789,7 +1788,7 @@ def test_service_main_reports_boot_before_any_live_pm_connection(monkeypatch, tm
             f"pid=4242 code_sha={code_sha}\n"
             "multi-asset per-asset risk gates + SQLite recovery + CLOB V2 preflight\n"
         )
-        assert "strategy_version=aftertake_twap_price_path_tail_v2" in notifier.messages[0]
+        assert "strategy_version=aftertake_twap_pm_tail_v3" in notifier.messages[0]
         assert "notification_ts_utc=" in notifier.messages[0]
         assert "notification_ts_ms=" in notifier.messages[0]
         audit = _kwargs["store"]._conn.execute(

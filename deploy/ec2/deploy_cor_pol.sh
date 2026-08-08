@@ -77,16 +77,13 @@ normalize_runtime_env() {
   ensure_env_kv AFTERTAKE_ASSETS BTC,ETH,SOL,XRP,BNB,DOGE
   ensure_env_default AFTERTAKE_QTY 5
   ensure_env_default AFTERTAKE_ORDER_TYPE GTC
-  ensure_env_default AFTERTAKE_TAIL_DECISION_LEAD_S 10.25
-  ensure_env_default AFTERTAKE_TAIL_MAX_DECISION_LATENESS_S 0.250
+  ensure_env_kv AFTERTAKE_TAIL_DECISION_LEAD_S 10.0
+  ensure_env_kv AFTERTAKE_TAIL_MAX_DECISION_LATENESS_S 1.0
   ensure_env_default AFTERTAKE_TAIL_LEADER_BID_THRESHOLD 0.90
   ensure_env_default AFTERTAKE_TAIL_PM_QUOTE_MAX_AGE_S 2.0
-  ensure_env_default AFTERTAKE_TAIL_BINANCE_MAX_TRADE_AGE_S 2.0
-  ensure_env_default AFTERTAKE_TAIL_WEAK_CANDLE_ABS_MOVE_BPS 5.0
-  ensure_env_default AFTERTAKE_TAIL_WEAK_PATH_REVERSAL_BPS 2.0
   ensure_env_default AFTERTAKE_TAIL_LIMIT_PRICE 0.99
   ensure_env_default AFTERTAKE_TAIL_MIN_NET_WIN_PER_SHARE 0.001
-  for key in AFTERTAKE_POST_CLOSE_SNAPSHOT_DELAY_S AFTERTAKE_POST_CLOSE_LEADER_BID_THRESHOLD AFTERTAKE_POST_CLOSE_PAIRED_MAX_AGE_S AFTERTAKE_POST_CLOSE_SNAPSHOT_MAX_LATENESS_S AFTERTAKE_POST_CLOSE_LIMIT_PRICE AFTERTAKE_TAIL_MIN_ENTRY_ASK_SIZE; do
+  for key in AFTERTAKE_POST_CLOSE_SNAPSHOT_DELAY_S AFTERTAKE_POST_CLOSE_LEADER_BID_THRESHOLD AFTERTAKE_POST_CLOSE_PAIRED_MAX_AGE_S AFTERTAKE_POST_CLOSE_SNAPSHOT_MAX_LATENESS_S AFTERTAKE_POST_CLOSE_LIMIT_PRICE AFTERTAKE_TAIL_MIN_ENTRY_ASK_SIZE AFTERTAKE_TAIL_BINANCE_MAX_TRADE_AGE_S AFTERTAKE_TAIL_WEAK_CANDLE_ABS_MOVE_BPS AFTERTAKE_TAIL_WEAK_PATH_REVERSAL_BPS; do
     if grep -q -E "^[[:space:]]*${key}[[:space:]]*=" "${ENV_FILE}"; then
       comment_out_legacy_env "${key}"
     fi
@@ -120,16 +117,16 @@ require_twap_tail_contract() {
     exit 2
   }
   case "${lead}" in
-    10.25|10.250|10.2500) ;;
-    *) echo "AFTERTAKE_TAIL_DECISION_LEAD_S must be 10.25; found '${lead}'. Refusing deployment." >&2; exit 2 ;;
+    10|10.0|10.00|10.000) ;;
+    *) echo "AFTERTAKE_TAIL_DECISION_LEAD_S must be 10.0; found '${lead}'. Refusing deployment." >&2; exit 2 ;;
   esac
   case "${threshold}" in
     0.9|0.90|0.900) ;;
     *) echo "AFTERTAKE_TAIL_LEADER_BID_THRESHOLD must be 0.90; found '${threshold}'. Refusing deployment." >&2; exit 2 ;;
   esac
   case "${lateness}" in
-    0.25|0.250|0.2500) ;;
-    *) echo "AFTERTAKE_TAIL_MAX_DECISION_LATENESS_S must be 0.250; found '${lateness}'. Refusing deployment." >&2; exit 2 ;;
+    1|1.0|1.00|1.000) ;;
+    *) echo "AFTERTAKE_TAIL_MAX_DECISION_LATENESS_S must be 1.0; found '${lateness}'. Refusing deployment." >&2; exit 2 ;;
   esac
   case "${limit}" in
     0.99|0.990) ;;

@@ -104,15 +104,12 @@ class Settings:
     post_close_paired_max_age_s: float = POST_CLOSE_SNAPSHOT_PAIRED_MAX_AGE_S
     post_close_snapshot_max_lateness_s: float = POST_CLOSE_SNAPSHOT_MAX_LATENESS_S
     post_close_limit_price: float = POST_CLOSE_SNAPSHOT_LIMIT_PRICE
-    # TWAP-tail live contract. Binance USD-M Futures is a causal path filter only; PM
-    # settlement remains the market's configured oracle/TWAP source.
-    tail_decision_lead_s: float = 10.25
-    tail_max_decision_lateness_s: float = 0.25
+    # TWAP-tail live contract. Binance Futures is observational only; the PM
+    # book selects the side and PM remains the configured resolution source.
+    tail_decision_lead_s: float = 10.0
+    tail_max_decision_lateness_s: float = 1.0
     tail_leader_bid_threshold: float = 0.90
     tail_pm_quote_max_age_s: float = 2.0
-    tail_binance_max_trade_age_s: float = 2.0
-    tail_weak_candle_abs_move_bps: float = 5.0
-    tail_weak_path_reversal_bps: float = 2.0
     tail_limit_price: float = 0.99
     tail_min_net_win_per_share: float = 0.001
     out_dir: Path = Path("out")
@@ -200,9 +197,6 @@ class Settings:
             max_decision_lateness_s=self.tail_max_decision_lateness_s,
             leader_bid_threshold=self.tail_leader_bid_threshold,
             pm_quote_max_age_s=self.tail_pm_quote_max_age_s,
-            binance_max_trade_age_s=self.tail_binance_max_trade_age_s,
-            weak_candle_abs_move_bps=self.tail_weak_candle_abs_move_bps,
-            weak_path_reversal_bps=self.tail_weak_path_reversal_bps,
             entry_limit_price=self.tail_limit_price,
         ).validate()
         if self.tail_min_net_win_per_share < 0:
@@ -285,13 +279,10 @@ class Settings:
             post_close_limit_price=_float(
                 "AFTERTAKE_POST_CLOSE_LIMIT_PRICE", POST_CLOSE_SNAPSHOT_LIMIT_PRICE
             ),
-            tail_decision_lead_s=_float("AFTERTAKE_TAIL_DECISION_LEAD_S", 10.25),
-            tail_max_decision_lateness_s=_float("AFTERTAKE_TAIL_MAX_DECISION_LATENESS_S", 0.25),
+            tail_decision_lead_s=_float("AFTERTAKE_TAIL_DECISION_LEAD_S", 10.0),
+            tail_max_decision_lateness_s=_float("AFTERTAKE_TAIL_MAX_DECISION_LATENESS_S", 1.0),
             tail_leader_bid_threshold=_float("AFTERTAKE_TAIL_LEADER_BID_THRESHOLD", 0.90),
             tail_pm_quote_max_age_s=_float("AFTERTAKE_TAIL_PM_QUOTE_MAX_AGE_S", 2.0),
-            tail_binance_max_trade_age_s=_float("AFTERTAKE_TAIL_BINANCE_MAX_TRADE_AGE_S", 2.0),
-            tail_weak_candle_abs_move_bps=_float("AFTERTAKE_TAIL_WEAK_CANDLE_ABS_MOVE_BPS", 5.0),
-            tail_weak_path_reversal_bps=_float("AFTERTAKE_TAIL_WEAK_PATH_REVERSAL_BPS", 2.0),
             tail_limit_price=_float("AFTERTAKE_TAIL_LIMIT_PRICE", 0.99),
             tail_min_net_win_per_share=_float("AFTERTAKE_TAIL_MIN_NET_WIN_PER_SHARE", 0.001),
             out_dir=out_dir,

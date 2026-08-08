@@ -1072,9 +1072,6 @@ def _tail_rule_config_for_settings(settings: Settings) -> TailRuleConfig:
         max_decision_lateness_s=settings.tail_max_decision_lateness_s,
         leader_bid_threshold=settings.tail_leader_bid_threshold,
         pm_quote_max_age_s=settings.tail_pm_quote_max_age_s,
-        binance_max_trade_age_s=settings.tail_binance_max_trade_age_s,
-        weak_candle_abs_move_bps=settings.tail_weak_candle_abs_move_bps,
-        weak_path_reversal_bps=settings.tail_weak_path_reversal_bps,
         entry_limit_price=settings.tail_limit_price,
     )
     config.validate()
@@ -2625,10 +2622,6 @@ def _run_twap_tail_round(
                     notify_on_no_transition=True,
                 )
                 break
-            if binance_proxy is None:
-                hold("tail_binance_futures_proxy_missing", now=now)
-                break
-
             with observations_lock:
                 quotes = tuple(
                     PMQuote(
@@ -2644,7 +2637,11 @@ def _run_twap_tail_round(
                 )
             decision = evaluate_tail_decision(
                 quotes=quotes,
-                binance=binance_proxy.tail_input(active_asset, round_start),
+                binance=(
+                    binance_proxy.tail_input(active_asset, round_start)
+                    if binance_proxy is not None
+                    else None
+                ),
                 round_end_ts=round_end,
                 decision_ts=now,
                 config=cfg,
@@ -3062,10 +3059,10 @@ def _select_next_round_start(
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.time,
 ) -> int:
-    """Return a fresh boundary with continuous Binance Futures tape coverage.
+    """Return an active round when enough preflight lead remains.
 
-    A restarted process cannot reconstruct the already-open candle.  Waiting
-    for a clean boundary is therefore intentional fail-closed behavior.
+    Binance Futures is observational only, so a restart does not need a full
+    candle. Joining the active market avoids an unnecessary extra-round wait.
     """
 
     observed_now = float(now)
@@ -3073,7 +3070,7 @@ def _select_next_round_start(
         current = int(observed_now)
         active_start = current - current % 300
         active_end = active_start + 300
-        minimum_lead_s = 299.5
+        minimum_lead_s = LIVE_PREFLIGHT_LEAD_S
         if (
             active_start not in processed_round_starts
             and active_end - observed_now >= minimum_lead_s
@@ -4016,7 +4013,6 @@ def _status_payload(settings: Settings, store: StateStore) -> Dict[str, Any]:
         "leader_bid_threshold": tail.leader_bid_threshold,
         "leader_bid_comparison": "strictly_greater_than",
         "paired_receive_max_age_ms": int(tail.pm_quote_max_age_s * 1000),
-        "binance_trade_max_age_ms": int(tail.binance_max_trade_age_s * 1000),
         "max_decision_lateness_ms": int(tail.max_decision_lateness_s * 1000),
         "entry_limit_price": tail.entry_limit_price,
         "decision_window_ms": [
@@ -4027,9 +4023,7 @@ def _status_payload(settings: Settings, store: StateStore) -> Dict[str, Any]:
         "confirmations": 0,
         "confirmation_spacing_ms": 0,
         "post_close_classifier_for_live_entry": False,
-        "binance_role": "usd_m_futures_path_filter_not_settlement_oracle",
-        "weak_candle_abs_move_bps": tail.weak_candle_abs_move_bps,
-        "weak_path_reversal_bps": tail.weak_path_reversal_bps,
+        "binance_role": "usd_m_futures_observational_only_not_entry_gate",
         "require_loser_refill_failure": False,
         "require_stable_post_close_leader": False,
         "order_type": settings.order_type,
@@ -4056,13 +4050,12 @@ def _tail_runtime_payload(settings: Settings) -> Dict[str, Any]:
         "leader_bid_threshold": config.leader_bid_threshold,
         "leader_bid_comparison": "strictly_greater_than",
         "paired_receive_max_age_s": config.pm_quote_max_age_s,
-        "binance_trade_max_age_s": config.binance_max_trade_age_s,
         "max_decision_lateness_s": config.max_decision_lateness_s,
         "max_decision_lateness_ms": int(config.max_decision_lateness_s * 1000),
         "entry_limit_price": config.entry_limit_price,
         "order_type": settings.order_type,
         "post_close_classifier_for_live_entry": False,
-        "binance_role": "usd_m_futures_path_filter_not_settlement_oracle",
+        "binance_role": "usd_m_futures_observational_only_not_entry_gate",
     }
 
 

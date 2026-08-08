@@ -1,9 +1,8 @@
 """Causal pre-close gate for Polymarket 30-second crypto TWAP markets.
 
 The Polymarket outcome is resolved by its published oracle/TWAP rule, not by
-Binance.  Binance USD-M Futures is used here only as a fast, public *path filter*: if a
-small five-minute move is already reversing in the final thirty seconds, the
-runner stands down rather than treating a stale CLOB leader as a certainty.
+Binance. Binance USD-M Futures is collected for diagnostics only; it does not
+select the side or block an otherwise-qualified PM decision.
 
 This module has no network or execution side effects.  All observations are
 filtered ``as_of`` the decision timestamp so an offline replay cannot leak a
@@ -18,7 +17,7 @@ from typing import Any, Dict, Iterable, Optional, Sequence
 
 from .post_close import PostCloseDecision
 
-STRATEGY_VERSION = "aftertake_twap_price_path_tail_v2"
+STRATEGY_VERSION = "aftertake_twap_pm_tail_v3"
 TWAP_CUTOVER_TS = 1_786_060_800
 SUPPORTED_ASSETS = ("BTC", "ETH", "SOL", "XRP", "BNB", "DOGE")
 
@@ -27,13 +26,10 @@ SUPPORTED_ASSETS = ("BTC", "ETH", "SOL", "XRP", "BNB", "DOGE")
 class TailRuleConfig:
     """Explicit, fail-closed thresholds for the live tail entry."""
 
-    decision_lead_s: float = 10.25
-    max_decision_lateness_s: float = 0.25
+    decision_lead_s: float = 10.0
+    max_decision_lateness_s: float = 1.0
     leader_bid_threshold: float = 0.90
     pm_quote_max_age_s: float = 2.0
-    binance_max_trade_age_s: float = 2.0
-    weak_candle_abs_move_bps: float = 5.0
-    weak_path_reversal_bps: float = 2.0
     entry_limit_price: float = 0.99
     strategy_version: str = STRATEGY_VERSION
 
@@ -46,12 +42,6 @@ class TailRuleConfig:
             raise ValueError("tail leader bid threshold must be in (0, 1)")
         if not 0 < self.pm_quote_max_age_s <= 5:
             raise ValueError("tail PM quote maximum age must be in (0, 5] seconds")
-        if not 0 < self.binance_max_trade_age_s <= 5:
-            raise ValueError("tail Binance trade maximum age must be in (0, 5] seconds")
-        if self.weak_candle_abs_move_bps <= 0:
-            raise ValueError("tail weak candle threshold must be > 0 bps")
-        if self.weak_path_reversal_bps < 0:
-            raise ValueError("tail reversal threshold must be >= 0 bps")
         if not 0 < self.entry_limit_price < 1:
             raise ValueError("tail entry limit price must be in (0, 1)")
 
@@ -133,7 +123,7 @@ def _hold(reason: str, audit: Dict[str, Any], *, side: str = "") -> PostCloseDec
 def evaluate_tail_decision(
     *,
     quotes: Iterable[PMQuote],
-    binance: BinanceTailInput,
+    binance: Optional[BinanceTailInput],
     round_end_ts: float,
     decision_ts: float,
     config: Optional[TailRuleConfig] = None,
@@ -141,8 +131,8 @@ def evaluate_tail_decision(
     """Evaluate a single pre-close tail decision without future information.
 
     ``decision_ts`` must be near ``round_end - decision_lead``.  The CLOB
-    leader is the candidate side.  The complete Binance Futures tape only filters
-    obvious weak-candle reversals; it never replaces PM's resolution oracle.
+    leader is the candidate side. Binance Futures is recorded for diagnostics
+    only and never blocks or selects the PM side.
     """
 
     cfg = config or TailRuleConfig()
@@ -158,18 +148,23 @@ def evaluate_tail_decision(
         "decision_cutoff_ts": target_ts + cfg.max_decision_lateness_s,
         "leader_bid_threshold": cfg.leader_bid_threshold,
         "pm_quote_max_age_s": cfg.pm_quote_max_age_s,
-        "binance_max_trade_age_s": cfg.binance_max_trade_age_s,
-        "weak_candle_abs_move_bps": cfg.weak_candle_abs_move_bps,
-        "weak_path_reversal_bps": cfg.weak_path_reversal_bps,
-        "binance_source": "usd_m_futures_aggTrade_path_filter_not_settlement_oracle",
+        "binance_source": "usd_m_futures_aggTrade_observational_only",
+        "binance_gate_applied": False,
     }
     if now < target_ts:
         return _hold("tail_decision_not_due", audit)
     if now > target_ts + cfg.max_decision_lateness_s:
         return _hold("tail_decision_too_late", audit)
-    if not binance.complete_coverage:
-        audit["binance_invalid_reason"] = binance.invalid_reason or "incomplete_coverage"
-        return _hold("binance_futures_coverage_incomplete", audit)
+    if binance is None:
+        audit.update({"binance_complete_coverage": False, "binance_invalid_reason": "proxy_missing"})
+    else:
+        audit.update(
+            {
+                "binance_complete_coverage": bool(binance.complete_coverage),
+                "binance_invalid_reason": binance.invalid_reason,
+                "binance_observed_trade_count": len(binance.trades),
+            }
+        )
 
     eligible_quotes = [quote for quote in quotes if _finite(quote.observed_at) and quote.observed_at <= now]
     quote = max(eligible_quotes, key=lambda item: item.observed_at, default=None)
@@ -206,73 +201,9 @@ def evaluate_tail_decision(
     if not _finite(entry_ask, high=1.0) or float(entry_ask) > cfg.entry_limit_price:
         return _hold("tail_pm_entry_ask_not_marketable_within_cap", audit, side=side)
 
-    as_of_ms = int(now * 1000)
-    start_ms = int(binance.round_start_ms)
-    causal_trades = tuple(
-        trade
-        for trade in binance.trades
-        if start_ms <= trade.trade_ms <= as_of_ms
-        and trade.received_ms <= as_of_ms
-        and _finite(trade.price)
-    )
-    first = min(causal_trades, key=lambda trade: (trade.trade_ms, trade.received_ms), default=None)
-    latest = _latest_at_or_before(causal_trades, as_of_ms)
-    audit["binance_causal_trade_count"] = len(causal_trades)
-    if first is None or latest is None:
-        return _hold("tail_binance_futures_tape_missing", audit, side=side)
-    latest_age_s = (as_of_ms - latest.received_ms) / 1000.0
-    audit.update(
-        {
-            "binance_open_price": first.price,
-            "binance_latest_price": latest.price,
-            "binance_latest_trade_ms": latest.trade_ms,
-            "binance_latest_received_ms": latest.received_ms,
-            "binance_latest_age_ms": max(0.0, latest_age_s * 1000.0),
-        }
-    )
-    if latest_age_s < 0 or latest_age_s > cfg.binance_max_trade_age_s:
-        return _hold("tail_binance_futures_tape_stale", audit, side=side)
-
-    candle_bps = _price_change_bps(first.price, latest.price)
-    candle_side = _side_for_change(candle_bps)
-    audit.update({"binance_candle_move_bps": candle_bps, "binance_candle_side": candle_side})
-    if not candle_side:
-        return _hold("tail_binance_candle_flat", audit, side=side)
-    if candle_side != side:
-        return _hold("tail_binance_candle_direction_mismatch", audit, side=side)
-
-    if abs(candle_bps) > cfg.weak_candle_abs_move_bps:
-        audit["path_gate"] = "strong_candle_direction_only"
-    else:
-        window30 = _latest_at_or_before(causal_trades, int((round_end - 30.0) * 1000))
-        window20 = _latest_at_or_before(causal_trades, int((round_end - 20.0) * 1000))
-        if window30 is None or window20 is None:
-            return _hold("tail_binance_path_anchor_missing", audit, side=side)
-        move30_bps = _price_change_bps(window30.price, latest.price)
-        move20_bps = _price_change_bps(window20.price, latest.price)
-        move30_side = _side_for_change(move30_bps)
-        move20_side = _side_for_change(move20_bps)
-        reversal_bps = _adverse_reversal_bps(
-            causal_trades, side, int((round_end - 30.0) * 1000), as_of_ms
-        )
-        audit.update(
-            {
-                "path_gate": "weak_candle_30s_20s_direction_and_reversal",
-                "binance_move_30s_to_decision_bps": move30_bps,
-                "binance_move_20s_to_decision_bps": move20_bps,
-                "binance_move_30s_side": move30_side,
-                "binance_move_20s_side": move20_side,
-                "binance_adverse_reversal_bps": reversal_bps,
-            }
-        )
-        if move30_side != side or move20_side != side:
-            return _hold("tail_weak_candle_path_direction_mismatch", audit, side=side)
-        if reversal_bps is None or reversal_bps > cfg.weak_path_reversal_bps:
-            return _hold("tail_weak_candle_reversal_too_large", audit, side=side)
-
     return PostCloseDecision(
         "enter",
-        "tail_twap_price_path_qualified",
+        "tail_pm_twap_qualified",
         side=side,
         entry_ask=cfg.entry_limit_price,
         entry_ask_size=entry_ask_size,

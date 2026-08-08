@@ -8,27 +8,21 @@ leader bid」規則；舊分類器沒有被 runtime 呼叫。
 - 最終輸贏只依 Polymarket/Gamma 市場的官方結算。
 - 只交易 Gamma metadata 明確標示 `cryptoMarketConfig.twapEnabled=true`、
   `twapLookbackSeconds=30` 的市場；metadata 缺失、非 30 秒或切換日前市場一律跳過。
-- Binance **USD-M Futures** `aggTrade` 不是結算 oracle，也不預測官方價格。它只是一條連續收集的
-  因果價格路徑，用來拒絕末段反轉。
+- Binance **USD-M Futures** `aggTrade` 僅供 audit；不是結算 oracle，也不是進場 gate。
 
 ## 單一決策點
 
-對每個完整五分鐘 candle，決策時間為 `E - 10.25s`，可接受的 scheduler 遲到最多
-`250ms`。超過即 HOLD；不會事後補判、重試或改方向。
+對每個完整五分鐘 candle，決策時間為 `E - 10s`，可接受的 scheduler 遲到最多
+`1s`。超過即 HOLD；不會事後補判、重試或改方向。
 
 1. 取得本地接收、決策時不超過 2 秒的 YES/NO 配對 CLOB quote。
 2. 選 best bid 較高的一側，且該 bid 必須嚴格大於 `0.90`。
-3. 該側可成交 ask 必須在 `.99` 價格上限內，且顯示深度至少能承接設定數量。
-4. Binance Futures tape 必須從 candle 開始前已連線、沒有中斷、沒有 buffer overflow，且最新
-   trade 本地接收時間距決策不超過 2 秒。
-5. 5 分鐘 Futures 方向要和 PM leader 相同。
-   - 若整根 move 絕對值大於 5bp：通過方向與新鮮度即可。
-   - 若 move 在 0--5bp：`E-30s → D` 與 `E-20s → D` 必須同向，且最後 30 秒的逆向
-     drawdown 不得超過 2bp。
-6. 再過既有風控、帳戶餘額/allowance、fee floor、最小單位和 SQLite reservation 後，才送一筆
+3. 該側可成交 ask 必須在 `.99` 價格上限內；顯示深度不阻擋送單。
+4. Futures 缺資料、方向相反、重連或 candle 不完整只寫入 audit，不改變 PM 判斷。
+5. 再過既有風控、帳戶餘額/allowance、fee floor、最小單位和 SQLite reservation 後，才送一筆
    marketable GTC limit；價格上限固定 `.99`。
 
-任一資料缺失、WS 重連、quote/tape 過期、方向不合、弱 candle 反轉、費用後下限不足、風控拒絕
+PM quote 缺失或過期、費用後下限不足、風控拒絕
 都等同 **不交易**。
 
 ## 為何不用「0ms」當 alpha

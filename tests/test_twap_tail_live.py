@@ -142,14 +142,14 @@ def test_live_path_uses_preclose_twap_tail_and_dry_run_never_sends_order(tmp_pat
         )
         assert decisions[0].action == "enter"
         assert decisions[0].side == "YES"
-        assert decisions[0].audit["strategy_version"] == "aftertake_twap_price_path_tail_v2"
+        assert decisions[0].audit["strategy_version"] == "aftertake_twap_pm_tail_v3"
         assert store.open_positions()[0].requested_qty == 5.0
     finally:
         store.close()
 
 
 def test_live_path_rejects_late_scheduler_without_reservation(tmp_path):
-    clock = _Clock(ROUND_END - 9.99)
+    clock = _Clock(ROUND_END - 8.90)
     store = StateStore(tmp_path / "state.sqlite3")
     try:
         settings = Settings(dry_run=True, out_dir=tmp_path / "out", state_db=tmp_path / "state.sqlite3")
