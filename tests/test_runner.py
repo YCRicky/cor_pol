@@ -1584,18 +1584,24 @@ def test_configured_assets_do_not_block_each_other_by_position_or_cooldown(tmp_p
         store.close()
 
 
-def test_round_scheduler_joins_active_round_after_previous_close_instead_of_skipping():
+def test_round_scheduler_skips_partial_round_without_full_binance_coverage():
     slept = []
     processed = {900}
+    current = [1201.0]
+
+    def sleep(seconds):
+        slept.append(seconds)
+        current[0] += seconds
 
     selected = _select_next_round_start(
-        now=1201.0,
+        now=current[0],
         processed_round_starts=processed,
-        sleep=lambda seconds: slept.append(seconds),
+        sleep=sleep,
+        clock=lambda: current[0],
     )
 
-    assert selected == 1200
-    assert slept == []
+    assert selected == 1500
+    assert slept == [299.0]
 
 
 def test_round_scheduler_waits_when_active_round_is_too_close_to_close():
@@ -1779,10 +1785,11 @@ def test_service_main_reports_boot_before_any_live_pm_connection(monkeypatch, tm
     def assert_boot_then_stop(**_kwargs):
         assert len(notifier.messages) == 1
         assert notifier.messages[0].startswith(
-                "[Aftertake] BOOT\nmode=LIVE qty=50.0000 assets=BTC,ETH,XRP,HYPE,DOGE,SOL\n"
+            "[Aftertake] BOOT\nmode=LIVE qty=5.0000 assets=BTC,ETH,SOL,XRP,BNB,DOGE\n"
             f"pid=4242 code_sha={code_sha}\n"
             "multi-asset per-asset risk gates + SQLite recovery + CLOB V2 preflight\n"
         )
+        assert "strategy_version=aftertake_twap_price_path_tail_v2" in notifier.messages[0]
         assert "notification_ts_utc=" in notifier.messages[0]
         assert "notification_ts_ms=" in notifier.messages[0]
         audit = _kwargs["store"]._conn.execute(

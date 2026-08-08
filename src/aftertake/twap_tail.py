@@ -18,7 +18,6 @@ from typing import Any, Dict, Iterable, Optional, Sequence
 
 from .post_close import PostCloseDecision
 
-
 STRATEGY_VERSION = "aftertake_twap_price_path_tail_v2"
 TWAP_CUTOVER_TS = 1_786_060_800
 SUPPORTED_ASSETS = ("BTC", "ETH", "SOL", "XRP", "BNB", "DOGE")

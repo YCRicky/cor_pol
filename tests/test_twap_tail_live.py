@@ -6,8 +6,7 @@ from aftertake.pm_client import GammaMarket
 from aftertake.post_close import PairedBook, SideBook
 from aftertake.runner import run_round
 from aftertake.state import StateStore
-from aftertake.twap_tail import BinanceTailInput, BinanceTrade, TWAP_CUTOVER_TS
-
+from aftertake.twap_tail import TWAP_CUTOVER_TS, BinanceTailInput, BinanceTrade
 
 ROUND_START = TWAP_CUTOVER_TS + 300
 ROUND_END = ROUND_START + 300

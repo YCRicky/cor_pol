@@ -147,7 +147,7 @@ def test_v9_live_runner_requires_explicit_live_flag(tmp_path):
         state_db=tmp_path / "state.sqlite3",
     )
     try:
-        with pytest.raises(LivePreflightError, match="AFTERTAKE_V9_LIVE_ENABLED"):
+        with pytest.raises(LivePreflightError, match="AFTERTAKE_STRATEGY=twap_tail_v2"):
             run_round(
                 settings=settings,
                 store=store,
@@ -237,7 +237,7 @@ class _V9Gateway:
         return {"heartbeat_id": "v9-heartbeat"}
 
 
-def test_v9_runner_is_explicit_and_uses_one_shared_live_post(tmp_path):
+def test_v9_runner_cannot_reach_live_post_after_twap_tail_cutover(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     gateway = _V9Gateway()
     settings = Settings(
@@ -250,25 +250,19 @@ def test_v9_runner_is_explicit_and_uses_one_shared_live_post(tmp_path):
     )
     try:
         times = iter((1190.0, 1190.1, 1200.40, 1200.50, 1200.50))
-        decisions = run_round(
-            settings=settings,
-            store=store,
-            public=_V9Public(),
-            executor=OrderExecutor(settings, store, gateway=gateway, wall_clock=lambda: 1200.50),
-            live_gateway=gateway,
-            round_start=900,
-            clock=lambda: next(times, 1200.50),
-            sleep=lambda _: None,
-            stream_factory=_V9Stream,
-        )
+        with pytest.raises(LivePreflightError, match="AFTERTAKE_STRATEGY=twap_tail_v2"):
+            run_round(
+                settings=settings,
+                store=store,
+                public=_V9Public(),
+                executor=OrderExecutor(settings, store, gateway=gateway, wall_clock=lambda: 1200.50),
+                live_gateway=gateway,
+                round_start=900,
+                clock=lambda: next(times, 1200.50),
+                sleep=lambda _: None,
+                stream_factory=_V9Stream,
+            )
 
-        assert any(decision.action == "enter" for decision in decisions)
-        assert len(gateway.posts) == 1
-        assert gateway.posts[0][1] == 0.99
-        assert gateway.posts[0][2] == 50
-        assert store.market_state("btc-updown-5m-900") == "open"
-        assert store.open_positions()[0].raw["timing"]["book_observed_ts"] == 1200.40
-        enter_decision = next(decision for decision in decisions if decision.action == "enter")
-        assert enter_decision.audit["strategy_version"] == "aftertake_postclose_snapshot_v1_plus0_5_leader_bid_gt_080"
+        assert gateway.posts == []
     finally:
         store.close()

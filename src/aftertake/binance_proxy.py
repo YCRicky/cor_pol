@@ -15,7 +15,6 @@ from typing import Dict, Iterable, Optional, Tuple
 
 from .twap_tail import BinanceTailInput, BinanceTrade
 
-
 WINDOW_MS = 300_000
 MAX_TRADES_PER_CANDLE = 32_768
 DEFAULT_SYMBOLS = {

@@ -1,12 +1,11 @@
 from aftertake.twap_tail import (
+    TWAP_CUTOVER_TS,
     BinanceTailInput,
     BinanceTrade,
     PMQuote,
-    TWAP_CUTOVER_TS,
     evaluate_tail_decision,
     twap_market_gate,
 )
-
 
 ROUND_START = TWAP_CUTOVER_TS + 300
 ROUND_END = ROUND_START + 300
