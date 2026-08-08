@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from aftertake.config import Settings
 from aftertake.execution import OrderExecutor
-from aftertake.pm_client import GammaMarket
+from aftertake.pm_client import (
+    BalanceAllowance,
+    GammaMarket,
+    GeoStatus,
+    LivePreflight,
+    MarketMetadata,
+)
 from aftertake.post_close import PairedBook, SideBook
 from aftertake.runner import run_round
 from aftertake.state import StateStore
@@ -52,6 +58,47 @@ class _Public:
             active=True,
             raw={"cryptoMarketConfig": {"twapEnabled": True, "twapLookbackSeconds": 30}},
         )
+
+    def geoblock_status(self, _endpoint):
+        return GeoStatus(blocked=False, country="", region="", ip="")
+
+
+class _Gateway:
+    def __init__(self):
+        self.posts = []
+
+    def preflight(self, geo, _required_cash):
+        return LivePreflight(
+            geo=geo,
+            collateral=BalanceAllowance(balance=100.0, allowance=100.0, raw={}),
+            closed_only=False,
+        )
+
+    def market_metadata(self, condition_id):
+        return MarketMetadata(
+            condition_id=condition_id,
+            tick_size="0.01",
+            min_order_size=1.0,
+            neg_risk=False,
+            fee_rate=0.0,
+            tokens={"up": "up-token", "down": "down-token"},
+            raw={},
+        )
+
+    def submit_limit_buy_fast(self, token_id, price, qty, metadata, order_type="GTC"):
+        self.posts.append((token_id, price, qty, metadata.condition_id, order_type))
+        return {"orderID": "twap-tail-order-1"}
+
+    def get_order(self, order_id):
+        return {
+            "id": order_id,
+            "status": "matched",
+            "size_matched": "5",
+            "average_price": "0.95",
+        }
+
+    def order_trades(self, _token_id, _order_id):
+        return []
 
 
 class _Proxy:
@@ -120,5 +167,37 @@ def test_live_path_rejects_late_scheduler_without_reservation(tmp_path):
         )
         assert decisions[-1].reason == "tail_decision_too_late"
         assert not store.open_positions()
+    finally:
+        store.close()
+
+
+def test_live_twap_tail_path_submits_exactly_one_gtc_order(tmp_path):
+    clock = _Clock(ROUND_END - 10.20)
+    store = StateStore(tmp_path / "state.sqlite3")
+    gateway = _Gateway()
+    try:
+        settings = Settings(
+            dry_run=False,
+            order_type="GTC",
+            out_dir=tmp_path / "out",
+            state_db=tmp_path / "state.sqlite3",
+            min_seconds_between_entries=0,
+        )
+        decisions = run_round(
+            settings=settings,
+            store=store,
+            public=_Public(),
+            executor=OrderExecutor(settings, store, gateway=gateway, wall_clock=clock),
+            live_gateway=gateway,
+            round_start=ROUND_START,
+            clock=clock,
+            sleep=clock.sleep,
+            stream_factory=_Stream,
+            binance_proxy=_Proxy(),
+        )
+
+        assert decisions[0].action == "enter"
+        assert gateway.posts == [("up-token", 0.99, 5.0, "condition", "GTC")]
+        assert store.open_positions()[0].order_id == "twap-tail-order-1"
     finally:
         store.close()
