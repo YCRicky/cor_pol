@@ -57,6 +57,7 @@ from .risk import RiskRejected, check_entry_risk
 from .rounds import CRYPTO_5M_WINDOW_S
 from .settlement import builder_fee_total, fee_total, settle_trade
 from .state import RuntimeLock, StateStore
+from .twap_tail import PMQuote, TailRuleConfig, evaluate_tail_decision, twap_market_gate
 from .v9 import V9DualLaneClassifier, active_v9_config
 
 _TELEGRAM_NOTIFIER_TYPE = Notifier
@@ -1052,15 +1053,35 @@ def _build_dry_metadata(market: GammaMarket) -> MarketMetadata:
 
 
 def _required_cash(settings: Settings, metadata: MarketMetadata) -> float:
-    """Reserve enough cash for the fixed close+500ms order."""
+    """Reserve enough cash for the fixed TWAP-tail order."""
 
-    price = float(settings.post_close_limit_price)
+    price = float(settings.tail_limit_price)
     qty = float(settings.qty)
     return (
         price * qty
         + fee_total(price, qty, metadata.fee_rate, metadata.fee_exponent)
         + builder_fee_total(price, qty, metadata.builder_taker_fee_bps)
     )
+
+
+def _tail_rule_config_for_settings(settings: Settings) -> TailRuleConfig:
+    """Build the one explicit production tail contract from environment settings."""
+
+    config = TailRuleConfig(
+        decision_lead_s=settings.tail_decision_lead_s,
+        max_decision_lateness_s=settings.tail_max_decision_lateness_s,
+        leader_bid_threshold=settings.tail_leader_bid_threshold,
+        pm_quote_max_age_s=settings.tail_pm_quote_max_age_s,
+        binance_max_trade_age_s=settings.tail_binance_max_trade_age_s,
+        weak_candle_abs_move_bps=settings.tail_weak_candle_abs_move_bps,
+        weak_path_reversal_bps=settings.tail_weak_path_reversal_bps,
+        entry_limit_price=settings.tail_limit_price,
+        # A visible quote must support the actual fixed order, not merely a
+        # smaller generic depth threshold.
+        min_entry_ask_size=max(settings.tail_min_entry_ask_size, settings.qty),
+    )
+    config.validate()
+    return config
 
 
 class _RoundAccountPreflight:
@@ -2431,6 +2452,348 @@ def _run_post_close_snapshot_round(
     return decisions
 
 
+def _run_twap_tail_round(
+    *,
+    settings: Settings,
+    store: StateStore,
+    public: PolymarketPublicClient,
+    executor: OrderExecutor,
+    live_gateway: Optional[V2ClobGateway],
+    round_start: int,
+    asset: Optional[str] = None,
+    round_preflight: Optional[_RoundAccountPreflight] = None,
+    clock: Callable[[], float] = time.time,
+    sleep: Callable[[float], None] = time.sleep,
+    notifier: Optional[Notifier] = None,
+    stream_factory: Callable[..., MarketBookStream] = MarketBookStream,
+    binance_proxy: Optional[BinanceFiveMinuteProxy] = None,
+) -> List[PostCloseDecision]:
+    """Run the only production entry path: causal pre-close 30s-TWAP tail.
+
+    The market must opt in through Gamma's ``cryptoMarketConfig``.  A Spot
+    stream disconnect, missing paired CLOB quote, late scheduler, insufficient
+    depth, or any weak-candle reversal results in a single HOLD and no retry.
+    """
+
+    active_asset = str(asset or settings.asset).upper().strip()
+    slug, expected_start, round_end = current_crypto_5m_slug(active_asset, round_start)
+    if expected_start != int(round_start):
+        raise ValueError("run_round requires a 5-minute boundary")
+    if settings.strategy_family != "twap_tail_v2":
+        raise LivePreflightError("production runner requires AFTERTAKE_STRATEGY=twap_tail_v2")
+    if str(settings.order_type).upper().strip() != "GTC":
+        raise LivePreflightError("tail live entry requires AFTERTAKE_ORDER_TYPE=GTC")
+    cfg = _tail_rule_config_for_settings(settings)
+    target_ts = float(round_end) - cfg.decision_lead_s
+    cutoff_ts = target_ts + cfg.max_decision_lateness_s
+    notifier = notifier or Notifier(token=settings.telegram_token, chat_id=settings.telegram_chat_id)
+    market = public.market_by_slug(slug)
+    if not market.condition_id:
+        raise LivePreflightError("Gamma market has no condition ID")
+    store.observe_market(slug, market.condition_id, round_start)
+    gate_reason = twap_market_gate(active_asset, market.raw, round_start)
+    if gate_reason:
+        decision = PostCloseDecision(
+            "hold",
+            gate_reason,
+            audit={
+                "strategy_version": cfg.strategy_version,
+                "asset": active_asset,
+                "round_start": int(round_start),
+                "round_end_ts": float(round_end),
+                "tail_decision_target_ts": target_ts,
+                "gamma_raw_present": bool(market.raw),
+            },
+        )
+        _audit_decision(settings, store, decision, slug)
+        return [decision]
+
+    yes_token = market.token_for_side("YES")
+    no_token = market.token_for_side("NO")
+    metadata = _build_dry_metadata(market)
+    observations = deque(maxlen=2048)
+    observations_lock = threading.Lock()
+
+    def record_book(book: Any) -> None:
+        try:
+            observed_at = float(book.observed_at)
+        except (AttributeError, TypeError, ValueError):
+            return
+        if not (observed_at == observed_at and abs(observed_at) != float("inf")):
+            return
+        with observations_lock:
+            if observations and observed_at <= float(observations[-1].observed_at):
+                return
+            observations.append(book)
+
+    def reset_books() -> None:
+        with observations_lock:
+            observations.clear()
+
+    stream = stream_factory(
+        yes_token_id=yes_token,
+        no_token_id=no_token,
+        on_book=record_book,
+        on_reset=reset_books,
+        clock=clock,
+        near_touch_band=0.02,
+        resolve_overrides=parse_resolve_overrides(settings.resolve_overrides),
+    )
+    decisions: List[PostCloseDecision] = []
+    preflight_done = settings.dry_run
+    preflight_at = float(round_end) - LIVE_PREFLIGHT_LEAD_S
+    stream_component = "market_stream:%s" % active_asset
+
+    def hold(reason: str, *, now: float, side: str = "", audit: Optional[Dict[str, Any]] = None) -> None:
+        decision = PostCloseDecision("hold", reason, side=side, audit=audit or {})
+        decisions.append(decision)
+        _audit_decision(settings, store, decision, slug)
+        _audit(
+            settings,
+            store,
+            "twap_tail_hold",
+            {
+                "reason": reason,
+                "side": side,
+                "event_ts": now,
+                "tail_decision_target_ts": target_ts,
+                "decision_cutoff_ts": cutoff_ts,
+                "strategy": cfg.strategy_version,
+                "audit": decision.audit,
+            },
+            slug,
+        )
+
+    stream.start()
+    try:
+        while True:
+            now = float(clock())
+            if now < preflight_at:
+                sleep(min(0.5, max(0.0, preflight_at - now)))
+                continue
+
+            if not preflight_done:
+                if now > cutoff_ts:
+                    hold("tail_preflight_not_complete_before_cutoff", now=now)
+                    break
+                if live_gateway is None:
+                    raise RuntimeError("live Aftertake requires a CLOB V2 gateway")
+                phase = "account_preflight" if round_preflight is not None else "market_metadata"
+                try:
+                    if round_preflight is not None:
+                        preflight = round_preflight.snapshot()
+                    else:
+                        geo = public.geoblock_status(settings.geo_endpoint)
+                        preflight = live_gateway.preflight(geo, 0.0)
+                    phase = "market_metadata"
+                    metadata = live_gateway.market_metadata(market.condition_id)
+                    _metadata_token_matches(market, metadata, "YES")
+                    _metadata_token_matches(market, metadata, "NO")
+                    _check_preflight_collateral(preflight, _required_cash(settings, metadata))
+                except Exception as exc:
+                    _audit_asset_transport_error(
+                        settings,
+                        store,
+                        asset=active_asset,
+                        slug=slug,
+                        phase=phase,
+                        exc=exc,
+                        notifier=notifier,
+                    )
+                    if not _is_transient_transport_error(exc):
+                        raise
+                    hold("%s_transport_error" % phase, now=float(clock()))
+                    break
+                preflight_done = True
+                continue
+
+            if now < target_ts:
+                sleep(min(0.05, max(0.0, target_ts - now)))
+                continue
+            if now > cutoff_ts:
+                hold("tail_decision_too_late", now=now)
+                break
+            if not getattr(stream, "ready", False):
+                hold("tail_market_stream_not_ready", now=now)
+                _transition_component_and_notify(
+                    store=store,
+                    component=stream_component,
+                    status="unhealthy",
+                    detail="paired CLOB book was not ready at tail decision",
+                    notifier=notifier,
+                    settings=settings,
+                    kind="alert",
+                    payload={"reason": "paired CLOB book not ready", "component": stream_component},
+                    slug=slug,
+                    notify_on_no_transition=True,
+                )
+                break
+            if binance_proxy is None:
+                hold("tail_binance_spot_proxy_missing", now=now)
+                break
+
+            with observations_lock:
+                quotes = tuple(
+                    PMQuote(
+                        observed_at=float(book.observed_at),
+                        yes_bid=book.yes.best_bid,
+                        no_bid=book.no.best_bid,
+                        yes_ask=book.yes.best_ask,
+                        no_ask=book.no.best_ask,
+                        yes_ask_size=float(book.yes.ask_size),
+                        no_ask_size=float(book.no.ask_size),
+                    )
+                    for book in observations
+                )
+            decision = evaluate_tail_decision(
+                quotes=quotes,
+                binance=binance_proxy.tail_input(active_asset, round_start),
+                round_end_ts=round_end,
+                decision_ts=now,
+                config=cfg,
+            )
+            decisions.append(decision)
+            _audit_decision(settings, store, decision, slug)
+            if decision.action != "enter":
+                _audit(settings, store, "twap_tail_hold", {"reason": decision.reason, "audit": decision.audit}, slug)
+                break
+
+            claim_id: Optional[int] = None
+            claim_committed = False
+            try:
+                entry_qty = float(settings.qty)
+                entry_price = float(cfg.entry_limit_price)
+                expected_net = (
+                    1.0
+                    - entry_price
+                    - fee_total(entry_price, 1.0, metadata.fee_rate, metadata.fee_exponent)
+                    - builder_fee_total(entry_price, 1.0, metadata.builder_taker_fee_bps)
+                )
+                if expected_net < settings.tail_min_net_win_per_share:
+                    hold(
+                        "tail_expected_net_below_fee_floor",
+                        now=now,
+                        side=decision.side,
+                        audit={**dict(decision.audit or {}), "expected_net_per_share": expected_net},
+                    )
+                    break
+                check_entry_risk(
+                    settings=settings,
+                    store=store,
+                    slug=slug,
+                    price=entry_price,
+                    qty=entry_qty,
+                    displayed_ask_size=decision.entry_ask_size,
+                    now_ts=now,
+                )
+                token_id = _metadata_token_matches(market, metadata, decision.side)
+                if settings.is_live and entry_qty < metadata.min_order_size:
+                    raise RiskRejected("requested_qty_below_market_minimum")
+                if round_preflight is not None:
+                    _, claim_id = round_preflight.claim_fixed_entry(
+                        price=entry_price, qty=entry_qty, metadata=metadata
+                    )
+                record = store.reserve_entry(
+                    slug=slug,
+                    condition_id=market.condition_id,
+                    round_start=round_start,
+                    token_id=token_id,
+                    side=decision.side,
+                    requested_qty=entry_qty,
+                    requested_price=entry_price,
+                    fee_rate=metadata.fee_rate,
+                    fee_exponent=metadata.fee_exponent,
+                    builder_taker_fee_bps=metadata.builder_taker_fee_bps,
+                )
+                if record is None:
+                    hold("market_already_reserved", now=now, side=decision.side)
+                    break
+                claim_committed = True
+                timing_context = {
+                    "asset": active_asset,
+                    "round_start": int(round_start),
+                    "round_end_ts": float(round_end),
+                    "tail_decision_target_ts": target_ts,
+                    "decision_cutoff_ts": cutoff_ts,
+                    "decision_ts": now,
+                    "book_observed_ts": (decision.audit or {}).get("pm_quote_observed_ts"),
+                    "pm_quote_age_ms": (decision.audit or {}).get("pm_quote_age_ms"),
+                    "immediate_taker_order_delay_enabled": metadata.immediate_taker_order_delay_enabled,
+                    "expected_taker_delay_ms": metadata.expected_taker_delay_ms,
+                }
+                result = executor.execute_reserved(record, metadata, fast=True, timing_context=timing_context)
+                result_raw = result.raw or {}
+                result_timing = result_raw.get("timing") or {}
+                if result.dry_run or isinstance(result_raw.get("submit"), dict):
+                    _audit(
+                        settings,
+                        store,
+                        "order_submitted",
+                        {
+                            "slug": slug,
+                            "side": decision.side,
+                            "order_id": result.order_id,
+                            "order_type": "GTC",
+                            "requested_qty": entry_qty,
+                            "requested_price": entry_price,
+                            "status": result.status,
+                            "event_ts": result_timing.get("submit_end_ts") or result.event_ts,
+                            "tail_decision_target_ts": target_ts,
+                            "actual_submit_ts": result_timing.get("submit_start_ts"),
+                            "submit_lag_ms": result_timing.get("submit_lag_ms"),
+                            "no_live_order": result.dry_run,
+                        },
+                        slug,
+                    )
+                _audit(
+                    settings,
+                    store,
+                    "entry_result",
+                    {
+                        **asdict(result),
+                        "strategy": cfg.strategy_version,
+                        "classifier_audit": decision.audit,
+                        "tail_decision_target_ts": target_ts,
+                        "simulated_take": result.dry_run,
+                        "no_live_order": result.dry_run,
+                    },
+                    slug,
+                )
+                _notify_order_result(
+                    notifier,
+                    settings,
+                    store,
+                    result,
+                    slug,
+                    available_size=decision.entry_ask_size,
+                    simulated_take=result.dry_run,
+                )
+                if settings.is_live and _report_executor_timeout(
+                    settings=settings,
+                    store=store,
+                    notifier=notifier,
+                    executor=executor,
+                    component="clob_executor:%s" % active_asset,
+                    slug=slug,
+                ):
+                    decisions.append(PostCloseDecision("hold", "clob_worker_timeout", side=decision.side))
+                break
+            except (RiskRejected, LivePreflightError) as exc:
+                hold("tail_entry_blocked:%s" % exc, now=now, side=decision.side)
+                break
+            except Exception as exc:
+                _audit(settings, store, "entry_runtime_error", {"error": str(exc)}, slug)
+                _safe_notify(notifier, settings, store, "alert", {"reason": str(exc)}, slug)
+                decisions.append(PostCloseDecision("hold", "entry_runtime_error", side=decision.side))
+                break
+            finally:
+                if claim_id is not None and not claim_committed and round_preflight is not None:
+                    round_preflight.release_claim(claim_id)
+    finally:
+        stream.close()
+    return decisions
+
+
 def run_round(
     *,
     settings: Settings,
@@ -2447,9 +2810,9 @@ def run_round(
     stream_factory: Callable[..., MarketBookStream] = MarketBookStream,
     binance_proxy: Optional[BinanceFiveMinuteProxy] = None,
 ) -> List[PostCloseDecision]:
-    """Public live entry point; historical classifiers are not called."""
+    """Public live entry point; old post-close classifiers are not called."""
 
-    return _run_post_close_snapshot_round(
+    return _run_twap_tail_round(
         settings=settings,
         store=store,
         public=public,
@@ -2702,12 +3065,10 @@ def _select_next_round_start(
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.time,
 ) -> int:
-    """Return the next runnable 5m round without skipping active markets.
+    """Return a fresh boundary with continuous Binance Spot tape coverage.
 
-    The strategy needs the close-adjacent scene, not the full 5-minute history.
-    After a round finishes at close+~1s, the next market is already active but
-    still has almost five minutes before its own close.  Joining that active
-    round prevents the old 10-minute cadence bug.
+    A restarted process cannot reconstruct the already-open candle.  Waiting
+    for a clean boundary is therefore intentional fail-closed behavior.
     """
 
     observed_now = float(now)
@@ -2715,11 +3076,7 @@ def _select_next_round_start(
         current = int(observed_now)
         active_start = current - current % 300
         active_end = active_start + 300
-        snapshot_cfg = PostCloseSnapshotConfig()
-        minimum_lead_s = max(
-            snapshot_cfg.snapshot_delay_s + snapshot_cfg.paired_max_age_s,
-            LIVE_PREFLIGHT_LEAD_S,
-        )
+        minimum_lead_s = 299.5
         if (
             active_start not in processed_round_starts
             and active_end - observed_now >= minimum_lead_s
@@ -3315,7 +3672,7 @@ def _run_round_loop(
                     "assets": list(settings.assets),
                     "pid": os.getpid(),
                     "code_sha": _resolve_code_sha(),
-                    **_post_close_runtime_payload(settings),
+                    **_tail_runtime_payload(settings),
                 }
                 _audit(settings, store, "runtime_ready", ready_payload)
                 _safe_notify(notifier, settings, store, "ready", ready_payload)
@@ -3332,7 +3689,7 @@ def _run_round_loop(
                 "assets": list(settings.assets),
                 "pid": os.getpid(),
                 "code_sha": _resolve_code_sha(),
-                **_post_close_runtime_payload(settings),
+                **_tail_runtime_payload(settings),
             }
             _audit(settings, store, "runtime_ready", ready_payload)
             _safe_notify(notifier, settings, store, "ready", ready_payload)
@@ -3632,7 +3989,7 @@ def settle_open_positions(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Aftertake post-close CLOB runner")
+    parser = argparse.ArgumentParser(description="Aftertake causal TWAP-tail CLOB runner")
     parser.add_argument("--rounds", type=int, default=1, help="number of fresh 5m rounds per configured asset")
     parser.add_argument("--forever", action="store_true", help="run fresh rounds until stopped")
     parser.add_argument("--dry-run", action="store_true", help="force shadow mode regardless of .env")
@@ -3646,9 +4003,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _status_payload(settings: Settings, store: StateStore) -> Dict[str, Any]:
-    snapshot = _post_close_snapshot_config_for_settings(settings)
+    tail = _tail_rule_config_for_settings(settings)
     return {
-        "strategy": snapshot.strategy_version,
+        "strategy": tail.strategy_version,
         "strategy_family": settings.strategy_family,
         "v9_live_enabled": settings.v9_live_enabled,
         "dry_run": settings.dry_run,
@@ -3658,20 +4015,24 @@ def _status_payload(settings: Settings, store: StateStore) -> Dict[str, Any]:
         "live_quantity_floor_step": settings.live_quantity_floor_step,
         "dry_run_simulated_balance": settings.dry_run_simulated_balance,
         "resolve_overrides_enabled": bool(parse_resolve_overrides(settings.resolve_overrides)),
-        "post_close_snapshot_delay_ms": int(snapshot.snapshot_delay_s * 1000),
-        "leader_bid_threshold": snapshot.leader_bid_threshold,
+        "tail_decision_lead_ms": int(tail.decision_lead_s * 1000),
+        "leader_bid_threshold": tail.leader_bid_threshold,
         "leader_bid_comparison": "strictly_greater_than",
-        "paired_receive_max_age_ms": int(snapshot.paired_max_age_s * 1000),
-        "max_decision_lateness_ms": int(snapshot.max_decision_lateness_s * 1000),
-        "entry_limit_price": snapshot.limit_price,
+        "paired_receive_max_age_ms": int(tail.pm_quote_max_age_s * 1000),
+        "binance_trade_max_age_ms": int(tail.binance_max_trade_age_s * 1000),
+        "max_decision_lateness_ms": int(tail.max_decision_lateness_s * 1000),
+        "entry_limit_price": tail.entry_limit_price,
         "decision_window_ms": [
-            int(snapshot.snapshot_delay_s * 1000),
-            int((snapshot.snapshot_delay_s + snapshot.max_decision_lateness_s) * 1000),
+            -int(tail.decision_lead_s * 1000),
+            -int((tail.decision_lead_s - tail.max_decision_lateness_s) * 1000),
         ],
-        "confirmation_policy": "none_post_close_snapshot_frozen",
+        "confirmation_policy": "one_causal_twap_tail_decision",
         "confirmations": 0,
         "confirmation_spacing_ms": 0,
         "post_close_classifier_for_live_entry": False,
+        "binance_role": "spot_path_filter_not_settlement_oracle",
+        "weak_candle_abs_move_bps": tail.weak_candle_abs_move_bps,
+        "weak_path_reversal_bps": tail.weak_path_reversal_bps,
         "require_loser_refill_failure": False,
         "require_stable_post_close_leader": False,
         "order_type": settings.order_type,
@@ -3688,21 +4049,23 @@ def _status_payload(settings: Settings, store: StateStore) -> Dict[str, Any]:
     }
 
 
-def _post_close_runtime_payload(settings: Settings) -> Dict[str, Any]:
-    """Return the non-secret close+500ms contract for BOOT/READY evidence."""
+def _tail_runtime_payload(settings: Settings) -> Dict[str, Any]:
+    """Return the non-secret TWAP-tail contract for BOOT/READY evidence."""
 
-    config = _post_close_snapshot_config_for_settings(settings)
+    config = _tail_rule_config_for_settings(settings)
     return {
         "strategy_version": config.strategy_version,
-        "post_close_snapshot_delay_s": config.snapshot_delay_s,
+        "tail_decision_lead_s": config.decision_lead_s,
         "leader_bid_threshold": config.leader_bid_threshold,
         "leader_bid_comparison": "strictly_greater_than",
-        "paired_receive_max_age_s": config.paired_max_age_s,
+        "paired_receive_max_age_s": config.pm_quote_max_age_s,
+        "binance_trade_max_age_s": config.binance_max_trade_age_s,
         "max_decision_lateness_s": config.max_decision_lateness_s,
         "max_decision_lateness_ms": int(config.max_decision_lateness_s * 1000),
-        "entry_limit_price": config.limit_price,
+        "entry_limit_price": config.entry_limit_price,
         "order_type": settings.order_type,
         "post_close_classifier_for_live_entry": False,
+        "binance_role": "spot_path_filter_not_settlement_oracle",
     }
 
 
@@ -3815,13 +4178,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "assets": list(settings.assets),
                 "pid": os.getpid(),
                 "code_sha": _resolve_code_sha(),
-                **_post_close_runtime_payload(settings),
+                **_tail_runtime_payload(settings),
             }
             _audit(settings, store, "boot", boot_payload)
             _safe_notify(notifier, settings, store, "boot", boot_payload)
-            if settings.is_live:
-                binance_proxy = BinanceFiveMinuteProxy(settings.assets)
-                binance_proxy.start()
+            # Shadow mode must observe the same Spot coverage failures as live
+            # mode; it never grants order capability.
+            binance_proxy = BinanceFiveMinuteProxy(settings.assets)
+            binance_proxy.start()
             runtime_watchdog = startup_watchdog
             try:
                 _run_round_loop(

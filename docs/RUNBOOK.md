@@ -8,9 +8,10 @@
 4. Install `.[dev,live]`; `aftertake --deployment-check` is optional manual diagnostics.
 5. Start `aftertake --forever` and confirm `BOOT` arrives.
 
-The shadow runner receives real Gamma/CLOB data and writes the same SQLite and
-JSONL audit trail. A qualifying candidate reserves the round and records a
-`shadow_no_order` result; no wallet key, signature or CLOB order is used.
+The shadow runner receives real Gamma/CLOB and Binance Spot data and writes the
+same SQLite/JSONL audit trail. It waits for a fresh candle boundary, requires a
+Gamma-declared 30-second TWAP market, then records the one `E-10.25s` decision
+or its fail-closed reason. No wallet key, signature, or CLOB order is used.
 
 ## EC2
 
@@ -37,10 +38,10 @@ stall is likewise terminated by the 180-second runtime watchdog. Normal
 waiting for the next five-minute boundary is explicitly exempt from that
 watchdog.
 
-The market WebSocket has a 5-second keepalive and a 12-second transport
-watchdog, plus an independent close-window market-data watchdog. A dead or
-frozen socket is closed and reconnected with bounded backoff; the affected
-round is fail-closed until a fresh paired book is available. For live orders,
+The PM market WebSocket has a 5-second keepalive and a 12-second transport
+watchdog. Binance Spot `aggTrade` is collected independently. A PM or Spot
+disconnect/reconnect during the candle invalidates the tail round; the service
+does not reconstruct an incomplete tape. For live orders,
 the CLOB heartbeat is sent every 4 seconds. If Polymarket returns a
 400 invalid/expired heartbeat id, the replacement id in that response is
 adopted and retried immediately instead of repeating the stale id. Each
@@ -59,7 +60,8 @@ only the affected market and do not block unrelated future entries.
 ## Operator evidence
 
 For each process start expect `BOOT`. `RUNTIME_READY` appears when the scheduler
-has passed its startup boundary in both dry-run and live mode.
+is ready in both dry-run and live mode. Each eligible round emits either
+`aftertake_decision`/`twap_tail_hold` or an `ORDER_SUBMITTED` lifecycle record.
 `DEPLOYMENT_CHECK_OK` appears only after
 an operator manually runs `--deployment-check`; it is not a service gate.
 For an actual entry expect `ORDER_SUBMITTED` followed by either

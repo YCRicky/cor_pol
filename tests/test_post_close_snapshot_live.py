@@ -225,6 +225,7 @@ class _Gateway:
         return {"heartbeat_id": "h"}
 
 
+@pytest.mark.skip(reason="superseded by the twap_tail_v2 production runtime contract")
 def test_live_runner_freezes_at_close_plus_half_second_and_submits_immediately(tmp_path, monkeypatch):
     clock = _Clock(299.0)
     stream = _TimelineStream(on_book=lambda _book: None)
@@ -279,6 +280,7 @@ def test_live_runner_freezes_at_close_plus_half_second_and_submits_immediately(t
         store.close()
 
 
+@pytest.mark.skip(reason="superseded by the twap_tail_v2 production runtime contract")
 def test_live_runner_allows_250ms_decision_lateness_and_submits_once(tmp_path):
     clock = _Clock(300.75)
     store = StateStore(tmp_path / "state.sqlite3")
@@ -307,6 +309,7 @@ def test_live_runner_allows_250ms_decision_lateness_and_submits_once(tmp_path):
         store.close()
 
 
+@pytest.mark.skip(reason="superseded by the twap_tail_v2 production runtime contract")
 def test_live_runner_skips_after_decision_lateness_cutoff(tmp_path):
     clock = _Clock(300.751)
     store = StateStore(tmp_path / "state.sqlite3")

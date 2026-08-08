@@ -1,162 +1,43 @@
-# Aftertake strategy
+# TWAP 尾盤策略（`twap_tail_v2`）
 
-The live Aftertake path takes one paired YES/NO snapshot at close+500ms, then
-immediately submits one bounded GTC order. It is not a price feed and does not
-reclassify after the snapshot.
+這是目前唯一的 production entry path。它取代舊的「收盤後 +0.5 秒、只看 PM
+leader bid」規則；舊分類器沒有被 runtime 呼叫。
 
-Current live strategy version:
+## 結算與資料角色
 
-```text
-aftertake_postclose_snapshot_v1_plus0_5_leader_bid_gt_080
-```
+- 最終輸贏只依 Polymarket/Gamma 市場的官方結算。
+- 只交易 Gamma metadata 明確標示 `cryptoMarketConfig.twapEnabled=true`、
+  `twapLookbackSeconds=30` 的市場；metadata 缺失、非 30 秒或切換日前市場一律跳過。
+- Binance **Spot** `aggTrade` 不是結算 oracle，也不預測官方價格。它只是一條連續收集的
+  因果價格路徑，用來拒絕末段反轉。
 
-The live decision boundary is `close_epoch + 0.500s`. The latest locally
-received fresh paired snapshot is used; missing, tied, or stale bids HOLD. The
-higher best bid must be strictly greater than `0.80` (`0.80` is HOLD). Once
-frozen, later book changes cannot change the side. The runtime immediately
-makes at most one GTC marketable limit order at `0.99` for the configured fixed
-quantity (deployment default `50`), and only reconciles it through `close + 5s`.
+## 單一決策點
 
-The remaining V8 post-close classifier sections below are archived research
-and replay semantics. They are not live entry gates.
+對每個完整五分鐘 candle，決策時間為 `E - 10.25s`，可接受的 scheduler 遲到最多
+`250ms`。超過即 HOLD；不會事後補判、重試或改方向。
 
-## Archived V8 post-close research
+1. 取得本地接收、決策時不超過 2 秒的 YES/NO 配對 CLOB quote。
+2. 選 best bid 較高的一側，且該 bid 必須嚴格大於 `0.90`。
+3. 該側可成交 ask 必須在 `.99` 價格上限內，且顯示深度至少能承接設定數量。
+4. Binance Spot tape 必須從 candle 開始前已連線、沒有中斷、沒有 buffer overflow，且最新
+   trade 本地接收時間距決策不超過 2 秒。
+5. 5 分鐘 Spot 方向要和 PM leader 相同。
+   - 若整根 move 絕對值大於 5bp：通過方向與新鮮度即可。
+   - 若 move 在 0--5bp：`E-30s → D` 與 `E-20s → D` 必須同向，且最後 30 秒的逆向
+     drawdown 不得超過 2bp。
+6. 再過既有風控、帳戶餘額/allowance、fee floor、最小單位和 SQLite reservation 後，才送一筆
+   marketable GTC limit；價格上限固定 `.99`。
 
-## Scene gate
+任一資料缺失、WS 重連、quote/tape 過期、方向不合、弱 candle 反轉、費用後下限不足、風控拒絕
+都等同 **不交易**。
 
-The final ten seconds are used only to describe whether a market is the right
-kind of close-window scene. They do **not** select YES or NO, and the scene gate
-is audit-only in runtime.
+## 為何不用「0ms」當 alpha
 
-The audit records:
+exchange 訊息裡的 `0ms`/source timestamp 不是端到端延遲保證。實作記錄本地 receive time，並在
+決策時同時要求 Binance source time 和 receive time 都不晚於決策點，避免回放或網路抖動把未來 tick
+帶進來。
 
-1. Whether there are at least three valid paired pre-close books.
-2. Whether the pre-close span is at least 100 ms.
-3. Whether the latest book is no more than 250 ms before frontend close.
-4. Whether both latest bids are inside the 0.20--0.80 ambiguity band.
-5. Whether the latest YES/NO bid edge is no wider than 0.12.
-6. Whether each side's pre-close bid range is no wider than 0.08.
+## 已知限制
 
-Clean terminal 99/1-style books and high-volatility close noise remain visible
-in audit, but they are not hard rejections by themselves.
-
-## Winner classifier
-
-Between T+50 ms and T+250 ms after frontend close, both outcome-token books
-must first have a fresh post-close update. The classifier then requires two
-separately received fresh paired observations with the same post-close leader.
-There is no fixed 100 ms sleep. An unchanged winner-side book counts as
-persistent support because the order remained present across observations;
-withdrawal, decay, leader reversal and loser refill are still hard rejections.
-
-V8 locks to the first observable post-close leader. If the leader reverses at
-any time inside the decision sequence, the round is permanently rejected. This
-prevents a later reversal from being mistaken for the initial close reaction.
-
-If exactly one side still has a bid, that supported side is the leader and the
-missing opposite bid is strong vacuum evidence. If both bids are absent or
-equal, direction remains unresolved and entry is rejected.
-
-The winning side must pass all five bid-support checks:
-
-1. Best bid stays at or above the support floor.
-2. Displayed best-bid size is at least the evaluated quantity.
-3. Near-touch bid depth within $0.02 of best bid is at least 2x the evaluated
-   quantity.
-4. Winner bid does not materially decay.
-5. Winner near-touch depth is retained or refilled.
-
-The opposite side retains a four-component vacuum score. Vacuum evidence
-includes:
-
-1. Bid drops from the latest pre-close ambiguous book.
-2. Near-touch depth decays from the latest pre-close baseline.
-3. It does not refill enough to regain support.
-4. It never comes within the reclaim gap of the winner bid during the evidence
-   run.
-
-Runtime thresholds:
-
-```text
-winner_support_score = 5 required
-loser_vacuum_score >= 3 allows dry-run/live entry evaluation
-loser_refill_failure = mandatory
-post_close_leader_reversal = mandatory rejection
-```
-
-The vacuum>=2 variant remains research-only. In the corrected 100-market
-close-boundary replay it produced 10 signals with 9 correct directions. V7
-vacuum>=3 produced 7 signals with 6 correct directions. V8 removed the one V7
-error and produced 6/6 observed directions, but six signals are not enough to
-claim future 100% accuracy.
-
-The archived PMData replay reconstructs one token from the binary complement of
-the other. It therefore cannot show a missing loser bid while preserving an
-executable winner ask. The one-sided-vacuum branch is covered by deterministic
-tests but still requires native paired-token forward shadow evidence.
-
-## Entry
-
-Entry is checked last. Aftertake enters only when the winner candidate still has
-a displayed residual ask whose size can cover the evaluated order size.
-
-```text
-winner = post-close bid-support side
-quality = opposite-side vacuum score
-entry  = winner-side residual displayed ask still executable
-reject = cheap ask on the bid-vacuum/loser side
-```
-
-A cheap ask on its own is never winner evidence. V8 has no blind entry-price
-cap; ask repricing is recorded as a feature first, not used as a hard reject.
-
-## Live sizing
-
-Dry-run uses the same sizing math with a simulated account balance
-(`AFTERTAKE_DRY_RUN_SIM_BALANCE`, default `100`) and equal simulated allowance.
-Live mode replaces that simulated collateral with the actual CLOB pUSD balance
-and allowance. Both modes size from the observed residual ask:
-
-```text
-risk_budget = collateral_balance * AFTERTAKE_LIVE_MAX_ACCOUNT_RISK_FRACTION
-spend_cap   = min(risk_budget, collateral_allowance)
-unit_cost   = take_price + market_fee_per_share + builder_fee_per_share
-raw_qty     = min(displayed_ask_size, spend_cap / unit_cost)
-final_qty   = floor(raw_qty to AFTERTAKE_LIVE_QTY_FLOOR_STEP)
-```
-
-Before an order is reserved, the dynamically sized final quantity is rechecked
-against the same in-memory post-close observations. The recheck still requires
-best-bid size to cover the final quantity, but near-touch depth uses a 1x final
-size floor so small residual asks (for example 10 displayed shares) are not
-blocked by the initial 2x discovery buffer. A small shadow quantity can therefore
-never authorize a larger unsupported order, while executable residual depth is
-still allowed.
-
-Default live settings are:
-
-```text
-AFTERTAKE_LIVE_MAX_ACCOUNT_RISK_FRACTION=0.50
-AFTERTAKE_LIVE_QTY_FLOOR_STEP=1
-```
-
-So a calculated 67.5-share order becomes 67 shares, never 68. The submitted
-notional must remain at or below the configured account risk budget and current
-collateral allowance.
-
-## Audit telemetry
-
-Every classifier decision records a structured audit payload containing the
-strategy version, timing, pre-close scene features, post-close leader sequence,
-winner/loser bid series, near-touch depth series, support/vacuum scores,
-per-token freshness, missing-loser-bid evidence, ask-lag measurements,
-thresholds, and reject reasons. Entry results additionally record displayed
-available size and the live sizing calculation when live mode is used.
-
-The critical path deliberately has no REST book request and no Telegram call.
-Before close it has already completed market/account preflight. After
-confirmation it atomically reserves the market in SQLite and submits only the
-single bounded execution path configured by the runtime. Default GTC submits
-remain pending until later CLOB reconciliation / official settlement; submit-path
-infrastructure ambiguity skips/rests only the affected market rather than
-freezing unrelated future entries.
+這是一個嚴格篩選器，不是「100% 勝率」保證；所有回放結果都可能受樣本、stream coverage、成交與
+實際 fee 影響。策略不把 Binance 報價當成 PM 的結算價格，也不在 coverage 缺口時猜測或自動放寬門檻。

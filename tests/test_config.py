@@ -45,10 +45,10 @@ def test_defaults_are_aftertake_only(monkeypatch):
     settings = Settings.from_env()
 
     assert settings.dry_run is True
-    assert settings.strategy_family == "v8"
+    assert settings.strategy_family == "twap_tail_v2"
     assert settings.v9_live_enabled is False
     assert settings.asset == "BTC"
-    assert settings.qty == 50
+    assert settings.qty == 5
     assert settings.post_close_snapshot_delay_s == 0.5
     assert settings.post_close_leader_bid_threshold == 0.80
     assert settings.post_close_paired_max_age_s == 0.250
@@ -156,7 +156,7 @@ def test_legacy_asset_env_btc_only_keeps_default_universe(monkeypatch, tmp_path)
 
     settings = Settings.from_env()
 
-    assert settings.assets == ("BTC", "ETH", "XRP", "HYPE", "DOGE", "SOL")
+    assert settings.assets == ("BTC", "ETH", "SOL", "XRP", "BNB", "DOGE")
 
 
 def test_assets_env_rejects_unsupported_assets(monkeypatch, tmp_path):

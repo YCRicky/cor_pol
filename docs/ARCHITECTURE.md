@@ -1,50 +1,29 @@
 # Architecture
 
 ```text
-Gamma market discovery
-        |
-        v
-Official public CLOB WebSocket (YES + NO paired books)
-        |
-        +--> pre-close contested/reversal scene gate
-        |
-        +--> T+50..250ms stable-leader + loser-refill-failure classifier
-                              |
-                              v
-               winner-side residual ask + local risk check
-                              |
-                              v
-             SQLite reservation -> single CLOB GTC taker-intent order; pending until CLOB reconciliation / settlement
-                              |
-                              v
-                 reconciliation -> Telegram lifecycle -> PM settlement
+Gamma market metadata ──► 30s-TWAP eligibility gate
+                                  │
+PM public CLOB WS ─► paired quote buffer ─┤
+Binance Spot aggTrade ─► complete tape ───┤──► E-10.25s causal decision
+                                  │                    │
+State/risk/fees/account preflight ────────┘                    ▼
+                                                       one GTC limit (.99 cap)
+                                                               │
+                                                     CLOB reconciliation
+                                                               │
+                                                official PM/Gamma settlement
 ```
 
-`aftertake.market_stream` consumes only the public official market WebSocket.
-It sends the provider keepalive, detects both transport silence and a frozen
-market-data book (PONG alone is not freshness), and reconnects with bounded
-exponential backoff. Each reconnect clears the paired book generation; the
-classifier also clears its history so stale pre-close evidence cannot cross a
-dead connection.
-`aftertake.pm_client` handles Gamma discovery and, only in live mode, the
-authenticated `py-clob-client-v2` gateway. `aftertake.state` is the durable
-source of entry, order, recovery, settlement, component-health and
-notification-outbox state. `aftertake.execution` does not retry ambiguous
-submissions and freezes later entries through state. A single notifier worker
-drains the outbox in predecessor order, so an alert or recovery message is not
-lost merely because Telegram is slow or temporarily down.
-The authenticated order heartbeat adopts the replacement id returned by an
-expired/invalid-id response, so a stale heartbeat id cannot loop forever.
+`src/aftertake/twap_tail.py` is pure decision logic. It accepts timestamped CLOB quotes and Spot aggregate
+trades, filters both at the decision timestamp, and returns ENTER/HOLD plus audit fields. It has no HTTP,
+WebSocket, wallet, or execution side effects.
 
-Telegram is intentionally outside the time-sensitive classifier path. It
-observes lifecycle events but cannot place, repeat, delay or cancel an order.
-Transport and runtime faults are sent as `ALERT` events without state-change
-deduplication; a later healthy heartbeat, stream generation, asset round, or
-runtime bootstrap emits `RECOVERY_SUCCESS`.
+`src/aftertake/binance_proxy.py` owns the bounded Spot tape. A connection started after candle open,
+disconnect/reconnect during the candle, missing tape, or buffer overflow marks that round incomplete.
 
-Runtime liveness is layered: per-asset rounds have a bounded supervisor;
-startup/reconciliation/settlement errors are isolated per order or position;
-and a 180-second stale-progress watchdog terminates a genuinely wedged process
-so systemd can restart it. The watchdog is not a claim that arbitrary kernel
-or provider failures are impossible; it defines the recovery boundary for the
-known Python/HTTP/WebSocket failure classes and leaves durable state fail-closed.
+`src/aftertake/runner.py` owns schedule, Gamma metadata gate, streams, live account checks, risk, SQLite
+reservation, order submission and audit. It waits for a fresh boundary after startup so it cannot synthesize
+coverage for a mid-candle restart.
+
+The old post-close modules remain offline compatibility/research code only; `run_round()` dispatches solely
+to `_run_twap_tail_round()`.

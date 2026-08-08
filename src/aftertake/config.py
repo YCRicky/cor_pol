@@ -15,6 +15,7 @@ from .post_close_snapshot import (
     POST_CLOSE_SNAPSHOT_PAIRED_MAX_AGE_S,
 )
 from .resolver import parse_resolve_overrides
+from .twap_tail import TailRuleConfig
 
 POLYGON_CHAIN_ID = 137
 DEFAULT_CLOB_HOST = "https://clob.polymarket.com"
@@ -24,7 +25,7 @@ DEFAULT_GEO_ENDPOINT = "https://polymarket.com/api/geoblock"
 # emergency guard for RPZ-poisoned environments, configured via
 # AFTERTAKE_RESOLVE_OVERRIDES="host=ip,ip;...".
 DEFAULT_RESOLVE_OVERRIDES = ""
-DEFAULT_ASSETS = ("BTC", "ETH", "XRP", "HYPE", "DOGE", "SOL")
+DEFAULT_ASSETS = ("BTC", "ETH", "SOL", "XRP", "BNB", "DOGE")
 _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _PRIVATE_KEY_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
 
@@ -92,19 +93,29 @@ def _signature_type_from_env() -> Optional[int]:
 class Settings:
     # Aftertake strategy controls.
     dry_run: bool = True
-    strategy_family: str = "v8"
+    strategy_family: str = "twap_tail_v2"
     v9_live_enabled: bool = False
     asset: str = "BTC"
     assets: Tuple[str, ...] = DEFAULT_ASSETS
-    # The live close+500ms contract is a fixed 50-share order.  An explicit
-    # AFTERTAKE_QTY override remains visible and is rejected by deployment if
-    # it is not the contract value; it is never silently converted at runtime.
-    qty: float = 50.0
+    # The live TWAP-tail contract takes only a small, depth-checked quantity.
+    qty: float = 5.0
     post_close_snapshot_delay_s: float = POST_CLOSE_SNAPSHOT_DELAY_S
     post_close_leader_bid_threshold: float = 0.80
     post_close_paired_max_age_s: float = POST_CLOSE_SNAPSHOT_PAIRED_MAX_AGE_S
     post_close_snapshot_max_lateness_s: float = POST_CLOSE_SNAPSHOT_MAX_LATENESS_S
     post_close_limit_price: float = POST_CLOSE_SNAPSHOT_LIMIT_PRICE
+    # TWAP-tail live contract. Binance Spot is a causal path filter only; PM
+    # settlement remains the market's configured oracle/TWAP source.
+    tail_decision_lead_s: float = 10.25
+    tail_max_decision_lateness_s: float = 0.25
+    tail_leader_bid_threshold: float = 0.90
+    tail_pm_quote_max_age_s: float = 2.0
+    tail_binance_max_trade_age_s: float = 2.0
+    tail_weak_candle_abs_move_bps: float = 5.0
+    tail_weak_path_reversal_bps: float = 2.0
+    tail_limit_price: float = 0.99
+    tail_min_entry_ask_size: float = 5.0
+    tail_min_net_win_per_share: float = 0.001
     out_dir: Path = Path("out")
     max_daily_loss: float = 25.0
     max_open_positions: int = 3
@@ -150,7 +161,7 @@ class Settings:
         return bool(self.clob_api_key and self.clob_api_secret and self.clob_api_passphrase)
 
     def validate(self) -> None:
-        allowed_assets = {"BTC", "ETH", "XRP", "HYPE", "DOGE", "SOL"}
+        allowed_assets = {"BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "HYPE"}
         assets = tuple(str(asset).upper().strip() for asset in (self.assets or (self.asset,)) if str(asset).strip())
         if not assets:
             raise ValueError("AFTERTAKE_ASSETS must contain at least one asset")
@@ -185,9 +196,22 @@ class Settings:
             raise ValueError("AFTERTAKE_POST_CLOSE_SNAPSHOT_MAX_LATENESS_S must be in [0, 1]")
         if not 0 < self.post_close_limit_price < 1:
             raise ValueError("AFTERTAKE_POST_CLOSE_LIMIT_PRICE must be in (0, 1)")
+        TailRuleConfig(
+            decision_lead_s=self.tail_decision_lead_s,
+            max_decision_lateness_s=self.tail_max_decision_lateness_s,
+            leader_bid_threshold=self.tail_leader_bid_threshold,
+            pm_quote_max_age_s=self.tail_pm_quote_max_age_s,
+            binance_max_trade_age_s=self.tail_binance_max_trade_age_s,
+            weak_candle_abs_move_bps=self.tail_weak_candle_abs_move_bps,
+            weak_path_reversal_bps=self.tail_weak_path_reversal_bps,
+            entry_limit_price=self.tail_limit_price,
+            min_entry_ask_size=self.tail_min_entry_ask_size,
+        ).validate()
+        if self.tail_min_net_win_per_share < 0:
+            raise ValueError("AFTERTAKE_TAIL_MIN_NET_WIN_PER_SHARE must be >= 0")
         strategy_family = str(self.strategy_family or "").strip().lower()
-        if strategy_family not in {"v8", "v9"}:
-            raise ValueError("AFTERTAKE_STRATEGY must be v8 or v9")
+        if strategy_family not in {"v8", "v9", "twap_tail_v2"}:
+            raise ValueError("AFTERTAKE_STRATEGY must be twap_tail_v2, v8, or v9")
         object.__setattr__(self, "strategy_family", strategy_family)
         if strategy_family == "v9" and self.is_live and not self.v9_live_enabled:
             raise ValueError("V9 live trading requires AFTERTAKE_V9_LIVE_ENABLED=true")
@@ -197,7 +221,7 @@ class Settings:
             raise ValueError("AFTERTAKE_ORDER_TYPE must be one of FAK, FOK, GTC, GTD")
         object.__setattr__(self, "order_type", order_type)
         if self.is_live and order_type != "GTC":
-            raise ValueError("post-close +500ms live entry requires AFTERTAKE_ORDER_TYPE=GTC")
+            raise ValueError("tail live entry requires AFTERTAKE_ORDER_TYPE=GTC")
         if not 0 < self.order_ttl_s <= 120:
             raise ValueError("internal order TTL must be in (0, 120]")
         if not 0 < self.reconcile_timeout_s <= 180:
@@ -243,11 +267,11 @@ class Settings:
             assets = DEFAULT_ASSETS
         settings = cls(
             dry_run=_bool("AFTERTAKE_DRY_RUN", True),
-            strategy_family=os.getenv("AFTERTAKE_STRATEGY", "v8").strip().lower(),
+            strategy_family=os.getenv("AFTERTAKE_STRATEGY", "twap_tail_v2").strip().lower(),
             v9_live_enabled=_bool("AFTERTAKE_V9_LIVE_ENABLED", False),
             asset=assets[0] if assets else "BTC",
             assets=assets,
-            qty=_float("AFTERTAKE_QTY", 50.0),
+            qty=_float("AFTERTAKE_QTY", 5.0),
             post_close_snapshot_delay_s=_float(
                 "AFTERTAKE_POST_CLOSE_SNAPSHOT_DELAY_S", POST_CLOSE_SNAPSHOT_DELAY_S
             ),
@@ -263,6 +287,16 @@ class Settings:
             post_close_limit_price=_float(
                 "AFTERTAKE_POST_CLOSE_LIMIT_PRICE", POST_CLOSE_SNAPSHOT_LIMIT_PRICE
             ),
+            tail_decision_lead_s=_float("AFTERTAKE_TAIL_DECISION_LEAD_S", 10.25),
+            tail_max_decision_lateness_s=_float("AFTERTAKE_TAIL_MAX_DECISION_LATENESS_S", 0.25),
+            tail_leader_bid_threshold=_float("AFTERTAKE_TAIL_LEADER_BID_THRESHOLD", 0.90),
+            tail_pm_quote_max_age_s=_float("AFTERTAKE_TAIL_PM_QUOTE_MAX_AGE_S", 2.0),
+            tail_binance_max_trade_age_s=_float("AFTERTAKE_TAIL_BINANCE_MAX_TRADE_AGE_S", 2.0),
+            tail_weak_candle_abs_move_bps=_float("AFTERTAKE_TAIL_WEAK_CANDLE_ABS_MOVE_BPS", 5.0),
+            tail_weak_path_reversal_bps=_float("AFTERTAKE_TAIL_WEAK_PATH_REVERSAL_BPS", 2.0),
+            tail_limit_price=_float("AFTERTAKE_TAIL_LIMIT_PRICE", 0.99),
+            tail_min_entry_ask_size=_float("AFTERTAKE_TAIL_MIN_ENTRY_ASK_SIZE", 5.0),
+            tail_min_net_win_per_share=_float("AFTERTAKE_TAIL_MIN_NET_WIN_PER_SHARE", 0.001),
             out_dir=out_dir,
             state_db=out_dir / "aftertake.sqlite3",
             max_daily_loss=_float("AFTERTAKE_MAX_DAILY_LOSS", 25.0),
