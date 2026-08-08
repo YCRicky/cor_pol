@@ -104,7 +104,7 @@ class Settings:
     post_close_paired_max_age_s: float = POST_CLOSE_SNAPSHOT_PAIRED_MAX_AGE_S
     post_close_snapshot_max_lateness_s: float = POST_CLOSE_SNAPSHOT_MAX_LATENESS_S
     post_close_limit_price: float = POST_CLOSE_SNAPSHOT_LIMIT_PRICE
-    # TWAP-tail live contract. Binance Spot is a causal path filter only; PM
+    # TWAP-tail live contract. Binance USD-M Futures is a causal path filter only; PM
     # settlement remains the market's configured oracle/TWAP source.
     tail_decision_lead_s: float = 10.25
     tail_max_decision_lateness_s: float = 0.25
@@ -114,7 +114,6 @@ class Settings:
     tail_weak_candle_abs_move_bps: float = 5.0
     tail_weak_path_reversal_bps: float = 2.0
     tail_limit_price: float = 0.99
-    tail_min_entry_ask_size: float = 5.0
     tail_min_net_win_per_share: float = 0.001
     out_dir: Path = Path("out")
     max_daily_loss: float = 25.0
@@ -205,7 +204,6 @@ class Settings:
             weak_candle_abs_move_bps=self.tail_weak_candle_abs_move_bps,
             weak_path_reversal_bps=self.tail_weak_path_reversal_bps,
             entry_limit_price=self.tail_limit_price,
-            min_entry_ask_size=self.tail_min_entry_ask_size,
         ).validate()
         if self.tail_min_net_win_per_share < 0:
             raise ValueError("AFTERTAKE_TAIL_MIN_NET_WIN_PER_SHARE must be >= 0")
@@ -295,7 +293,6 @@ class Settings:
             tail_weak_candle_abs_move_bps=_float("AFTERTAKE_TAIL_WEAK_CANDLE_ABS_MOVE_BPS", 5.0),
             tail_weak_path_reversal_bps=_float("AFTERTAKE_TAIL_WEAK_PATH_REVERSAL_BPS", 2.0),
             tail_limit_price=_float("AFTERTAKE_TAIL_LIMIT_PRICE", 0.99),
-            tail_min_entry_ask_size=_float("AFTERTAKE_TAIL_MIN_ENTRY_ASK_SIZE", 5.0),
             tail_min_net_win_per_share=_float("AFTERTAKE_TAIL_MIN_NET_WIN_PER_SHARE", 0.001),
             out_dir=out_dir,
             state_db=out_dir / "aftertake.sqlite3",

@@ -1,7 +1,7 @@
-"""Memory-bounded Binance Spot tape for the TWAP tail path filter.
+"""Memory-bounded Binance USD-M Futures tape for the TWAP tail path filter.
 
 Binance is deliberately not treated as Polymarket's settlement oracle.  Its
-public Spot ``aggTrade`` stream gives the runner a continuously captured,
+public USD-M Futures ``aggTrade`` stream gives the runner a continuously captured,
 causal price path which can reject an unstable final thirty seconds.
 """
 
@@ -51,7 +51,7 @@ class _Candle:
 
 
 class BinanceFiveMinuteProxy:
-    """Collect exact UTC five-minute Binance Spot aggregate-trade tapes."""
+    """Collect exact UTC five-minute Binance USD-M Futures aggregate-trade tapes."""
 
     def __init__(self, assets: Iterable[str], *, clock=time.time):
         self._clock = clock
@@ -61,7 +61,7 @@ class BinanceFiveMinuteProxy:
             if asset in DEFAULT_SYMBOLS
         }
         streams = "/".join(f"{symbol}@aggTrade" for symbol in self._symbols)
-        self._url = f"wss://stream.binance.com:9443/stream?streams={streams}"
+        self._url = f"wss://fstream.binance.com/stream?streams={streams}"
         self._lock = threading.RLock()
         self._candles: Dict[Tuple[str, int], _Candle] = {}
         self._invalid: Dict[Tuple[str, int], str] = {}
@@ -75,7 +75,7 @@ class BinanceFiveMinuteProxy:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop.clear()
-        self._thread = threading.Thread(target=self._run, daemon=True, name="binance-spot-tail")
+        self._thread = threading.Thread(target=self._run, daemon=True, name="binance-futures-tail")
         self._thread.start()
 
     def close(self) -> None:

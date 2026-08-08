@@ -8,7 +8,7 @@ leader bid」規則；舊分類器沒有被 runtime 呼叫。
 - 最終輸贏只依 Polymarket/Gamma 市場的官方結算。
 - 只交易 Gamma metadata 明確標示 `cryptoMarketConfig.twapEnabled=true`、
   `twapLookbackSeconds=30` 的市場；metadata 缺失、非 30 秒或切換日前市場一律跳過。
-- Binance **Spot** `aggTrade` 不是結算 oracle，也不預測官方價格。它只是一條連續收集的
+- Binance **USD-M Futures** `aggTrade` 不是結算 oracle，也不預測官方價格。它只是一條連續收集的
   因果價格路徑，用來拒絕末段反轉。
 
 ## 單一決策點
@@ -19,9 +19,9 @@ leader bid」規則；舊分類器沒有被 runtime 呼叫。
 1. 取得本地接收、決策時不超過 2 秒的 YES/NO 配對 CLOB quote。
 2. 選 best bid 較高的一側，且該 bid 必須嚴格大於 `0.90`。
 3. 該側可成交 ask 必須在 `.99` 價格上限內，且顯示深度至少能承接設定數量。
-4. Binance Spot tape 必須從 candle 開始前已連線、沒有中斷、沒有 buffer overflow，且最新
+4. Binance Futures tape 必須從 candle 開始前已連線、沒有中斷、沒有 buffer overflow，且最新
    trade 本地接收時間距決策不超過 2 秒。
-5. 5 分鐘 Spot 方向要和 PM leader 相同。
+5. 5 分鐘 Futures 方向要和 PM leader 相同。
    - 若整根 move 絕對值大於 5bp：通過方向與新鮮度即可。
    - 若 move 在 0--5bp：`E-30s → D` 與 `E-20s → D` 必須同向，且最後 30 秒的逆向
      drawdown 不得超過 2bp。

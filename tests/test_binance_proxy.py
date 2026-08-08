@@ -14,10 +14,10 @@ def _trade(symbol, timestamp_ms, price):
     )
 
 
-def test_proxy_builds_complete_spot_tape_and_compatibility_ohlc():
+def test_proxy_builds_complete_futures_tape_and_compatibility_ohlc():
     clock_value = [900.0]
     proxy = BinanceFiveMinuteProxy(("XRP",), clock=lambda: clock_value[0])
-    assert proxy._url.startswith("wss://stream.binance.com:9443/stream?")
+    assert proxy._url.startswith("wss://fstream.binance.com/stream?")
     assert "@aggTrade" in proxy._url
     proxy._on_open(None)
     proxy._on_message(None, _trade("XRPUSDT", 900_001, 1.0))

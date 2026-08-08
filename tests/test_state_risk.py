@@ -76,18 +76,18 @@ def test_unknown_execution_does_not_globally_freeze_new_entries(tmp_path):
         store.close()
 
 
-def test_displayed_depth_and_per_asset_open_position_limit_are_enforced(tmp_path):
+def test_displayed_depth_is_informational_and_open_position_limit_is_enforced(tmp_path):
     store = StateStore(tmp_path / "state.sqlite3")
     try:
-        with pytest.raises(RiskRejected, match="depth"):
-            check_entry_risk(
-                settings=Settings(),
-                store=store,
-                slug="market",
-                price=0.5,
-                qty=5,
-                displayed_ask_size=4,
-            )
+        snapshot = check_entry_risk(
+            settings=Settings(),
+            store=store,
+            slug="market",
+            price=0.5,
+            qty=5,
+            displayed_ask_size=0,
+        )
+        assert snapshot.requested_notional == 2.5
 
         record = _reserve(store, "btc-updown-5m-0")
         store.mark_terminal_execution(

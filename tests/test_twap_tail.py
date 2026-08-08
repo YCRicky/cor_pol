@@ -21,14 +21,14 @@ def _trade(offset_s, price, *, received_offset_s=None):
     )
 
 
-def _quote(*, yes_bid=0.93, no_bid=0.06, observed_at=DECISION_TS):
+def _quote(*, yes_bid=0.93, no_bid=0.06, yes_ask_size=8.0, observed_at=DECISION_TS):
     return PMQuote(
         observed_at=observed_at,
         yes_bid=yes_bid,
         no_bid=no_bid,
         yes_ask=0.95,
         no_ask=0.08,
-        yes_ask_size=8.0,
+        yes_ask_size=yes_ask_size,
         no_ask_size=8.0,
     )
 
@@ -44,7 +44,10 @@ def _tape(*trades):
 
 def test_strong_candle_direction_enters_without_future_data():
     decision = evaluate_tail_decision(
-        quotes=[_quote(), _quote(yes_bid=0.10, no_bid=0.94, observed_at=DECISION_TS + 1)],
+        quotes=[
+            _quote(yes_ask_size=0.0),
+            _quote(yes_bid=0.10, no_bid=0.94, observed_at=DECISION_TS + 1),
+        ],
         binance=_tape(
             _trade(0.01, 100.00),
             _trade(270.0, 100.04),
@@ -81,7 +84,7 @@ def test_weak_candle_final_reversal_is_rejected():
     }
 
 
-def test_incomplete_spot_coverage_is_fail_closed():
+def test_incomplete_futures_coverage_is_fail_closed():
     decision = evaluate_tail_decision(
         quotes=[_quote()],
         binance=BinanceTailInput("BTC", ROUND_START * 1000, False, (), "stream_disconnected"),
@@ -89,7 +92,7 @@ def test_incomplete_spot_coverage_is_fail_closed():
         decision_ts=DECISION_TS,
     )
     assert decision.action == "hold"
-    assert decision.reason == "binance_spot_coverage_incomplete"
+    assert decision.reason == "binance_futures_coverage_incomplete"
 
 
 def test_twap_market_gate_requires_gamma_30_second_metadata():

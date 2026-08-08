@@ -1,7 +1,7 @@
 """Causal pre-close gate for Polymarket 30-second crypto TWAP markets.
 
 The Polymarket outcome is resolved by its published oracle/TWAP rule, not by
-Binance.  Binance Spot is used here only as a fast, public *path filter*: if a
+Binance.  Binance USD-M Futures is used here only as a fast, public *path filter*: if a
 small five-minute move is already reversing in the final thirty seconds, the
 runner stands down rather than treating a stale CLOB leader as a certainty.
 
@@ -35,7 +35,6 @@ class TailRuleConfig:
     weak_candle_abs_move_bps: float = 5.0
     weak_path_reversal_bps: float = 2.0
     entry_limit_price: float = 0.99
-    min_entry_ask_size: float = 5.0
     strategy_version: str = STRATEGY_VERSION
 
     def validate(self) -> None:
@@ -55,8 +54,6 @@ class TailRuleConfig:
             raise ValueError("tail reversal threshold must be >= 0 bps")
         if not 0 < self.entry_limit_price < 1:
             raise ValueError("tail entry limit price must be in (0, 1)")
-        if self.min_entry_ask_size <= 0:
-            raise ValueError("tail minimum entry ask size must be > 0")
 
 
 @dataclass(frozen=True)
@@ -74,7 +71,7 @@ class PMQuote:
 
 @dataclass(frozen=True)
 class BinanceTrade:
-    """A Binance Spot aggregate trade with both source and local timestamps."""
+    """A Binance USD-M Futures aggregate trade with source and local timestamps."""
 
     trade_ms: int
     received_ms: int
@@ -83,7 +80,7 @@ class BinanceTrade:
 
 @dataclass(frozen=True)
 class BinanceTailInput:
-    """Bounded, continuously collected Spot tape for one five-minute round."""
+    """Bounded, continuously collected Futures tape for one five-minute round."""
 
     asset: str
     round_start_ms: int
@@ -144,7 +141,7 @@ def evaluate_tail_decision(
     """Evaluate a single pre-close tail decision without future information.
 
     ``decision_ts`` must be near ``round_end - decision_lead``.  The CLOB
-    leader is the candidate side.  The complete Binance Spot tape only filters
+    leader is the candidate side.  The complete Binance Futures tape only filters
     obvious weak-candle reversals; it never replaces PM's resolution oracle.
     """
 
@@ -164,7 +161,7 @@ def evaluate_tail_decision(
         "binance_max_trade_age_s": cfg.binance_max_trade_age_s,
         "weak_candle_abs_move_bps": cfg.weak_candle_abs_move_bps,
         "weak_path_reversal_bps": cfg.weak_path_reversal_bps,
-        "binance_source": "spot_aggTrade_path_filter_not_settlement_oracle",
+        "binance_source": "usd_m_futures_aggTrade_path_filter_not_settlement_oracle",
     }
     if now < target_ts:
         return _hold("tail_decision_not_due", audit)
@@ -172,7 +169,7 @@ def evaluate_tail_decision(
         return _hold("tail_decision_too_late", audit)
     if not binance.complete_coverage:
         audit["binance_invalid_reason"] = binance.invalid_reason or "incomplete_coverage"
-        return _hold("binance_spot_coverage_incomplete", audit)
+        return _hold("binance_futures_coverage_incomplete", audit)
 
     eligible_quotes = [quote for quote in quotes if _finite(quote.observed_at) and quote.observed_at <= now]
     quote = max(eligible_quotes, key=lambda item: item.observed_at, default=None)
@@ -208,8 +205,6 @@ def evaluate_tail_decision(
         return _hold("tail_pm_leader_bid_not_strictly_above_threshold", audit, side=side)
     if not _finite(entry_ask, high=1.0) or float(entry_ask) > cfg.entry_limit_price:
         return _hold("tail_pm_entry_ask_not_marketable_within_cap", audit, side=side)
-    if entry_ask_size < cfg.min_entry_ask_size:
-        return _hold("tail_pm_entry_depth_below_minimum", audit, side=side)
 
     as_of_ms = int(now * 1000)
     start_ms = int(binance.round_start_ms)
@@ -224,7 +219,7 @@ def evaluate_tail_decision(
     latest = _latest_at_or_before(causal_trades, as_of_ms)
     audit["binance_causal_trade_count"] = len(causal_trades)
     if first is None or latest is None:
-        return _hold("tail_binance_spot_tape_missing", audit, side=side)
+        return _hold("tail_binance_futures_tape_missing", audit, side=side)
     latest_age_s = (as_of_ms - latest.received_ms) / 1000.0
     audit.update(
         {
@@ -236,7 +231,7 @@ def evaluate_tail_decision(
         }
     )
     if latest_age_s < 0 or latest_age_s > cfg.binance_max_trade_age_s:
-        return _hold("tail_binance_spot_tape_stale", audit, side=side)
+        return _hold("tail_binance_futures_tape_stale", audit, side=side)
 
     candle_bps = _price_change_bps(first.price, latest.price)
     candle_side = _side_for_change(candle_bps)

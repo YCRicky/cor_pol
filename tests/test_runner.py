@@ -445,7 +445,7 @@ def test_runtime_status_reports_active_twap_tail_contract(tmp_path):
         assert status["confirmation_spacing_ms"] == 0
         assert status["confirmation_policy"] == "one_causal_twap_tail_decision"
         assert status["post_close_classifier_for_live_entry"] is False
-        assert status["binance_role"] == "spot_path_filter_not_settlement_oracle"
+        assert status["binance_role"] == "usd_m_futures_path_filter_not_settlement_oracle"
         assert status["order_type"] == "GTC"
     finally:
         store.close()

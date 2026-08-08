@@ -8,7 +8,7 @@
 4. Install `.[dev,live]`; `aftertake --deployment-check` is optional manual diagnostics.
 5. Start `aftertake --forever` and confirm `BOOT` arrives.
 
-The shadow runner receives real Gamma/CLOB and Binance Spot data and writes the
+The shadow runner receives real Gamma/CLOB and Binance Futures data and writes the
 same SQLite/JSONL audit trail. It waits for a fresh candle boundary, requires a
 Gamma-declared 30-second TWAP market, then records the one `E-10.25s` decision
 or its fail-closed reason. No wallet key, signature, or CLOB order is used.
@@ -39,7 +39,7 @@ waiting for the next five-minute boundary is explicitly exempt from that
 watchdog.
 
 The PM market WebSocket has a 5-second keepalive and a 12-second transport
-watchdog. Binance Spot `aggTrade` is collected independently. A PM or Spot
+watchdog. Binance Futures `aggTrade` is collected independently. A PM or Futures
 disconnect/reconnect during the candle invalidates the tail round; the service
 does not reconstruct an incomplete tape. For live orders,
 the CLOB heartbeat is sent every 4 seconds. If Polymarket returns a

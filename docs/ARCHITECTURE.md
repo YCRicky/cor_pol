@@ -4,7 +4,7 @@
 Gamma market metadata ──► 30s-TWAP eligibility gate
                                   │
 PM public CLOB WS ─► paired quote buffer ─┤
-Binance Spot aggTrade ─► complete tape ───┤──► E-10.25s causal decision
+Binance USD-M Futures aggTrade ─► complete tape ┤──► E-10.25s causal decision
                                   │                    │
 State/risk/fees/account preflight ────────┘                    ▼
                                                        one GTC limit (.99 cap)
@@ -14,11 +14,11 @@ State/risk/fees/account preflight ────────┘                   
                                                 official PM/Gamma settlement
 ```
 
-`src/aftertake/twap_tail.py` is pure decision logic. It accepts timestamped CLOB quotes and Spot aggregate
+`src/aftertake/twap_tail.py` is pure decision logic. It accepts timestamped CLOB quotes and Futures aggregate
 trades, filters both at the decision timestamp, and returns ENTER/HOLD plus audit fields. It has no HTTP,
 WebSocket, wallet, or execution side effects.
 
-`src/aftertake/binance_proxy.py` owns the bounded Spot tape. A connection started after candle open,
+`src/aftertake/binance_proxy.py` owns the bounded Futures tape. A connection started after candle open,
 disconnect/reconnect during the candle, missing tape, or buffer overflow marks that round incomplete.
 
 `src/aftertake/runner.py` owns schedule, Gamma metadata gate, streams, live account checks, risk, SQLite

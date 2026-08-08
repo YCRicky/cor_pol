@@ -1076,9 +1076,6 @@ def _tail_rule_config_for_settings(settings: Settings) -> TailRuleConfig:
         weak_candle_abs_move_bps=settings.tail_weak_candle_abs_move_bps,
         weak_path_reversal_bps=settings.tail_weak_path_reversal_bps,
         entry_limit_price=settings.tail_limit_price,
-        # A visible quote must support the actual fixed order, not merely a
-        # smaller generic depth threshold.
-        min_entry_ask_size=max(settings.tail_min_entry_ask_size, settings.qty),
     )
     config.validate()
     return config
@@ -2470,7 +2467,7 @@ def _run_twap_tail_round(
 ) -> List[PostCloseDecision]:
     """Run the only production entry path: causal pre-close 30s-TWAP tail.
 
-    The market must opt in through Gamma's ``cryptoMarketConfig``.  A Spot
+    The market must opt in through Gamma's ``cryptoMarketConfig``.  A Futures
     stream disconnect, missing paired CLOB quote, late scheduler, insufficient
     depth, or any weak-candle reversal results in a single HOLD and no retry.
     """
@@ -2629,7 +2626,7 @@ def _run_twap_tail_round(
                 )
                 break
             if binance_proxy is None:
-                hold("tail_binance_spot_proxy_missing", now=now)
+                hold("tail_binance_futures_proxy_missing", now=now)
                 break
 
             with observations_lock:
@@ -3065,7 +3062,7 @@ def _select_next_round_start(
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.time,
 ) -> int:
-    """Return a fresh boundary with continuous Binance Spot tape coverage.
+    """Return a fresh boundary with continuous Binance Futures tape coverage.
 
     A restarted process cannot reconstruct the already-open candle.  Waiting
     for a clean boundary is therefore intentional fail-closed behavior.
@@ -4030,7 +4027,7 @@ def _status_payload(settings: Settings, store: StateStore) -> Dict[str, Any]:
         "confirmations": 0,
         "confirmation_spacing_ms": 0,
         "post_close_classifier_for_live_entry": False,
-        "binance_role": "spot_path_filter_not_settlement_oracle",
+        "binance_role": "usd_m_futures_path_filter_not_settlement_oracle",
         "weak_candle_abs_move_bps": tail.weak_candle_abs_move_bps,
         "weak_path_reversal_bps": tail.weak_path_reversal_bps,
         "require_loser_refill_failure": False,
@@ -4065,7 +4062,7 @@ def _tail_runtime_payload(settings: Settings) -> Dict[str, Any]:
         "entry_limit_price": config.entry_limit_price,
         "order_type": settings.order_type,
         "post_close_classifier_for_live_entry": False,
-        "binance_role": "spot_path_filter_not_settlement_oracle",
+        "binance_role": "usd_m_futures_path_filter_not_settlement_oracle",
     }
 
 
@@ -4182,7 +4179,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             }
             _audit(settings, store, "boot", boot_payload)
             _safe_notify(notifier, settings, store, "boot", boot_payload)
-            # Shadow mode must observe the same Spot coverage failures as live
+            # Shadow mode must observe the same Futures coverage failures as live
             # mode; it never grants order capability.
             binance_proxy = BinanceFiveMinuteProxy(settings.assets)
             binance_proxy.start()

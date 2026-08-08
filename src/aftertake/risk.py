@@ -39,11 +39,10 @@ def check_entry_risk(
     # and cooldown caps are per asset so BTC/ETH/etc. do not block one another.
     price = float(price)
     qty = float(qty)
-    displayed_ask_size = float(displayed_ask_size)
     if price <= 0 or price >= 1 or qty <= 0:
         raise RiskRejected("invalid_entry_size")
-    if qty > displayed_ask_size:
-        raise RiskRejected("requested_qty_exceeds_displayed_ask_depth")
+    # Displayed depth is audit information only. A marketable GTC may fill from
+    # deeper or newly arriving liquidity, so it must not block submission.
     now = float(time.time() if now_ts is None else now_ts)
     open_positions = len(store.open_positions_for_asset(slug))
     daily_loss = store.daily_realized_loss()
