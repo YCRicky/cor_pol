@@ -39,9 +39,12 @@ def test_ec2_deploy_enforces_multi_asset_live_universe_without_touching_secrets(
     assert "AFTERTAKE_STRATEGY=twap_tail_v2" in env_example
     assert "AFTERTAKE_ASSETS=BTC,ETH,SOL,XRP,BNB,DOGE" in env_example
     assert "AFTERTAKE_QTY=5" in env_example
-    assert "AFTERTAKE_TAIL_DECISION_LEAD_S=10.0" in env_example
+    assert "AFTERTAKE_TAIL_DECISION_LEAD_S=10.25" in env_example
     assert "AFTERTAKE_TAIL_LEADER_BID_THRESHOLD=0.90" in env_example
-    assert "AFTERTAKE_TAIL_MAX_DECISION_LATENESS_S=1.0" in env_example
+    assert "AFTERTAKE_TAIL_MAX_DECISION_LATENESS_S=0.25" in env_example
+    assert "AFTERTAKE_TAIL_BINANCE_MAX_TRADE_AGE_S=2.0" in env_example
+    assert "AFTERTAKE_TAIL_WEAK_CANDLE_ABS_MOVE_BPS=5.0" in env_example
+    assert "AFTERTAKE_TAIL_WEAK_PATH_REVERSAL_BPS=2.0" in env_example
     assert "AFTERTAKE_TAIL_LIMIT_PRICE=0.99" in env_example
     assert "AFTERTAKE_ASSET=BTC" not in env_example
     assert "AFTERTAKE_MAX_OPEN_POSITIONS=3" in env_example
@@ -52,16 +55,19 @@ def test_ec2_deploy_enforces_multi_asset_live_universe_without_touching_secrets(
     assert "ensure_env_kv AFTERTAKE_ASSETS BTC,ETH,SOL,XRP,BNB,DOGE" in deploy
     assert "ensure_env_default AFTERTAKE_QTY 5" in deploy
     assert "ensure_env_default AFTERTAKE_ORDER_TYPE GTC" in deploy
-    assert "ensure_env_kv AFTERTAKE_TAIL_DECISION_LEAD_S 10.0" in deploy
-    assert "ensure_env_default AFTERTAKE_TAIL_LEADER_BID_THRESHOLD 0.90" in deploy
-    assert "ensure_env_kv AFTERTAKE_TAIL_MAX_DECISION_LATENESS_S 1.0" in deploy
-    assert "ensure_env_default AFTERTAKE_TAIL_LIMIT_PRICE 0.99" in deploy
+    assert "ensure_env_kv AFTERTAKE_TAIL_DECISION_LEAD_S 10.25" in deploy
+    assert "ensure_env_kv AFTERTAKE_TAIL_LEADER_BID_THRESHOLD 0.90" in deploy
+    assert "ensure_env_kv AFTERTAKE_TAIL_MAX_DECISION_LATENESS_S 0.25" in deploy
+    assert "ensure_env_kv AFTERTAKE_TAIL_BINANCE_MAX_TRADE_AGE_S 2.0" in deploy
+    assert "ensure_env_kv AFTERTAKE_TAIL_WEAK_CANDLE_ABS_MOVE_BPS 5.0" in deploy
+    assert "ensure_env_kv AFTERTAKE_TAIL_WEAK_PATH_REVERSAL_BPS 2.0" in deploy
+    assert "ensure_env_kv AFTERTAKE_TAIL_LIMIT_PRICE 0.99" in deploy
     assert "require_twap_tail_contract" in deploy
     assert "AFTERTAKE_QTY must be a positive number" in deploy
     assert "AFTERTAKE_QTY must be 50" not in deploy
-    assert "AFTERTAKE_TAIL_DECISION_LEAD_S must be 10.0" in deploy
+    assert "AFTERTAKE_TAIL_DECISION_LEAD_S must be 10.25" in deploy
     assert "AFTERTAKE_TAIL_LEADER_BID_THRESHOLD must be 0.90" in deploy
-    assert "AFTERTAKE_TAIL_MAX_DECISION_LATENESS_S must be 1.0" in deploy
+    assert "AFTERTAKE_TAIL_MAX_DECISION_LATENESS_S must be 0.25" in deploy
     assert "comment_out_legacy_env AFTERTAKE_ASSET" in deploy
     assert "POLYMARKET_PRIVATE_KEY" in deploy  # still only validates, never rewrites secrets
     assert "ensure_env_kv POLYMARKET_PRIVATE_KEY" not in deploy

@@ -8,10 +8,11 @@
 4. Install `.[dev,live]`; `aftertake --deployment-check` is optional manual diagnostics.
 5. Start `aftertake --forever` and confirm `BOOT` arrives.
 
-The shadow runner receives real Gamma/CLOB and Binance Futures data and writes the
-same SQLite/JSONL audit trail. It joins an active round when preflight lead remains, requires a
-Gamma-declared 30-second TWAP market, then records the one `E-10s` to `E-9s` decision
-or its fail-closed reason. No wallet key, signature, or CLOB order is used.
+The shadow runner receives real Gamma/CLOB and Binance Spot data and writes the
+same SQLite/JSONL audit trail. It joins an active round only when its Spot connection began before
+that candle; otherwise it waits for the next boundary. It requires a Gamma-declared 30-second TWAP
+market, freezes feature inputs at `E-10.25s`, and may submit only through `E-10.00s`. No wallet key,
+signature, or CLOB order is used in shadow mode.
 
 ## EC2
 
@@ -39,8 +40,8 @@ waiting for the next five-minute boundary is explicitly exempt from that
 watchdog.
 
 The PM market WebSocket has a 5-second keepalive and a 12-second transport
-watchdog. Binance Futures `aggTrade` is collected independently for audit only;
-missing Futures data never invalidates a PM-qualified entry. For live orders,
+watchdog. Binance Spot `@kline_5m` plus `aggTrade` is required for the replay-parity
+candidate gate; missing/incomplete Spot data invalidates the entry. For live orders,
 the CLOB heartbeat is sent every 4 seconds. If Polymarket returns a
 400 invalid/expired heartbeat id, the replacement id in that response is
 adopted and retried immediately instead of repeating the stale id. Each
@@ -55,6 +56,10 @@ Set `AFTERTAKE_DRY_RUN=false` plus the required CLOB V2 account identity in
 hide diagnostics. Pending GTC orders should remain submitted until later CLOB
 reconciliation / official settlement; submit-path infrastructure failures skip
 only the affected market and do not block unrelated future entries.
+
+Before promotion, run the read-only parity verifier against the retained local
+feature cache. It must report `250/250` train, `193/193` held out, `443/443`
+combined; this verifies candidate logic only, not fills or PnL.
 
 ## Operator evidence
 

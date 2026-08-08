@@ -1,37 +1,49 @@
-# TWAP 尾盤策略（`twap_tail_v2`）
+# TWAP 尾盤策略（回放 parity contract）
 
-這是目前唯一的 production entry path。它取代舊的「收盤後 +0.5 秒、只看 PM
-leader bid」規則；舊分類器沒有被 runtime 呼叫。
+`twap_tail_v2` 是唯一的 runtime entry path。其**勝邊候選 gate** 與
+`research_outputs/twap_price_path_tail_v1` 的 global safety rule 對齊；它取代舊的收盤後
+`+0.5s` PM-only 規則。
 
 ## 結算與資料角色
 
-- 最終輸贏只依 Polymarket/Gamma 市場的官方結算。
-- 只交易 Gamma metadata 明確標示 `cryptoMarketConfig.twapEnabled=true`、
-  `twapLookbackSeconds=30` 的市場；metadata 缺失、非 30 秒或切換日前市場一律跳過。
-- Binance **USD-M Futures** `aggTrade` 僅供 audit；不是結算 oracle，也不是進場 gate。
+- 最終輸贏只依 Polymarket/Gamma 的官方結算；回放中 PM/UMA 結果只在候選後作為 label。
+- 僅接受 Gamma metadata 的 `twapEnabled=true` 與 `twapLookbackSeconds=30`。
+- Binance **Spot** `@kline_5m` 提供當根 open，`@aggTrade` 提供路徑。它只會 veto PM 候選，
+  不是結算 oracle。
 
-## 單一決策點
+## 固定資料 cutoff 與候選規則
 
-對每個完整五分鐘 candle，決策時間為 `E - 10s`，可接受的 scheduler 遲到最多
-`1s`。超過即 HOLD；不會事後補判、重試或改方向。
+對每個完整五分鐘市場，特徵 cutoff 固定為 `D = E−10.25s`。scheduler 最多可在 `E−10.00s`
+才送出，但 PM quote 與 Binance trades 一律只讀取 `<=D` 的本地可見資料；絕不把後 250ms 的更新
+混進判斷。
 
-1. 取得本地接收、決策時不超過 2 秒的 YES/NO 配對 CLOB quote。
-2. 選 best bid 較高的一側，且該 bid 必須嚴格大於 `0.90`。
-3. 該側可成交 ask 必須在 `.99` 價格上限內；顯示深度不阻擋送單。
-4. Futures 缺資料、方向相反、重連或 candle 不完整只寫入 audit，不改變 PM 判斷。
-5. 再過既有風控、帳戶餘額/allowance、fee floor、最小單位和 SQLite reservation 後，才送一筆
-   marketable GTC limit；價格上限固定 `.99`。
+1. 取 `D` 時最新、年齡 `<=2s` 的 paired PM CLOB quote，選較高 best bid；leader 必須
+   **`>=0.90`**，不是 `>0.90`。
+2. Binance Spot kline open 與最新 causal aggTrade 的 signed candle 必須同 PM side 且 `>0bp`；
+   最新 trade exchange time 距 `D` 必須 `<=2s`。
+3. 若 signed candle `>5bp`，通過；這正是已選全域規則的 strong-candle 模式。
+4. 若 `0 < signed candle <=5bp`，要求 `E−30→D`、`E−20→D` 都同 PM side，且由 30 秒窗口的
+   高/低點回到 `D` 的逆向回撤 `<=2bp`。
+5. Spot 流在 candle 開始後才連線、途中斷線、缺 kline open、資料過期、PM tie 或資料缺失，一律 HOLD。
 
-PM quote 缺失或過期、費用後下限不足、風控拒絕
-都等同 **不交易**。
+通過候選 gate 後，runner 才依序檢查 Gamma/CLOB metadata、帳戶餘額與 allowance、fee floor、
+風控、SQLite reservation，最後以 `.99` GTC 執行。這些是成交安全層，**不是** 443/443 標籤回放的
+一部分。
 
-## 為何不用「0ms」當 alpha
+## 回放一致性驗證
 
-exchange 訊息裡的 `0ms`/source timestamp 不是端到端延遲保證。實作記錄本地 receive time，並在
-決策時同時要求 Binance source time 和 receive time 都不晚於決策點，避免回放或網路抖動把未來 tick
-帶進來。
+在保留的本地 feature cache 上執行：
+
+```bash
+PYTHONPATH=src python3 scripts/verify_twap_replay_parity.py \
+  --feature-cache research_outputs/twap_price_path_tail_v1/price_path_features.json
+```
+
+預期輸出為訓練 `250/250`、保留樣本 `193/193`，合計 `443/443`。驗證程式選邊時不讀
+`pm_winner`，只在計分時讀取它。
 
 ## 已知限制
 
-這是一個嚴格篩選器，不是「100% 勝率」保證；所有回放結果都可能受樣本、stream coverage、成交與
-實際 fee 影響。策略不把 Binance 報價當成 PM 的結算價格，也不在 coverage 缺口時猜測或自動放寬門檻。
+443/443 包含用於定參的前 60% 訓練資料；193/193 才是時間保留樣本。它是方向標籤的歷史結果，
+不含 CLOB ask、queue、部分成交、撤單、端到端延遲或真實 fee，因此不是未來 100% 勝率或實盤獲利保證。
+Binance source timestamp 也不是「0ms」端到端延遲保證。

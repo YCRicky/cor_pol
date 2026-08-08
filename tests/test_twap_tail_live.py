@@ -37,7 +37,7 @@ class _Stream:
     def start(self):
         self._on_book(
             PairedBook(
-                observed_at=ROUND_END - 10.20,
+                observed_at=ROUND_END - 10.25,
                 yes=SideBook(0.93, 10, 10, 0.95, 10),
                 no=SideBook(0.06, 10, 10, 0.08, 10),
             )
@@ -115,6 +115,8 @@ class _Proxy:
                 BinanceTrade((ROUND_END - 20) * 1000, (ROUND_END - 20) * 1000, 100.06),
                 BinanceTrade((ROUND_END * 1000) - 10_300, (ROUND_END * 1000) - 10_300, 100.10),
             ),
+            candle_open_price=100.0,
+            candle_open_received_ms=(ROUND_START + 1) * 1000,
         )
 
 
@@ -142,7 +144,7 @@ def test_live_path_uses_preclose_twap_tail_and_dry_run_never_sends_order(tmp_pat
         )
         assert decisions[0].action == "enter"
         assert decisions[0].side == "YES"
-        assert decisions[0].audit["strategy_version"] == "aftertake_twap_pm_tail_v3"
+        assert decisions[0].audit["strategy_version"] == "aftertake_twap_price_path_tail_replay_parity_v1"
         assert store.open_positions()[0].requested_qty == 5.0
     finally:
         store.close()

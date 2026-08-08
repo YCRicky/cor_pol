@@ -77,13 +77,16 @@ normalize_runtime_env() {
   ensure_env_kv AFTERTAKE_ASSETS BTC,ETH,SOL,XRP,BNB,DOGE
   ensure_env_default AFTERTAKE_QTY 5
   ensure_env_default AFTERTAKE_ORDER_TYPE GTC
-  ensure_env_kv AFTERTAKE_TAIL_DECISION_LEAD_S 10.0
-  ensure_env_kv AFTERTAKE_TAIL_MAX_DECISION_LATENESS_S 1.0
-  ensure_env_default AFTERTAKE_TAIL_LEADER_BID_THRESHOLD 0.90
-  ensure_env_default AFTERTAKE_TAIL_PM_QUOTE_MAX_AGE_S 2.0
-  ensure_env_default AFTERTAKE_TAIL_LIMIT_PRICE 0.99
+  ensure_env_kv AFTERTAKE_TAIL_DECISION_LEAD_S 10.25
+  ensure_env_kv AFTERTAKE_TAIL_MAX_DECISION_LATENESS_S 0.25
+  ensure_env_kv AFTERTAKE_TAIL_LEADER_BID_THRESHOLD 0.90
+  ensure_env_kv AFTERTAKE_TAIL_PM_QUOTE_MAX_AGE_S 2.0
+  ensure_env_kv AFTERTAKE_TAIL_BINANCE_MAX_TRADE_AGE_S 2.0
+  ensure_env_kv AFTERTAKE_TAIL_WEAK_CANDLE_ABS_MOVE_BPS 5.0
+  ensure_env_kv AFTERTAKE_TAIL_WEAK_PATH_REVERSAL_BPS 2.0
+  ensure_env_kv AFTERTAKE_TAIL_LIMIT_PRICE 0.99
   ensure_env_default AFTERTAKE_TAIL_MIN_NET_WIN_PER_SHARE 0.001
-  for key in AFTERTAKE_POST_CLOSE_SNAPSHOT_DELAY_S AFTERTAKE_POST_CLOSE_LEADER_BID_THRESHOLD AFTERTAKE_POST_CLOSE_PAIRED_MAX_AGE_S AFTERTAKE_POST_CLOSE_SNAPSHOT_MAX_LATENESS_S AFTERTAKE_POST_CLOSE_LIMIT_PRICE AFTERTAKE_TAIL_MIN_ENTRY_ASK_SIZE AFTERTAKE_TAIL_BINANCE_MAX_TRADE_AGE_S AFTERTAKE_TAIL_WEAK_CANDLE_ABS_MOVE_BPS AFTERTAKE_TAIL_WEAK_PATH_REVERSAL_BPS; do
+  for key in AFTERTAKE_POST_CLOSE_SNAPSHOT_DELAY_S AFTERTAKE_POST_CLOSE_LEADER_BID_THRESHOLD AFTERTAKE_POST_CLOSE_PAIRED_MAX_AGE_S AFTERTAKE_POST_CLOSE_SNAPSHOT_MAX_LATENESS_S AFTERTAKE_POST_CLOSE_LIMIT_PRICE AFTERTAKE_TAIL_MIN_ENTRY_ASK_SIZE; do
     if grep -q -E "^[[:space:]]*${key}[[:space:]]*=" "${ENV_FILE}"; then
       comment_out_legacy_env "${key}"
     fi
@@ -94,7 +97,7 @@ normalize_runtime_env() {
 }
 
 require_twap_tail_contract() {
-  local strategy assets qty order_type lead threshold lateness limit
+  local strategy assets qty order_type lead threshold lateness pm_age binance_age weak_move weak_reversal limit
   strategy="$(read_env AFTERTAKE_STRATEGY)"
   assets="$(read_env AFTERTAKE_ASSETS)"
   qty="$(read_env AFTERTAKE_QTY)"
@@ -102,6 +105,10 @@ require_twap_tail_contract() {
   lead="$(read_env AFTERTAKE_TAIL_DECISION_LEAD_S)"
   threshold="$(read_env AFTERTAKE_TAIL_LEADER_BID_THRESHOLD)"
   lateness="$(read_env AFTERTAKE_TAIL_MAX_DECISION_LATENESS_S)"
+  pm_age="$(read_env AFTERTAKE_TAIL_PM_QUOTE_MAX_AGE_S)"
+  binance_age="$(read_env AFTERTAKE_TAIL_BINANCE_MAX_TRADE_AGE_S)"
+  weak_move="$(read_env AFTERTAKE_TAIL_WEAK_CANDLE_ABS_MOVE_BPS)"
+  weak_reversal="$(read_env AFTERTAKE_TAIL_WEAK_PATH_REVERSAL_BPS)"
   limit="$(read_env AFTERTAKE_TAIL_LIMIT_PRICE)"
   test "${strategy}" = "twap_tail_v2" || { echo "AFTERTAKE_STRATEGY must be twap_tail_v2. Refusing deployment." >&2; exit 2; }
   test "${assets}" = "BTC,ETH,SOL,XRP,BNB,DOGE" || { echo "AFTERTAKE_ASSETS must be BTC,ETH,SOL,XRP,BNB,DOGE. Refusing deployment." >&2; exit 2; }
@@ -117,16 +124,32 @@ require_twap_tail_contract() {
     exit 2
   }
   case "${lead}" in
-    10|10.0|10.00|10.000) ;;
-    *) echo "AFTERTAKE_TAIL_DECISION_LEAD_S must be 10.0; found '${lead}'. Refusing deployment." >&2; exit 2 ;;
+    10.25|10.250|10.2500) ;;
+    *) echo "AFTERTAKE_TAIL_DECISION_LEAD_S must be 10.25; found '${lead}'. Refusing deployment." >&2; exit 2 ;;
   esac
   case "${threshold}" in
     0.9|0.90|0.900) ;;
     *) echo "AFTERTAKE_TAIL_LEADER_BID_THRESHOLD must be 0.90; found '${threshold}'. Refusing deployment." >&2; exit 2 ;;
   esac
   case "${lateness}" in
-    1|1.0|1.00|1.000) ;;
-    *) echo "AFTERTAKE_TAIL_MAX_DECISION_LATENESS_S must be 1.0; found '${lateness}'. Refusing deployment." >&2; exit 2 ;;
+    0.25|0.250|0.2500) ;;
+    *) echo "AFTERTAKE_TAIL_MAX_DECISION_LATENESS_S must be 0.25; found '${lateness}'. Refusing deployment." >&2; exit 2 ;;
+  esac
+  case "${pm_age}" in
+    2|2.0|2.00|2.000) ;;
+    *) echo "AFTERTAKE_TAIL_PM_QUOTE_MAX_AGE_S must be 2.0; found '${pm_age}'. Refusing deployment." >&2; exit 2 ;;
+  esac
+  case "${binance_age}" in
+    2|2.0|2.00|2.000) ;;
+    *) echo "AFTERTAKE_TAIL_BINANCE_MAX_TRADE_AGE_S must be 2.0; found '${binance_age}'. Refusing deployment." >&2; exit 2 ;;
+  esac
+  case "${weak_move}" in
+    5|5.0|5.00|5.000) ;;
+    *) echo "AFTERTAKE_TAIL_WEAK_CANDLE_ABS_MOVE_BPS must be 5.0; found '${weak_move}'. Refusing deployment." >&2; exit 2 ;;
+  esac
+  case "${weak_reversal}" in
+    2|2.0|2.00|2.000) ;;
+    *) echo "AFTERTAKE_TAIL_WEAK_PATH_REVERSAL_BPS must be 2.0; found '${weak_reversal}'. Refusing deployment." >&2; exit 2 ;;
   esac
   case "${limit}" in
     0.99|0.990) ;;

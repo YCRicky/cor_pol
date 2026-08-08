@@ -1072,6 +1072,9 @@ def _tail_rule_config_for_settings(settings: Settings) -> TailRuleConfig:
         max_decision_lateness_s=settings.tail_max_decision_lateness_s,
         leader_bid_threshold=settings.tail_leader_bid_threshold,
         pm_quote_max_age_s=settings.tail_pm_quote_max_age_s,
+        binance_max_trade_age_s=settings.tail_binance_max_trade_age_s,
+        weak_candle_abs_move_bps=settings.tail_weak_candle_abs_move_bps,
+        weak_path_reversal_bps=settings.tail_weak_path_reversal_bps,
         entry_limit_price=settings.tail_limit_price,
     )
     config.validate()
@@ -2464,9 +2467,10 @@ def _run_twap_tail_round(
 ) -> List[PostCloseDecision]:
     """Run the only production entry path: causal pre-close 30s-TWAP tail.
 
-    The market must opt in through Gamma's ``cryptoMarketConfig``.  A Futures
-    stream disconnect, missing paired CLOB quote, late scheduler, insufficient
-    depth, or any weak-candle reversal results in a single HOLD and no retry.
+    The market must opt in through Gamma's ``cryptoMarketConfig``.  Its candidate
+    inputs are frozen at E-10.25s, matching the labelled replay.  A Spot stream
+    discontinuity, missing Spot kline open, missing paired CLOB quote, late
+    scheduler, or weak-candle reversal results in a single HOLD and no retry.
     """
 
     active_asset = str(asset or settings.asset).upper().strip()
@@ -2875,13 +2879,9 @@ def _run_asset_rounds(
         for asset in assets
     }
     pending = set(futures)
-    # ``_select_next_round_start`` intentionally joins an active market when
-    # enough pre-close lead remains.  A fixed 90-second deadline would then
-    # kill a perfectly healthy worker before that market closes (the exact
-    # failure mode seen after a mid-round service restart).  Budget through
-    # the round close, the configured reconciliation lifecycle, and cleanup,
-    # while retaining the fixed timeout as the minimum for already-expired or
-    # genuinely stuck workers.
+    # A continuously connected Spot proxy can join a just-opened candle. Budget
+    # through its close, reconciliation lifecycle, and cleanup, while retaining
+    # the fixed timeout as the minimum for expired/stuck workers.
     round_completion_s = (
         float(round_start)
         + CRYPTO_5M_WINDOW_S
@@ -3058,11 +3058,14 @@ def _select_next_round_start(
     processed_round_starts: set[int],
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.time,
+    assets: Tuple[str, ...] = (),
+    binance_proxy: Optional[BinanceFiveMinuteProxy] = None,
 ) -> int:
-    """Return an active round when enough preflight lead remains.
+    """Return an unseen round only when Spot coverage can be causal.
 
-    Binance Futures is observational only, so a restart does not need a full
-    candle. Joining the active market avoids an unnecessary extra-round wait.
+    A process that starts mid-candle waits for the next boundary.  A continuous
+    Spot connection can join the just-opened active candle because it began
+    before that candle.
     """
 
     observed_now = float(now)
@@ -3071,9 +3074,15 @@ def _select_next_round_start(
         active_start = current - current % 300
         active_end = active_start + 300
         minimum_lead_s = LIVE_PREFLIGHT_LEAD_S
+        coverage_ready = True
+        if binance_proxy is not None:
+            coverage_ready = bool(assets) and all(
+                binance_proxy.can_cover_candle(asset, active_start) for asset in assets
+            )
         if (
             active_start not in processed_round_starts
             and active_end - observed_now >= minimum_lead_s
+            and coverage_ready
         ):
             return active_start
         next_start = active_start + 300
@@ -3697,6 +3706,8 @@ def _run_round_loop(
                 processed_round_starts=processed_round_starts,
                 sleep=sleep,
                 clock=time.time,
+                assets=tuple(settings.assets),
+                binance_proxy=binance_proxy,
             )
         processed_round_starts.add(start)
         _audit(
@@ -4011,8 +4022,9 @@ def _status_payload(settings: Settings, store: StateStore) -> Dict[str, Any]:
         "resolve_overrides_enabled": bool(parse_resolve_overrides(settings.resolve_overrides)),
         "tail_decision_lead_ms": int(tail.decision_lead_s * 1000),
         "leader_bid_threshold": tail.leader_bid_threshold,
-        "leader_bid_comparison": "strictly_greater_than",
+        "leader_bid_comparison": "greater_than_or_equal",
         "paired_receive_max_age_ms": int(tail.pm_quote_max_age_s * 1000),
+        "binance_trade_max_age_ms": int(tail.binance_max_trade_age_s * 1000),
         "max_decision_lateness_ms": int(tail.max_decision_lateness_s * 1000),
         "entry_limit_price": tail.entry_limit_price,
         "decision_window_ms": [
@@ -4023,7 +4035,10 @@ def _status_payload(settings: Settings, store: StateStore) -> Dict[str, Any]:
         "confirmations": 0,
         "confirmation_spacing_ms": 0,
         "post_close_classifier_for_live_entry": False,
-        "binance_role": "usd_m_futures_observational_only_not_entry_gate",
+        "binance_role": "spot_kline_open_and_aggtrade_path_filter_not_settlement_oracle",
+        "feature_cutoff_ms_before_end": int(tail.decision_lead_s * 1000),
+        "weak_candle_abs_move_bps": tail.weak_candle_abs_move_bps,
+        "weak_path_reversal_bps": tail.weak_path_reversal_bps,
         "require_loser_refill_failure": False,
         "require_stable_post_close_leader": False,
         "order_type": settings.order_type,
@@ -4048,14 +4063,18 @@ def _tail_runtime_payload(settings: Settings) -> Dict[str, Any]:
         "strategy_version": config.strategy_version,
         "tail_decision_lead_s": config.decision_lead_s,
         "leader_bid_threshold": config.leader_bid_threshold,
-        "leader_bid_comparison": "strictly_greater_than",
+        "leader_bid_comparison": "greater_than_or_equal",
         "paired_receive_max_age_s": config.pm_quote_max_age_s,
+        "binance_trade_max_age_s": config.binance_max_trade_age_s,
         "max_decision_lateness_s": config.max_decision_lateness_s,
         "max_decision_lateness_ms": int(config.max_decision_lateness_s * 1000),
         "entry_limit_price": config.entry_limit_price,
         "order_type": settings.order_type,
         "post_close_classifier_for_live_entry": False,
-        "binance_role": "usd_m_futures_observational_only_not_entry_gate",
+        "binance_role": "spot_kline_open_and_aggtrade_path_filter_not_settlement_oracle",
+        "feature_cutoff_s_before_end": config.decision_lead_s,
+        "weak_candle_abs_move_bps": config.weak_candle_abs_move_bps,
+        "weak_path_reversal_bps": config.weak_path_reversal_bps,
     }
 
 
@@ -4172,7 +4191,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             }
             _audit(settings, store, "boot", boot_payload)
             _safe_notify(notifier, settings, store, "boot", boot_payload)
-            # Shadow mode must observe the same Futures coverage failures as live
+            # Shadow mode must observe the same Spot coverage failures as live
             # mode; it never grants order capability.
             binance_proxy = BinanceFiveMinuteProxy(settings.assets)
             binance_proxy.start()
