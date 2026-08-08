@@ -134,6 +134,18 @@ def _round_up_to_tick(price: float, tick_size: str) -> float:
     return round(min(max_price, max(tick, units * tick)), decimals)
 
 
+def _round_down_to_tick(price: float, tick_size: str) -> float:
+    """Round a user-supplied maximum price down so a BUY never exceeds it."""
+
+    tick = float(tick_size or "0.01")
+    if tick <= 0:
+        tick = 0.01
+    units = int((price / tick) + 1e-9)
+    decimals = max(0, len(str(tick).split(".")[-1]) if "." in str(tick) else 0)
+    max_price = round(1.0 - tick, decimals)
+    return round(min(max_price, max(tick, units * tick)), decimals)
+
+
 def _clean_env(value: str | None) -> str:
     return (value or "").strip().strip('"').strip("'")
 
@@ -337,9 +349,18 @@ class PolymarketLiveExecutor:
         tick_size: str,
         neg_risk: bool,
         slippage_ticks: int,
+        price_cap: Optional[float] = None,
     ) -> tuple[Any, float]:
         tick = float(tick_size or "0.01")
         limit_price = _round_up_to_tick(best_ask + max(slippage_ticks, 0) * tick, tick_size)
+        if price_cap is not None:
+            cap = _float_or_none(price_cap)
+            if cap is None or not (0.0 < cap < 1.0):
+                raise ValueError("invalid_price_cap")
+            cap = _round_down_to_tick(cap, tick_size)
+            if best_ask > cap + 1e-12:
+                raise ValueError("best_ask_above_price_cap")
+            limit_price = min(limit_price, cap)
         order_kwargs: dict[str, Any] = {
             "token_id": token_id,
             "price": limit_price,
@@ -453,6 +474,7 @@ class PolymarketLiveExecutor:
         tick_size: str,
         neg_risk: bool,
         slippage_ticks: int,
+        price_cap: Optional[float] = None,
     ) -> ExecutionLegResult:
         if target_qty <= 0:
             return ExecutionLegResult(label, token_id, target_qty, 0.0, 0.0, 0.0, ok=False, error="target_qty<=0")
@@ -465,6 +487,7 @@ class PolymarketLiveExecutor:
                 tick_size=tick_size,
                 neg_risk=neg_risk,
                 slippage_ticks=slippage_ticks,
+                price_cap=price_cap,
             )
             submission_started = True
             resp = self.client.post_order(

@@ -1,10 +1,16 @@
 # Live trading runbook
 
-This build runs `empjp_e75_n30_c1_l1`, a BTC-only 5-minute Polymarket strategy.
-It preserves the old live execution wrapper but replaces the BTC/ETH correlation
-entry logic.
+## Active runner
 
-## Safe startup
+`main.py` runs `twap_price_path_tail_v2`, the six-asset Chainlink 30-second-TWAP
+price-path tail strategy. Its exact live gates, price cap, state/reconciliation
+behavior and configuration are documented in
+[twap_price_path_tail_live_strategy_v2_2026-08-08.md](twap_price_path_tail_live_strategy_v2_2026-08-08.md).
+
+The remaining EMPJP material below is retained for direct invocation of the
+legacy `lab.empjp_live_bot` module; it is not the `main.py` runtime.
+
+## Legacy EMPJP safe startup
 
 Default is shadow mode:
 

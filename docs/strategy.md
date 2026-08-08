@@ -1,7 +1,10 @@
-# Strategy spec: `empjp_e75_n30_c1_l1`
+# Legacy strategy spec: `empjp_e75_n30_c1_l1`
 
-This repository now runs the BTC-only empirical joint probability strategy that
-was selected from the PM5M replay research.
+> Active runtime note: `main.py` now runs `twap_price_path_tail_v2`. See
+> [the current live strategy specification](twap_price_path_tail_live_strategy_v2_2026-08-08.md).
+
+This document describes the BTC-only empirical joint probability strategy kept
+for legacy/reference use after the active runtime moved to the TWAP tail model.
 
 ## 1. What it trades
 

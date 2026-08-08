@@ -1,6 +1,8 @@
-# EMPJP Strategy Brief: `empjp_e75_n30_c1_l1`
+# Legacy EMPJP Strategy Brief: `empjp_e75_n30_c1_l1`
 
-This document is the dedicated strategy note for the live/shadow system currently wired to `main.py`.
+This is the dedicated note for the retained EMPJP module. `main.py` now runs
+[`twap_price_path_tail_v2`](twap_price_path_tail_live_strategy_v2_2026-08-08.md)
+instead; this file remains as a rollback/research reference.
 
 ## Executive summary
 
